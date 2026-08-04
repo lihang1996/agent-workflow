@@ -9,6 +9,7 @@ import type { Bot, IncomingMessage } from '../im/lark.js';
 import type { AppContext } from './app-context.js';
 import { startCliTask } from './cli-task.js';
 import { ensureRunnableSession, topicIdOf } from './sessions.js';
+import type { CliExecutionPolicy } from '../cli/types.js';
 
 /** reviewer →（未通过则）dev → 复审，直到通过或达上限。 */
 export async function runCollabReview(
@@ -19,12 +20,24 @@ export async function runCollabReview(
     task: string;
     round: number;
     priorDevResult?: string;
+    executionPolicy?: CliExecutionPolicy;
+    approvedScope?: string;
     /** 协作自然结束时回调（通过 / 触顶）；供流水线续跑。 */
     onComplete?: (result: { approved: boolean; answer: string }) => Promise<void>;
     onFailure?: (error: Error) => Promise<void>;
   },
 ): Promise<void> {
-  const { initiator, msg, task, round, priorDevResult, onComplete, onFailure } = options;
+  const {
+    initiator,
+    msg,
+    task,
+    round,
+    priorDevResult,
+    executionPolicy = 'standard',
+    approvedScope,
+    onComplete,
+    onFailure,
+  } = options;
   const hasThread = !!msg.threadId || !!msg.rootId;
   const reviewer = ctx.botsById.get('reviewer');
   const dev = ctx.botsById.get('dev');
@@ -60,6 +73,8 @@ export async function runCollabReview(
     msg,
     session: reviewerSession,
     prompt: reviewPrompt,
+    executionPolicy,
+    approvedScope,
     onFailure,
     onSuccess: async (reviewAnswer) => {
       if (ctx.shuttingDown) return;
@@ -98,6 +113,8 @@ export async function runCollabReview(
         msg,
         session: devSession,
         prompt: buildFixFromReviewPrompt(reviewer, reviewAnswer, round),
+        executionPolicy,
+        approvedScope,
         onFailure,
         onSuccess: async (devAnswer) => {
           if (ctx.shuttingDown) return;
@@ -124,6 +141,8 @@ export async function runCollabReview(
             task,
             round: nextRound,
             priorDevResult: devAnswer,
+            executionPolicy,
+            approvedScope,
             onComplete,
             onFailure,
           });

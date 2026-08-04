@@ -1,6 +1,7 @@
 import type { ApprovalRequest } from '../core/approval-store.js';
 import type { Questionnaire, Question } from '../core/questionnaire-store.js';
 import type { ProductSpec } from '../core/spec-store.js';
+import { redactSecrets } from '../core/log-inspection.js';
 import type { CardJson } from './card.js';
 
 function button(
@@ -163,21 +164,65 @@ export function buildSpecReviewCard(spec: ProductSpec): CardJson {
 }
 
 export function buildApprovalCard(approval: ApprovalRequest): CardJson {
+  const authorizationExpired = !!approval.expiresAt && Date.parse(approval.expiresAt) <= Date.now();
+  const retryAllowed = approval.status === 'failed'
+    && !approval.scheduleJobId
+    && !authorizationExpired;
+  const appearance = {
+    pending: { template: 'orange', label: '等待负责人拍板', detail: '⏳ 尚未执行。审批过期后必须重新发起。' },
+    approved: { template: 'blue', label: '已批准', detail: '✅ 已批准，正在等待执行。' },
+    executing: { template: 'blue', label: '执行中', detail: '▶️ 已批准，本次任务正在执行。请勿重复点击。' },
+    succeeded: { template: 'green', label: '已完成', detail: '✅ 本次批准的任务已执行完成。' },
+    failed: {
+      template: 'red',
+      label: '执行失败',
+      detail: approval.scheduleJobId
+        ? `❌ 执行失败：${escapeApprovalMarkdown(approval.executionError ?? '未知错误')}\n\n定时任务会按补偿策略重新触发并生成新审批。`
+        : authorizationExpired
+          ? `❌ 执行失败：${escapeApprovalMarkdown(approval.executionError ?? '未知错误')}\n\n本次批准已过期，如需重试请重新发起审批。`
+          : `❌ 执行失败：${escapeApprovalMarkdown(approval.executionError ?? '未知错误')}`,
+    },
+    rejected: { template: 'grey', label: '已拒绝', detail: '⛔ 已拒绝，任务没有执行。' },
+    expired: { template: 'grey', label: '已过期', detail: '⌛ 审批已失效，任务没有执行；如仍需执行请重新发起。' },
+  }[approval.status];
+  const expiresAt = approval.expiresAt
+    ? new Date(approval.expiresAt).toLocaleString('zh-CN', { hour12: false })
+    : '未设置';
   return {
     schema: '2.0',
     config: { update_multi: true, summary: { content: `高风险操作审批：${approval.reason}` } },
-    header: { template: approval.status === 'approved' ? 'green' : approval.status === 'rejected' ? 'red' : 'orange', title: { tag: 'plain_text', content: '高风险操作 · 需要你拍板' } },
+    header: {
+      template: appearance.template,
+      title: { tag: 'plain_text', content: `高风险操作 · ${appearance.label}` },
+    },
     body: {
       direction: 'vertical',
       elements: [
-        { tag: 'markdown', content: `**风险原因**：${approval.reason}\n\n**拟执行任务**\n${approval.prompt}` },
+        {
+          tag: 'markdown',
+          content: [
+            `**风险原因**：${escapeApprovalMarkdown(redactSecrets(approval.reason), 300)}`,
+            `**审批编号**：${approval.id}`,
+            `**有效期至**：${expiresAt}`,
+            `**拟执行任务**\n${escapeApprovalMarkdown(redactSecrets(approval.prompt), 2_000)}`,
+            appearance.detail,
+          ].join('\n\n'),
+        },
         ...(approval.status === 'pending'
           ? [
             button('approve_high_risk', { approvalId: approval.id }, '批准执行', 'primary'),
             button('reject_high_risk', { approvalId: approval.id }, '拒绝', 'danger'),
           ]
-          : [{ tag: 'markdown', content: approval.status === 'approved' ? '✅ 已批准，任务正在执行。' : '⛔ 已拒绝，任务不会执行。' }]),
+          : retryAllowed
+            ? [button('retry_high_risk', { approvalId: approval.id }, '重试本次批准任务', 'primary')]
+            : []),
       ],
     },
   };
+}
+
+function escapeApprovalMarkdown(value: string, maxLength = 800): string {
+  const text = value.trim().slice(0, maxLength);
+  const suffix = value.trim().length > maxLength ? '…' : '';
+  return `${text.replace(/[\\`*_~\[\]<>#]/g, '\\$&')}${suffix}`;
 }

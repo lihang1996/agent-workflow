@@ -11,11 +11,20 @@ import type { AppContext } from './app-context.js';
 import { runCollabReview } from './collab-runner.js';
 import { startCliTask } from './cli-task.js';
 import { ensureRunnableSession, topicIdOf, truncate } from './sessions.js';
+import { finishApprovalExecution } from './approval-status.js';
+
+interface ApprovedWorkflowLaunch {
+  executionPolicy?: DeliveryWorkflow['executionPolicy'];
+  approvalId?: string;
+  approvalAttempt?: number;
+  scheduleJobId?: string;
+  scheduleRunCount?: number;
+}
 
 /** CEO 团队交付流水线：按步骤串联各角色，关键人工节点会持久化暂停。 */
 export async function runTeamPipeline(
   ctx: AppContext,
-  options: { ceo: Bot; msg: IncomingMessage; goal: string },
+  options: { ceo: Bot; msg: IncomingMessage; goal: string } & ApprovedWorkflowLaunch,
 ): Promise<void> {
   return createAndStartWorkflow(ctx, {
     initiator: options.ceo,
@@ -24,13 +33,16 @@ export async function runTeamPipeline(
     requestedSteps: ctx.pipelineSteps,
     name: '团队交付流水线',
     kind: 'team',
+    executionPolicy: options.executionPolicy,
+    approvalId: options.approvalId,
+    approvalAttempt: options.approvalAttempt,
   });
 }
 
 /** 开发内部交付小队：聚焦技术方案、实现、评审与验收。 */
 export async function runDeliverySquad(
   ctx: AppContext,
-  options: { initiator: Bot; msg: IncomingMessage; goal: string },
+  options: { initiator: Bot; msg: IncomingMessage; goal: string } & ApprovedWorkflowLaunch,
 ): Promise<void> {
   const requestedSteps = ctx.pipelineSteps.filter((step) =>
     step.id === 'architect' || step.id === 'dev' || step.id === 'review' || step.id === 'qa');
@@ -51,10 +63,28 @@ async function createAndStartWorkflow(
     requestedSteps: PipelineStep[];
     name: string;
     kind: 'team' | 'squad';
-  },
+  } & ApprovedWorkflowLaunch,
 ): Promise<void> {
-  const { initiator, msg, goal, requestedSteps, name, kind } = options;
+  const {
+    initiator,
+    msg,
+    goal,
+    requestedSteps,
+    name,
+    kind,
+    executionPolicy = 'standard',
+    approvalId,
+    approvalAttempt,
+    scheduleJobId,
+    scheduleRunCount,
+  } = options;
   if (ctx.shuttingDown) throw new Error('服务正在停止，无法启动流水线');
+  if ((approvalId && !approvalAttempt) || (!approvalId && approvalAttempt)) {
+    throw new Error('审批工作流缺少完整的审批编号或执行轮次。');
+  }
+  if ((scheduleJobId && !scheduleRunCount) || (!scheduleJobId && scheduleRunCount)) {
+    throw new Error('定时工作流缺少完整的任务编号或运行轮次。');
+  }
   const steps = filterRunnableSteps(requestedSteps, new Set(ctx.botsById.keys()));
   if (steps.length === 0) throw new Error('没有可执行的流水线步骤，请检查 Bot 配置');
 
@@ -64,21 +94,43 @@ async function createAndStartWorkflow(
     initiatorBotId: initiator.id,
     goal,
     stepIds: steps.map((step) => step.id),
+    executionPolicy,
+    approvalId,
+    approvalAttempt,
+    scheduleJobId,
+    scheduleRunCount,
     message: storedMessage(msg),
   });
+  if (approvalId && approvalAttempt) {
+    try {
+      await ctx.approvals.attachWorkflow(approvalId, approvalAttempt, workflow.id);
+    } catch (error) {
+      await ctx.workflows.update(workflow.id, {
+        status: 'failed',
+        error: `绑定审批失败：${(error as Error).message}`,
+      });
+      throw error;
+    }
+  }
   console.log(`[${name}] workflow=${workflow.id} 目标=${truncate(goal, 60)} 步骤=${workflow.stepIds.join(' → ')}`);
-  await initiator.reply(
-    msg.messageId,
-    [`已启动${name}。`, `目标：${goal}`, `步骤：${steps.map((s, i) => `${i + 1}.${s.title}`).join(' → ')}`].join('\n'),
-    hasThread(msg),
-  );
-  await continueDeliveryWorkflow(ctx, workflow.id);
+  try {
+    await initiator.reply(
+      msg.messageId,
+      [`已启动${name}。`, `目标：${goal}`, `步骤：${steps.map((s, i) => `${i + 1}.${s.title}`).join(' → ')}`].join('\n'),
+      hasThread(msg),
+    );
+    await continueDeliveryWorkflow(ctx, workflow.id);
+  } catch (error) {
+    await failWorkflow(ctx, workflow.id, `启动失败：${(error as Error).message}`);
+    throw error;
+  }
 }
 
 /** 从持久化状态执行一个步骤；异步 CLI 完成后由回调推进下一步。 */
 export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: string): Promise<void> {
-  const workflow = requireWorkflow(ctx, workflowId);
-  if (ctx.shuttingDown || workflow.status !== 'ready') return;
+  if (ctx.shuttingDown) return;
+  const workflow = await ctx.workflows.claimReady(workflowId);
+  if (!workflow) return;
   const steps = stepsFor(workflow);
   const msg = messageForWorkflow(workflow);
   const initiator = ctx.botsById.get(workflow.initiatorBotId);
@@ -87,16 +139,18 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
     return;
   }
   if (workflow.nextStepIndex >= steps.length) {
-    await ctx.workflows.update(workflow.id, { status: 'completed', error: undefined });
-    await initiator.reply(msg.messageId, `${workflow.name}已全部完成。`, hasThread(msg));
+    const completed = await ctx.workflows.update(workflow.id, { status: 'completed', error: undefined });
+    await settleWorkflowApproval(ctx, completed, 'succeeded');
+    await settleWorkflowSchedule(ctx, completed, 'succeeded');
+    await initiator.reply(msg.messageId, `${workflow.name}已全部完成。`, hasThread(msg)).catch((error) => {
+      console.error(`[${workflow.name}] 完成通知发送失败:`, (error as Error).message);
+    });
     return;
   }
 
   const stepIndex = workflow.nextStepIndex;
   const step = steps[stepIndex];
   const stepLabel = `步骤 ${stepIndex + 1}/${steps.length} · ${step.title}`;
-  await ctx.workflows.update(workflow.id, { status: 'executing', error: undefined });
-
   if (step.id === 'review') {
     await initiator.reply(msg.messageId, `${stepLabel}：启动评审协作。`, hasThread(msg));
     try {
@@ -105,6 +159,8 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
         msg,
         task: buildPipelineStepPrompt(step, workflow.goal, workflow.priorOutputs),
         round: 1,
+        executionPolicy: workflow.executionPolicy,
+        approvedScope: workflow.executionPolicy === 'approved' ? workflow.goal : undefined,
         onComplete: async ({ approved, answer }) => {
           if (!approved) {
             await failWorkflow(ctx, workflow.id, '代码评审未通过，流水线已停止，不能继续 QA。');
@@ -139,6 +195,8 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
       session: actorSession,
       prompt: buildPipelineStepPrompt(step, workflow.goal, workflow.priorOutputs),
       workflowId: workflow.id,
+      executionPolicy: workflow.executionPolicy,
+      approvedScope: workflow.executionPolicy === 'approved' ? workflow.goal : undefined,
       onSuccess: async (answer) => {
         if (step.id === 'pm') await completeProductStep(ctx, workflow.id, stepIndex, actor, answer);
         else await completeRegularStep(ctx, workflow.id, stepIndex, step.id, answer);
@@ -318,14 +376,21 @@ export async function resumeWorkflowAfterProductReview(ctx: AppContext, specId: 
 
 /** 服务重启后恢复尚未进入人工等待节点的流水线。 */
 export async function resumeRecoverableWorkflows(ctx: AppContext): Promise<void> {
+  await reconcileWorkflowSchedules(ctx);
   for (const workflow of ctx.workflows.listRecoverable()) {
-    if (workflow.status === 'executing') {
-      await ctx.workflows.update(workflow.id, {
-        status: 'ready',
-        error: '上次执行被服务重启中断，本次将从当前步骤重新检查并继续。',
+    try {
+      if (workflow.status === 'executing') {
+        await ctx.workflows.update(workflow.id, {
+          status: 'ready',
+          error: '上次执行被服务重启中断，本次将从当前步骤重新检查并继续。',
+        });
+      }
+      await continueDeliveryWorkflow(ctx, workflow.id);
+    } catch (error) {
+      await failWorkflow(ctx, workflow.id, `恢复失败：${(error as Error).message}`).catch((failError) => {
+        console.error(`[工作流] ${workflow.id} 保存恢复失败状态异常:`, (failError as Error).message);
       });
     }
-    await continueDeliveryWorkflow(ctx, workflow.id);
   }
 }
 
@@ -337,6 +402,56 @@ async function failWorkflow(ctx: AppContext, workflowId: string, error: string):
   if (initiator) {
     const msg = messageForWorkflow(failed);
     await initiator.reply(msg.messageId, `${failed.name}已停止：${error}`, hasThread(msg)).catch(() => undefined);
+  }
+  await settleWorkflowApproval(ctx, failed, 'failed', error);
+  await settleWorkflowSchedule(ctx, failed, 'failed', error);
+}
+
+async function settleWorkflowApproval(
+  ctx: AppContext,
+  workflow: DeliveryWorkflow,
+  outcome: 'succeeded' | 'failed',
+  error?: string,
+): Promise<void> {
+  if (!workflow.approvalId || !workflow.approvalAttempt) return;
+  await finishApprovalExecution(
+    ctx,
+    workflow.approvalId,
+    workflow.approvalAttempt,
+    outcome,
+    error,
+  ).catch((settleError) => {
+    console.error(`[审批] 工作流 ${workflow.id} 回写失败:`, (settleError as Error).message);
+  });
+}
+
+async function settleWorkflowSchedule(
+  ctx: AppContext,
+  workflow: DeliveryWorkflow,
+  outcome: 'succeeded' | 'failed',
+  error?: string,
+): Promise<void> {
+  if (!workflow.scheduleJobId || !workflow.scheduleRunCount) return;
+  const job = ctx.schedules.get(workflow.scheduleJobId);
+  if (!job || job.lastStatus !== 'running' || job.runCount !== workflow.scheduleRunCount) return;
+  await ctx.schedules.finishRun(
+    job.id,
+    outcome,
+    outcome === 'failed' ? (error?.trim() || '交付工作流执行失败') : undefined,
+  ).catch((settleError) => {
+    console.error(`[定时任务] 工作流 ${workflow.id} 结算失败:`, (settleError as Error).message);
+  });
+}
+
+export async function reconcileWorkflowSchedules(ctx: AppContext): Promise<void> {
+  for (const workflow of ctx.workflows.list()) {
+    if (!workflow.scheduleJobId || !workflow.scheduleRunCount) continue;
+    await ctx.schedules.restoreInterruptedRun(workflow.scheduleJobId, workflow.scheduleRunCount);
+    if (workflow.status === 'completed') {
+      await settleWorkflowSchedule(ctx, workflow, 'succeeded');
+    } else if (workflow.status === 'failed') {
+      await settleWorkflowSchedule(ctx, workflow, 'failed', workflow.error);
+    }
   }
 }
 

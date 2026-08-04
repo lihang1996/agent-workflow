@@ -143,7 +143,9 @@ pnpm probe:cli  # 手工查看 CLI 的 JSON 流事件
 | `MCP_STRICT` | Claude 是否加 `--strict-mcp-config` | `false` |
 | `CLAUDE_WORKDIR` | Claude 全局回退目录 | 当前工作目录 |
 | `CODEX_WORKDIR` | Codex 全局回退目录；未设置时继续回退到 `CLAUDE_WORKDIR`、当前工作目录 | 未设置时按上述顺序回退 |
-| `CODEX_SANDBOX` | Codex 沙箱模式：`read-only`、`workspace-write` 或 `danger-full-access` | `workspace-write` |
+| `CODEX_SANDBOX` | Codex 普通任务沙箱：`read-only` 或 `workspace-write`；配置为全权限会安全回退 | `workspace-write` |
+| `CODEX_APPROVED_SANDBOX` | 仅审批通过的 Codex 任务沙箱：`read-only`、`workspace-write` 或 `danger-full-access` | `danger-full-access` |
+| `APPROVAL_TTL_MINUTES` | 高风险审批有效期（1–1440 分钟） | `30` |
 | `AGENT_OS_ALLOWED_ROOTS` | Agent 可访问的可信项目/日志根目录，多个路径用逗号分隔 | 当前项目和已配置工作目录 |
 
 不要把真实 Secret 提交到 git；`.env` 和 `data/` 已被忽略。
@@ -222,7 +224,9 @@ CEO 统一入口 → MCP 结构化问题 → /form 点选澄清
 
 日志巡检会先确认路径是可信根目录中的普通文件，再由 Agent OS 宿主以只读方式截取最后 500 行（最多 128 KiB）。凭证、Cookie、JWT、常见平台 Token 和连接串密码会先脱敏，日志内伪造的提示词/分隔符会被转义；报告固定给出异常计数、行号证据、影响和建议。巡检不会把日志路径误当成高风险执行指令，也不得调用工具、删除、截断、重启或部署；P0/P1 只上报，后续动作仍需经过审批门。日志位于项目目录之外时，请把其父目录加入 `AGENT_OS_ALLOWED_ROOTS`。
 
-高风险词（例如生产部署、删除数据、权限/密钥变更）会自动弹出审批卡。仅 `OWNER_OPEN_ID` 指定的人可批准；未设置时，原始需求发起人拥有审批权。批准前 Agent 不会执行原任务，定时任务也遵循同一规则。
+高风险词（例如生产部署、外部推送、删除数据、权限/密钥变更）会自动弹出审批卡。仅 `OWNER_OPEN_ID` 指定的人可批准；未设置时，原始需求发起人拥有审批权。审批默认 30 分钟过期，批准后只放行原卡片绑定的这一项任务；重复点击不会并发启动，执行结果会回写原审批卡，启动失败可在卡片上重试。普通任务保持受限权限，日志巡检强制只读，只有已批准任务才使用 `CODEX_APPROVED_SANDBOX` 或 Claude 的已批准权限模式。
+
+定时高风险任务在等待审批期间保持“执行中”，批准后的真实成功/失败、拒绝或超时会再回写定时任务状态，因此不会把“仅成功发出审批卡”误记成任务成功。
 
 ## 开发与扩展
 

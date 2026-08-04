@@ -1,5 +1,10 @@
 import { codexMcpFlags } from '../mcp/config.js';
-import type { CliAdapter, CliEvent } from './types.js';
+import {
+  codexSandboxFor,
+  instructionsForExecutionPolicy,
+  promptForExecutionPolicy,
+} from './execution-policy.js';
+import type { CliAdapter, CliBuildOptions, CliEvent, CliExecutionPolicy } from './types.js';
 
 interface CodexItem {
   type?: unknown;
@@ -61,33 +66,39 @@ export class CodexAdapter implements CliAdapter {
   private toolSeq = 0;
   private readonly openTools = new Map<string, string>();
 
-  constructor(
-    private readonly sandbox = process.env.CODEX_SANDBOX ?? 'workspace-write',
-  ) {}
-
   /** 新开 Codex 会话。 */
-  buildArgs(prompt: string): string[] {
+  buildArgs(prompt: string, options: CliBuildOptions = {}): string[] {
+    const policy = options.executionPolicy ?? 'standard';
     return [
+      '--ask-for-approval',
+      'never',
+      '-c',
+      `developer_instructions=${JSON.stringify(instructionsForExecutionPolicy(policy, options.approvedScope))}`,
       'exec',
       '--json',
       '--sandbox',
-      this.sandbox,
-      ...codexMcpFlags(),
-      prompt,
+      codexSandboxFor(policy),
+      ...mcpFlagsFor(policy),
+      promptForExecutionPolicy(prompt, policy, options.approvedScope),
     ];
   }
 
   /** 恢复会话；--sandbox 必须挂在 exec 上。 */
-  buildResumeArgs(prompt: string, sessionId: string): string[] {
+  buildResumeArgs(prompt: string, sessionId: string, options: CliBuildOptions = {}): string[] {
+    const policy = options.executionPolicy ?? 'standard';
     return [
+      '--ask-for-approval',
+      'never',
+      '-c',
+      `developer_instructions=${JSON.stringify(instructionsForExecutionPolicy(policy, options.approvedScope))}`,
       'exec',
       '--sandbox',
-      this.sandbox,
-      ...codexMcpFlags(),
+      codexSandboxFor(policy),
+      ...mcpFlagsFor(policy),
       'resume',
       '--json',
       sessionId,
-      prompt,
+      promptForExecutionPolicy(prompt, policy, options.approvedScope),
     ];
   }
 
@@ -235,4 +246,10 @@ export class CodexAdapter implements CliAdapter {
 
     return [];
   }
+}
+
+function mcpFlagsFor(policy: CliExecutionPolicy): string[] {
+  return policy === 'read-only'
+    ? ['--ignore-user-config', '-c', 'mcp_servers={}']
+    : codexMcpFlags();
 }

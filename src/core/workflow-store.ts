@@ -33,7 +33,13 @@ export const DeliveryWorkflowSchema = z.object({
   nextStepIndex: z.number().int().min(0),
   priorOutputs: z.record(z.string(), z.string()),
   status: WorkflowStatusSchema,
+  executionPolicy: z.enum(['standard', 'approved']).default('standard'),
   message: WorkflowMessageSchema,
+  // 兼容升级前的 8 位审批编号；新审批本身使用完整 UUID。
+  approvalId: z.string().min(1).optional(),
+  approvalAttempt: z.number().int().min(1).optional(),
+  scheduleJobId: z.string().min(1).optional(),
+  scheduleRunCount: z.number().int().min(1).optional(),
   questionnaireId: z.string().optional(),
   specId: z.string().optional(),
   error: z.string().optional(),
@@ -58,22 +64,41 @@ export class JsonWorkflowStore {
     return this.workflows.get(id);
   }
 
+  findByApproval(approvalId: string, approvalAttempt: number): DeliveryWorkflow | undefined {
+    return [...this.workflows.values()].find((workflow) =>
+      workflow.approvalId === approvalId && workflow.approvalAttempt === approvalAttempt);
+  }
+
+  list(): DeliveryWorkflow[] {
+    return [...this.workflows.values()];
+  }
+
   listRecoverable(): DeliveryWorkflow[] {
     return [...this.workflows.values()].filter((workflow) =>
       workflow.status === 'ready' || workflow.status === 'executing');
   }
 
-  async create(input: Omit<DeliveryWorkflow, 'id' | 'status' | 'nextStepIndex' | 'priorOutputs' | 'createdAt' | 'updatedAt'>): Promise<DeliveryWorkflow> {
+  async create(input: Omit<
+    DeliveryWorkflow,
+    | 'id'
+    | 'status'
+    | 'nextStepIndex'
+    | 'priorOutputs'
+    | 'createdAt'
+    | 'updatedAt'
+    | 'executionPolicy'
+  > & { executionPolicy?: DeliveryWorkflow['executionPolicy'] }): Promise<DeliveryWorkflow> {
     const now = new Date().toISOString();
-    const workflow: DeliveryWorkflow = {
+    const workflow = DeliveryWorkflowSchema.parse({
       ...input,
       id: randomUUID(),
       status: 'ready',
+      executionPolicy: input.executionPolicy ?? 'standard',
       nextStepIndex: 0,
       priorOutputs: {},
       createdAt: now,
       updatedAt: now,
-    };
+    });
     this.workflows.set(workflow.id, workflow);
     await this.persist();
     return workflow;
@@ -88,6 +113,22 @@ export class JsonWorkflowStore {
     const next = DeliveryWorkflowSchema.parse({
       ...current,
       ...patch,
+      updatedAt: new Date().toISOString(),
+    });
+    this.workflows.set(id, next);
+    await this.persist();
+    return next;
+  }
+
+  /** 原子认领一个 ready 工作流，避免按钮重放/异步回调并发启动同一步骤。 */
+  async claimReady(id: string): Promise<DeliveryWorkflow | undefined> {
+    const current = this.get(id);
+    if (!current) throw new Error(`工作流不存在: ${id}`);
+    if (current.status !== 'ready') return undefined;
+    const next = DeliveryWorkflowSchema.parse({
+      ...current,
+      status: 'executing',
+      error: undefined,
       updatedAt: new Date().toISOString(),
     });
     this.workflows.set(id, next);

@@ -1,7 +1,7 @@
 import { resolve } from 'node:path';
 import { createAdapter } from '../cli/registry.js';
 import { runCli } from '../cli/runner.js';
-import type { CliEvent } from '../cli/types.js';
+import type { CliEvent, CliExecutionPolicy } from '../cli/types.js';
 import {
   answerContinuation,
   answerNeedsContinuation,
@@ -32,6 +32,8 @@ export async function startCliTask(
     prompt: string;
     downloadResources?: boolean;
     workflowId?: string;
+    executionPolicy?: CliExecutionPolicy;
+    approvedScope?: string;
     onSuccess?: (answer: string) => Promise<void>;
     onFailure?: (error: Error) => Promise<void>;
   },
@@ -40,7 +42,16 @@ export async function startCliTask(
     throw new Error('服务正在停止，无法启动新任务');
   }
 
-  const { bot, msg, downloadResources = false, workflowId, onSuccess, onFailure } = options;
+  const {
+    bot,
+    msg,
+    downloadResources = false,
+    workflowId,
+    executionPolicy = 'standard',
+    approvedScope,
+    onSuccess,
+    onFailure,
+  } = options;
   let taskPrompt = options.prompt.trim();
   let session = options.session;
   const hasThread = !!msg.threadId || !!msg.rootId;
@@ -247,6 +258,8 @@ export async function startCliTask(
     sessionId: session.cliSessionId,
     signal: controller.signal,
     onEvent: onCliEvent,
+    executionPolicy,
+    approvedScope: executionPolicy === 'approved' ? (approvedScope ?? options.prompt) : undefined,
     env: {
       AGENT_OS_CHAT_ID: msg.chatId,
       AGENT_OS_TOPIC_ID: msg.threadId || msg.rootId || msg.messageId,

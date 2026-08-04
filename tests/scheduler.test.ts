@@ -8,8 +8,16 @@ import {
   type ScheduledJob,
   type ScheduleRunOutcome,
 } from '../src/core/schedule-store.js';
+import { JsonApprovalStore } from '../src/core/approval-store.js';
+import { JsonWorkflowStore } from '../src/core/workflow-store.js';
 import type { AppContext } from '../src/runtime/app-context.js';
+import {
+  finishApprovalExecution,
+  reconcileApprovalExecutions,
+  settleApprovalSchedule,
+} from '../src/runtime/approval-status.js';
 import { runDueSchedules } from '../src/runtime/scheduler.js';
+import { resumeRecoverableWorkflows } from '../src/runtime/pipeline-runner.js';
 
 function message() {
   return {
@@ -70,6 +78,10 @@ test('服务重启会把执行中的定时任务改为失败并立即补偿', as
     assert.match(recovered.lastError ?? '', /服务重启中断/);
     assert.ok(new Date(recovered.nextRunAt).getTime() >= beforeOpen);
     assert.equal(reopened.listDue(new Date(Date.now() + 1_000)).length, 1);
+    const restored = await reopened.restoreInterruptedRun(created.id, recovered.runCount);
+    assert.equal(restored?.lastStatus, 'running');
+    assert.equal(restored?.consecutiveFailures, 0);
+    assert.equal(reopened.listDue(new Date(Date.now() + 1_000)).length, 0);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -103,6 +115,8 @@ test('单个定时任务失败不会阻断同一轮后续任务', async () => {
     shuttingDown: false,
     schedulerRunning: false,
     schedules,
+    approvals: { expireStale: async () => [], list: () => [] },
+    workflows: { list: () => [] },
     botsById: new Map(),
   } as unknown as AppContext;
   await runDueSchedules(ctx, async (_context, job) => {
@@ -111,4 +125,105 @@ test('单个定时任务失败不会阻断同一轮后续任务', async () => {
   });
   assert.deepEqual(finished, [['job-a', 'failed'], ['job-b', 'succeeded']]);
   assert.equal(ctx.schedulerRunning, false);
+});
+
+test('定时高风险任务等待真实审批结果后再结算', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-schedule-approval-'));
+  try {
+    const schedules = await JsonScheduleStore.open(join(root, 'schedules.json'));
+    const approvals = await JsonApprovalStore.open(join(root, 'approvals.json'));
+    const created = await schedules.create({
+      botId: 'dev', ownerOpenId: 'ou_owner', kind: 'task', prompt: 'git push origin main', intervalMs: 60_000, message: message(),
+    });
+    const claimed = await schedules.claimRun(created.id, new Date(created.nextRunAt));
+    const approval = await approvals.create({
+      botId: 'dev', ownerOpenId: 'ou_owner', action: 'task', prompt: claimed.prompt,
+      reason: '会向外部仓库推送内容', message: claimed.message,
+      scheduleJobId: claimed.id, scheduleRunCount: claimed.runCount,
+    });
+    const executing = await approvals.beginExecution(approval.id, 'ou_owner');
+    const ctx = { schedules, approvals, botsById: new Map() } as unknown as AppContext;
+    await finishApprovalExecution(ctx, approval.id, executing.executionAttempt, 'succeeded');
+    assert.equal(schedules.get(claimed.id)?.lastStatus, 'succeeded');
+
+    const next = await schedules.claimRun(claimed.id, new Date(schedules.get(claimed.id)!.nextRunAt));
+    const rejected = await approvals.create({
+      botId: 'dev', ownerOpenId: 'ou_owner', action: 'task', prompt: next.prompt,
+      reason: '会向外部仓库推送内容', message: next.message,
+      scheduleJobId: next.id, scheduleRunCount: next.runCount,
+    });
+    const rejectedState = await approvals.reject(rejected.id, 'ou_owner');
+    await settleApprovalSchedule(ctx, rejectedState, 'skipped', '负责人拒绝审批');
+    assert.equal(schedules.get(next.id)?.lastStatus, 'skipped');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('重启后待审批定时任务保持占位，审批终态可修复跨存储结算', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-schedule-approval-restart-'));
+  const schedulePath = join(root, 'schedules.json');
+  const approvalPath = join(root, 'approvals.json');
+  try {
+    const initialSchedules = await JsonScheduleStore.open(schedulePath);
+    const initialApprovals = await JsonApprovalStore.open(approvalPath);
+    const job = await initialSchedules.create({
+      botId: 'dev', ownerOpenId: 'ou_owner', kind: 'task', prompt: 'git push origin main', intervalMs: 60_000, message: message(),
+    });
+    const claimed = await initialSchedules.claimRun(job.id, new Date(job.nextRunAt));
+    const approval = await initialApprovals.create({
+      botId: 'dev', ownerOpenId: 'ou_owner', action: 'task', prompt: claimed.prompt,
+      reason: '会向外部仓库推送内容', message: claimed.message,
+      scheduleJobId: claimed.id, scheduleRunCount: claimed.runCount,
+    });
+
+    const schedules = await JsonScheduleStore.open(schedulePath);
+    const approvals = await JsonApprovalStore.open(approvalPath);
+    assert.equal(schedules.get(job.id)?.lastStatus, 'failed');
+    const ctx = {
+      schedules,
+      approvals,
+      workflows: { get: () => undefined, findByApproval: () => undefined },
+      botsById: new Map(),
+    } as unknown as AppContext;
+    await reconcileApprovalExecutions(ctx);
+    assert.equal(schedules.get(job.id)?.lastStatus, 'running');
+
+    const executing = await approvals.beginExecution(approval.id, 'ou_owner');
+    await approvals.finishExecution(approval.id, executing.executionAttempt, 'succeeded');
+    await reconcileApprovalExecutions(ctx);
+    assert.equal(schedules.get(job.id)?.lastStatus, 'succeeded');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('定时流水线按工作流真实终态结算并可跨重启修复', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-scheduled-workflow-'));
+  const schedulePath = join(root, 'schedules.json');
+  try {
+    const initialSchedules = await JsonScheduleStore.open(schedulePath);
+    const workflows = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const job = await initialSchedules.create({
+      botId: 'ceo', ownerOpenId: 'ou_owner', kind: 'pipeline', prompt: '整理文档', intervalMs: 60_000, message: message(),
+    });
+    const claimed = await initialSchedules.claimRun(job.id, new Date(job.nextRunAt));
+    const workflow = await workflows.create({
+      kind: 'team', name: '团队交付流水线', initiatorBotId: 'ceo', goal: claimed.prompt,
+      stepIds: ['pm'], message: claimed.message,
+      scheduleJobId: claimed.id, scheduleRunCount: claimed.runCount,
+    });
+    await workflows.update(workflow.id, { status: 'completed', nextStepIndex: 1 });
+
+    const schedules = await JsonScheduleStore.open(schedulePath);
+    assert.equal(schedules.get(job.id)?.lastStatus, 'failed');
+    await resumeRecoverableWorkflows({
+      workflows,
+      schedules,
+      botsById: new Map(),
+    } as unknown as AppContext);
+    assert.equal(schedules.get(job.id)?.lastStatus, 'succeeded');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

@@ -114,6 +114,7 @@ for (const config of botConfigs) {
 }
 
 await app.reconcileOrphanedCards();
+await app.reconcileApprovalExecutions();
 await app.resumeRecoverableWorkflows();
 app.startScheduler();
 app.startSpecReviewSync();

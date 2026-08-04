@@ -174,6 +174,34 @@ export class JsonScheduleStore {
     return next;
   }
 
+  /**
+   * 审批/持久化工作流可跨服务重启等待：撤销 open() 对这一轮的通用中断标记，
+   * 恢复原 runCount 和常规 nextRunAt，避免 scheduler 重复发起同一高风险任务。
+   */
+  async restoreInterruptedRun(id: string, runCount: number): Promise<ScheduledJob | undefined> {
+    const current = this.get(id);
+    if (!current || current.runCount !== runCount) return undefined;
+    if (current.lastStatus === 'running') return current;
+    if (
+      current.lastStatus !== 'failed'
+      || !current.lastError?.startsWith('上次执行被服务重启中断')
+      || !current.lastRunAt
+    ) return undefined;
+    const regularNext = new Date(new Date(current.lastRunAt).getTime() + current.intervalMs).toISOString();
+    const next = ScheduleSchema.parse({
+      ...current,
+      lastStatus: 'running',
+      lastFinishedAt: undefined,
+      lastError: undefined,
+      consecutiveFailures: Math.max(0, current.consecutiveFailures - 1),
+      nextRunAt: regularNext,
+      updatedAt: new Date().toISOString(),
+    });
+    this.jobs.set(id, next);
+    await this.persist();
+    return next;
+  }
+
   async setEnabled(id: string, enabled: boolean): Promise<ScheduledJob> {
     const current = this.get(id);
     if (!current) throw new Error(`定时任务不存在: ${id}`);

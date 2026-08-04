@@ -5,12 +5,14 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { buildPipelineStepPrompt, DEFAULT_PIPELINE_STEPS } from '../src/core/pipeline.js';
 import { JsonQuestionnaireStore } from '../src/core/questionnaire-store.js';
+import { JsonApprovalStore } from '../src/core/approval-store.js';
 import { JsonSpecStore } from '../src/core/spec-store.js';
 import { JsonWorkflowStore } from '../src/core/workflow-store.js';
 import { normalizeDocumentMarkdown, partitionConvertedBlocks } from '../src/im/lark.js';
 import { buildQuestionnaireCard, buildSpecConfirmationCard, buildSpecReviewCard } from '../src/im/workflow-card.js';
 import { resumeWorkflowAfterProductReview } from '../src/runtime/pipeline-runner.js';
 import { publishSpecToDoc } from '../src/runtime/spec-review.js';
+import { reconcileApprovalExecutions } from '../src/runtime/approval-status.js';
 import type { AppContext } from '../src/runtime/app-context.js';
 
 test('问卷带工作流作用域并可持久化答案', async () => {
@@ -49,6 +51,9 @@ test('交付工作流状态可在重启后恢复', async () => {
       initiatorBotId: 'ceo',
       goal: '完成登录功能',
       stepIds: ['pm', 'dev'],
+      executionPolicy: 'approved',
+      approvalId: '3e3f9af8-009a-4f7f-8ce4-793fac7922d0',
+      approvalAttempt: 2,
       message: {
         messageId: 'om_message',
         chatId: 'oc_chat',
@@ -67,6 +72,32 @@ test('交付工作流状态可在重启后恢复', async () => {
     const reopened = await JsonWorkflowStore.open(path);
     assert.equal(reopened.get(workflow.id)?.status, 'awaiting_spec_confirmation');
     assert.equal(reopened.get(workflow.id)?.nextStepIndex, 1);
+    assert.equal(reopened.get(workflow.id)?.executionPolicy, 'approved');
+    assert.equal(reopened.get(workflow.id)?.approvalAttempt, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('重启可修复已落盘工作流与审批之间的关联窗口', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-workflow-approval-link-'));
+  try {
+    const approvals = await JsonApprovalStore.open(join(root, 'approvals.json'));
+    const workflows = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const approval = await approvals.create({
+      botId: 'ceo', ownerOpenId: 'ou_owner', action: 'pipeline', prompt: '部署生产', reason: '生产发布',
+      message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: '', senderOpenId: 'ou' },
+    });
+    const executing = await approvals.beginExecution(approval.id, 'ou_owner');
+    const workflow = await workflows.create({
+      kind: 'team', name: '团队交付流水线', initiatorBotId: 'ceo', goal: approval.prompt,
+      stepIds: ['pm'], executionPolicy: 'approved', approvalId: approval.id,
+      approvalAttempt: executing.executionAttempt, message: approval.message,
+    });
+    const ctx = { approvals, workflows, botsById: new Map() } as unknown as AppContext;
+    await reconcileApprovalExecutions(ctx);
+    assert.equal(approvals.get(approval.id)?.workflowId, workflow.id);
+    assert.equal(approvals.get(approval.id)?.status, 'executing');
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -135,6 +166,22 @@ test('工作流支持在云文档评审节点暂停', async () => {
     const waiting = await store.update(workflow.id, { status: 'awaiting_doc_review', nextStepIndex: 1 });
     assert.equal(waiting.status, 'awaiting_doc_review');
     assert.equal(store.listRecoverable().length, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('同一工作流步骤只能被一个并发执行者认领', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-workflow-claim-'));
+  try {
+    const store = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const workflow = await store.create({
+      kind: 'squad', name: '内部交付小队', initiatorBotId: 'dev', goal: '修复问题', stepIds: ['dev'],
+      message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: '', senderOpenId: 'ou' },
+    });
+    const claims = await Promise.all([store.claimReady(workflow.id), store.claimReady(workflow.id)]);
+    assert.equal(claims.filter(Boolean).length, 1);
+    assert.equal(store.get(workflow.id)?.status, 'executing');
   } finally {
     await rm(root, { recursive: true, force: true });
   }

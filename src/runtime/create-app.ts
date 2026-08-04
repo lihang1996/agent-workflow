@@ -8,6 +8,7 @@ import { reconcileOrphanedCards, shutdownActiveRuns } from './active-runs.js';
 import { handleCardAction, handleMessage } from './message-handler.js';
 import { startScheduler, stopScheduler } from './scheduler.js';
 import { resumeRecoverableWorkflows } from './pipeline-runner.js';
+import { reconcileApprovalExecutions } from './approval-status.js';
 import {
   handleDocumentComment,
   startSpecReviewSync,
@@ -35,6 +36,7 @@ export interface App {
     bot: Bot,
   ) => Promise<void>;
   resumeRecoverableWorkflows: () => Promise<void>;
+  reconcileApprovalExecutions: () => Promise<void>;
 }
 
 /** 组装运行时上下文并绑定消息/卡片处理器。 */
@@ -54,6 +56,7 @@ export function createApp(deps: CreateAppDeps): App {
     stopSpecReviewSync: () => stopSpecReviewSync(ctx),
     handleDocumentComment: (event, bot) => handleDocumentComment(ctx, event, bot),
     resumeRecoverableWorkflows: () => resumeRecoverableWorkflows(ctx),
+    reconcileApprovalExecutions: () => reconcileApprovalExecutions(ctx),
   };
 }
 

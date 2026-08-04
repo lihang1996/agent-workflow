@@ -1,4 +1,10 @@
 export type CliId = "claude" | "codex";
+export type CliExecutionPolicy = 'standard' | 'read-only' | 'approved';
+
+export interface CliBuildOptions {
+  executionPolicy?: CliExecutionPolicy;
+  approvedScope?: string;
+}
 
 export interface CliRunStats {
   durationMs?: number;
@@ -34,8 +40,8 @@ export interface CliAdapter {
   readonly id: CliId;
   readonly command: string;
   readonly displayName: string;
-  buildArgs(prompt: string): string[];
-  buildResumeArgs(prompt: string, sessionId: string): string[];
+  buildArgs(prompt: string, options?: CliBuildOptions): string[];
+  buildResumeArgs(prompt: string, sessionId: string, options?: CliBuildOptions): string[];
   /** 一行 stream-json 可能产出多个事件（如文本 + 工具调用）。 */
   parseEvents(line: string): CliEvent[];
 }

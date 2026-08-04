@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import type { CliAdapter, CliEvent, CliRunResult } from './types.js';
+import type { CliAdapter, CliEvent, CliExecutionPolicy, CliRunResult } from './types.js';
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const useProcessGroup = process.platform !== 'win32';
@@ -14,6 +14,8 @@ export interface RunCliOptions {
   timeoutMs?: number;
   onEvent?: (event: CliEvent) => void;
   env?: NodeJS.ProcessEnv;
+  executionPolicy?: CliExecutionPolicy;
+  approvedScope?: string;
 }
 
 /** 杀掉 CLI 进程组（含孙子进程）。 */
@@ -46,10 +48,12 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
     timeoutMs = DEFAULT_TIMEOUT_MS,
     onEvent,
     env,
+    executionPolicy = 'standard',
+    approvedScope,
   } = options;
   const args = sessionId
-    ? adapter.buildResumeArgs(prompt, sessionId)
-    : adapter.buildArgs(prompt);
+    ? adapter.buildResumeArgs(prompt, sessionId, { executionPolicy, approvedScope })
+    : adapter.buildArgs(prompt, { executionPolicy, approvedScope });
 
   return new Promise((resolve, reject) => {
     // detached 让子进程成为新进程组组长，便于连带杀掉孙子进程。
@@ -57,7 +61,7 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: useProcessGroup,
-      env: { ...process.env, ...env },
+      env: { ...process.env, ...env, AGENT_OS_EXECUTION_POLICY: executionPolicy },
     });
     const lines = createInterface({ input: child.stdout });
     let observedSessionId = sessionId;

@@ -4,8 +4,9 @@ import { highRiskReason, isHighRiskTask } from '../core/risk.js';
 import type { IncomingMessage } from '../im/lark.js';
 import type { AppContext } from './app-context.js';
 import { startCliTask } from './cli-task.js';
-import { runTeamPipeline } from './pipeline-runner.js';
+import { reconcileWorkflowSchedules, runTeamPipeline } from './pipeline-runner.js';
 import { requestHighRiskApproval } from './approval-runner.js';
+import { expireStaleApprovals } from './approval-status.js';
 import { ensureRunnableSession } from './sessions.js';
 
 const TICK_MS = 15_000;
@@ -48,6 +49,12 @@ export async function runDueSchedules(
   if (ctx.shuttingDown || ctx.schedulerRunning) return;
   ctx.schedulerRunning = true;
   try {
+    await expireStaleApprovals(ctx).catch((error) => {
+      console.error('[审批] 清理过期审批失败:', (error as Error).message);
+    });
+    await reconcileWorkflowSchedules(ctx).catch((error) => {
+      console.error('[定时任务] 修复工作流结算失败:', (error as Error).message);
+    });
     for (const job of ctx.schedules.listDue()) {
       let claimed: ScheduledJob | undefined;
       try {
@@ -134,16 +141,24 @@ async function runJob(ctx: AppContext, job: ScheduledJob): Promise<ScheduleExecu
       prompt: job.prompt,
       action: job.kind === 'pipeline' ? 'pipeline' : 'task',
       reason: highRiskReason(job.prompt),
+      scheduleJobId: job.id,
+      scheduleRunCount: job.runCount,
     });
-    return { outcome: 'succeeded' };
+    return { outcome: 'deferred' };
   }
 
   if (job.kind === 'pipeline') {
     if (bot.id !== 'ceo') {
       throw new Error('pipeline 只能由 CEO Bot 发起');
     }
-    await runTeamPipeline(ctx, { ceo: bot, msg, goal: job.prompt });
-    return { outcome: 'succeeded' };
+    await runTeamPipeline(ctx, {
+      ceo: bot,
+      msg,
+      goal: job.prompt,
+      scheduleJobId: job.id,
+      scheduleRunCount: job.runCount,
+    });
+    return { outcome: 'deferred' };
   }
 
   const session = await ensureRunnableSession(ctx, bot, msg);
@@ -163,6 +178,7 @@ async function runJob(ctx: AppContext, job: ScheduledJob): Promise<ScheduleExecu
     msg,
     session,
     prompt,
+    executionPolicy: job.kind === 'log_inspection' ? 'read-only' : 'standard',
     onSuccess: async () => settleDeferredRun(ctx, job.id, 'succeeded'),
     onFailure: async (error) => settleDeferredRun(ctx, job.id, 'failed', error.message),
   });

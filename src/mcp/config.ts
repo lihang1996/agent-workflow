@@ -34,7 +34,7 @@ export function isMcpStrict(): boolean {
   return value === '1' || value === 'true' || value === 'yes' || value === 'on';
 }
 
-function tsxLoaderPath(): string {
+export function tsxLoaderPath(): string {
   return join(AGENT_OS_ROOT, 'node_modules', 'tsx', 'dist', 'loader.mjs');
 }
 

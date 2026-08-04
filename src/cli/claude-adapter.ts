@@ -1,5 +1,13 @@
 import { claudeMcpFlags } from "../mcp/config.js";
-import type { CliAdapter, CliEvent, CliRunStats } from "./types.js";
+import { instructionsForExecutionPolicy, promptForExecutionPolicy } from './execution-policy.js';
+import { ensureClaudePermissionSettingsFile } from './permission-hook.js';
+import type {
+  CliAdapter,
+  CliBuildOptions,
+  CliEvent,
+  CliExecutionPolicy,
+  CliRunStats,
+} from "./types.js";
 
 interface ClaudeEvent {
   type?: unknown;
@@ -120,15 +128,30 @@ function parseStats(event: ClaudeEvent): CliRunStats | undefined {
     : undefined;
 }
 
-function outputArgs(prompt: string): string[] {
+function outputArgs(prompt: string, policy: CliExecutionPolicy, approvedScope?: string): string[] {
   return [
     "-p",
-    prompt,
+    promptForExecutionPolicy(prompt, policy, approvedScope),
+    '--append-system-prompt',
+    instructionsForExecutionPolicy(policy, approvedScope),
     "--output-format",
     "stream-json",
     "--verbose",
-    ...claudeMcpFlags(),
+    ...permissionFlags(policy),
+    ...(policy === 'approved' ? [] : ['--settings', ensureClaudePermissionSettingsFile()]),
+    ...(policy === 'read-only'
+      ? ['--mcp-config', '{"mcpServers":{}}', '--strict-mcp-config']
+      : claudeMcpFlags()),
   ];
+}
+
+function permissionFlags(policy: CliExecutionPolicy): string[] {
+  if (policy === 'approved') return ['--dangerously-skip-permissions'];
+  if (policy === 'read-only') {
+    return ['--permission-mode', 'dontAsk', '--tools', 'Read,Glob,Grep'];
+  }
+  // 非交互运行不能把权限请求悬挂在终端；需要高权限时由 Agent OS 飞书审批门重启任务。
+  return ['--permission-mode', 'dontAsk'];
 }
 
 export class ClaudeAdapter implements CliAdapter {
@@ -136,12 +159,16 @@ export class ClaudeAdapter implements CliAdapter {
   readonly command = "claude";
   readonly displayName = "Claude Code";
 
-  buildArgs(prompt: string): string[] {
-    return outputArgs(prompt);
+  buildArgs(prompt: string, options: CliBuildOptions = {}): string[] {
+    return outputArgs(prompt, options.executionPolicy ?? 'standard', options.approvedScope);
   }
 
-  buildResumeArgs(prompt: string, sessionId: string): string[] {
-    return ["--resume", sessionId, ...outputArgs(prompt)];
+  buildResumeArgs(prompt: string, sessionId: string, options: CliBuildOptions = {}): string[] {
+    return [
+      "--resume",
+      sessionId,
+      ...outputArgs(prompt, options.executionPolicy ?? 'standard', options.approvedScope),
+    ];
   }
 
   parseEvent(line: string): CliEvent | undefined {

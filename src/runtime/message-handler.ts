@@ -33,7 +33,8 @@ import {
   resumeWorkflowForSpecRevision,
 } from './pipeline-runner.js';
 import { approveSpecReview, publishSpecToDoc, requestSpecChangesFromCard } from './spec-review.js';
-import { requestHighRiskApproval, runApprovedAction } from './approval-runner.js';
+import { executeApprovedAction, requestHighRiskApproval } from './approval-runner.js';
+import { settleApprovalSchedule } from './approval-status.js';
 import {
   ensureRunnableSession,
   formatSessionStatus,
@@ -721,36 +722,73 @@ export async function handleCardAction(
     formValue: Record<string, unknown>;
   },
 ) {
-  if (action.value.action === 'approve_high_risk' || action.value.action === 'reject_high_risk') {
+  if (
+    action.value.action === 'approve_high_risk'
+    || action.value.action === 'reject_high_risk'
+    || action.value.action === 'retry_high_risk'
+  ) {
     const approvalId = typeof action.value.approvalId === 'string' ? action.value.approvalId : '';
     try {
-      const approval = ctx.approvals.get(approvalId);
+      let approval = ctx.approvals.get(approvalId);
       if (!approval) throw new Error('审批不存在或已被删除。');
       if (action.operatorOpenId !== approval.ownerOpenId) {
         return { toast: { type: 'warning' as const, content: '只有指定负责人可以处理该审批。' } };
       }
-      const approved = action.value.action === 'approve_high_risk';
-      const decided = await ctx.approvals.decide(approval.id, approved ? 'approved' : 'rejected', action.operatorOpenId);
-      if (!approved) {
+      // 兼容升级前未记录 message_id 的审批；之后的异步结果仍能更新原卡。
+      if (!approval.cardMessageId && action.messageId) {
+        approval = await ctx.approvals.setCardMessageId(approval.id, action.messageId);
+      }
+      if (action.value.action === 'reject_high_risk') {
+        const rejected = await ctx.approvals.reject(approval.id, action.operatorOpenId);
+        await settleApprovalSchedule(ctx, rejected, 'skipped', '负责人拒绝审批').catch((error) => {
+          console.error(`[审批] ${rejected.id} 拒绝结算失败:`, (error as Error).message);
+        });
         return {
           toast: { type: 'info' as const, content: '已拒绝，高风险任务不会执行。' },
-          card: { type: 'raw' as const, data: buildApprovalCard(decided) },
+          card: { type: 'raw' as const, data: buildApprovalCard(rejected) },
         };
       }
-      try {
-        await runApprovedAction(ctx, decided);
-      } catch (error) {
+
+      if (action.value.action === 'retry_high_risk' && approval.status !== 'failed') {
         return {
-          toast: { type: 'error' as const, content: `已批准但启动失败：${(error as Error).message}` },
-          card: { type: 'raw' as const, data: buildApprovalCard(decided) },
+          toast: { type: 'info' as const, content: `审批当前状态为 ${approval.status}，无需重试。` },
+          card: { type: 'raw' as const, data: buildApprovalCard(approval) },
+        };
+      }
+      if (action.value.action === 'approve_high_risk' && approval.status === 'failed') {
+        return {
+          toast: { type: 'info' as const, content: '上次执行已失败，请使用最新卡片上的重试按钮。' },
+          card: { type: 'raw' as const, data: buildApprovalCard(approval) },
+        };
+      }
+      if (action.value.action === 'retry_high_risk' && approval.scheduleJobId) {
+        return {
+          toast: { type: 'info' as const, content: '定时任务会自动补偿重试，请使用下一张审批卡。' },
+          card: { type: 'raw' as const, data: buildApprovalCard(approval) },
+        };
+      }
+      const executing = await executeApprovedAction(ctx, approval.id, action.operatorOpenId);
+      if (executing.status === 'failed') {
+        return {
+          toast: { type: 'error' as const, content: `启动失败：${executing.executionError ?? '未知错误'}，可在卡片上重试。` },
+          card: { type: 'raw' as const, data: buildApprovalCard(executing) },
         };
       }
       return {
         toast: { type: 'success' as const, content: '已批准，任务开始执行。' },
-        card: { type: 'raw' as const, data: buildApprovalCard(decided) },
+        card: { type: 'raw' as const, data: buildApprovalCard(executing) },
       };
     } catch (error) {
-      return { toast: { type: 'error' as const, content: (error as Error).message } };
+      const latest = approvalId ? ctx.approvals.get(approvalId) : undefined;
+      if (latest?.status === 'expired' || latest?.status === 'rejected') {
+        await settleApprovalSchedule(ctx, latest, 'skipped', latest.executionError).catch((settleError) => {
+          console.error(`[审批] ${latest.id} 定时任务结算失败:`, (settleError as Error).message);
+        });
+      }
+      return {
+        toast: { type: 'error' as const, content: (error as Error).message },
+        ...(latest ? { card: { type: 'raw' as const, data: buildApprovalCard(latest) } } : {}),
+      };
     }
   }
   if (action.value.action === 'approve_spec_review' || action.value.action === 'request_spec_changes') {
