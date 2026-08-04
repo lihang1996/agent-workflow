@@ -13,7 +13,7 @@ const ActiveRunSchema = z.object({
   progress: z.number().min(0).max(100),
   detail: z.string(),
   activities: z.array(z.string()).default([]),
-  updatedAt: z.string().min(1),
+  updatedAt: z.iso.datetime(),
 });
 
 export type PersistedActiveRun = z.infer<typeof ActiveRunSchema>;
@@ -33,13 +33,24 @@ export class JsonActiveRunStore {
       throw error;
     }
 
-    const rows: unknown = JSON.parse(content);
-    if (!Array.isArray(rows)) return [];
+    let rows: unknown;
+    try {
+      rows = JSON.parse(content);
+    } catch (error) {
+      throw new Error(`进行中任务文件不是有效 JSON: ${this.filePath}`, { cause: error });
+    }
+    if (!Array.isArray(rows)) throw new Error(`进行中任务文件格式错误: ${this.filePath}`);
 
     const runs: PersistedActiveRun[] = [];
-    for (const row of rows) {
+    for (const [index, row] of rows.entries()) {
       const result = ActiveRunSchema.safeParse(row);
-      if (result.success) runs.push(result.data);
+      if (!result.success) {
+        const issue = result.error.issues[0];
+        throw new Error(
+          `进行中任务文件第 ${index + 1} 条记录格式错误: ${issue?.path.join('.') || '(根)'} ${issue?.message ?? ''}`.trim(),
+        );
+      }
+      runs.push(result.data);
     }
     return runs;
   }

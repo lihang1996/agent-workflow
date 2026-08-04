@@ -41,18 +41,25 @@ export class JsonSessionStore implements SessionStore {
       throw error;
     }
 
-    const rows: unknown = JSON.parse(content);
+    let rows: unknown;
+    try {
+      rows = JSON.parse(content);
+    } catch (error) {
+      throw new Error(`会话文件不是有效 JSON: ${this.filePath}`, { cause: error });
+    }
     if (!Array.isArray(rows)) {
       throw new Error(`会话文件格式错误: ${this.filePath}`);
     }
 
     const sessions: Session[] = [];
     let needsCleanup = false;
-    for (const row of rows) {
+    for (const [index, row] of rows.entries()) {
       const result = SessionSchema.safeParse(row);
       if (!result.success) {
-        needsCleanup = true;
-        continue;
+        const issue = result.error.issues[0];
+        throw new Error(
+          `会话文件第 ${index + 1} 条记录格式错误: ${issue?.path.join('.') || '(根)'} ${issue?.message ?? ''}`.trim(),
+        );
       }
 
       const recovered = recoverInterruptedSession(result.data);

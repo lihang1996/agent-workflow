@@ -40,7 +40,7 @@ const ALLOWED_TRANSITIONS: Record<SessionStatus, SessionStatus[]> = {
   creating: ['active', 'closed'],
   active: ['idle', 'closed'],
   idle: ['active', 'closed'],
-  closed: ['idle'], // /reopen
+  closed: [],
 };
 
 /** 话题 ID：优先 thread，其次 root，最后消息本身。 */
@@ -71,11 +71,15 @@ export class SessionManager {
   static async open(options: SessionManagerOptions = {}): Promise<SessionManager> {
     const manager = new SessionManager(options);
     const restored = await options.store?.load() ?? [];
+    const restoredIds = new Set<string>();
     for (const session of restored) {
-      manager.sessions.set(
-        sessionKey(session.chatId, session.threadId, session.botId),
-        session,
-      );
+      const key = sessionKey(session.chatId, session.threadId, session.botId);
+      if (restoredIds.has(session.id)) throw new Error(`会话文件包含重复 ID: ${session.id}`);
+      if (manager.sessions.has(key)) {
+        throw new Error(`会话文件包含重复话题角色: ${session.chatId}/${session.threadId}/${session.botId}`);
+      }
+      restoredIds.add(session.id);
+      manager.sessions.set(key, session);
     }
     return manager;
   }
@@ -223,15 +227,32 @@ export class SessionManager {
 
   /** 清理同一话题下所有角色的 CLI 上下文（例如切换项目目录后）。 */
   async clearCliContextForTopic(chatId: string, threadId: string): Promise<number> {
-    let count = 0;
-    for (const session of this.sessions.values()) {
+    const changes: Array<{ key: string; previous: Session; next: Session }> = [];
+    for (const [key, session] of this.sessions) {
       if (session.chatId !== chatId || session.threadId !== threadId) continue;
       if (session.status === 'active' || session.status === 'closed') continue;
       if (!session.cliSessionId) continue;
-      await this.clearCliContext(session.id);
-      count += 1;
+      const next: Session = {
+        ...session,
+        cliSessionId: undefined,
+        status: session.status === 'creating' ? 'creating' : 'idle',
+        updatedAt: this.now().toISOString(),
+      };
+      changes.push({ key, previous: session, next });
+      this.sessions.set(key, next);
     }
-    return count;
+    if (changes.length === 0) return 0;
+    try {
+      await this.persist();
+    } catch (error) {
+      for (const change of changes) {
+        if (this.sessions.get(change.key) === change.next) {
+          this.sessions.set(change.key, change.previous);
+        }
+      }
+      throw error;
+    }
+    return changes.length;
   }
 
   /** 重新打开已关闭会话，并清空 CLI 上下文。 */
@@ -242,10 +263,10 @@ export class SessionManager {
       throw new Error('当前会话未关闭，无需 reopen');
     }
 
-    const reopened = await this.transition(sessionId, 'idle');
     const updated: Session = {
-      ...reopened,
+      ...current,
       cliSessionId: undefined,
+      status: 'idle',
       updatedAt: this.now().toISOString(),
     };
     const key = sessionKey(updated.chatId, updated.threadId, updated.botId);
@@ -253,7 +274,7 @@ export class SessionManager {
     try {
       await this.persist();
     } catch (error) {
-      if (this.sessions.get(key) === updated) this.sessions.set(key, reopened);
+      if (this.sessions.get(key) === updated) this.sessions.set(key, current);
       throw error;
     }
     return updated;
@@ -261,13 +282,22 @@ export class SessionManager {
 
   /** 删除所有已关闭会话，释放 sessions.json。 */
   async purgeClosed(): Promise<number> {
-    const before = this.sessions.size;
+    const removedEntries: Array<[string, Session]> = [];
     for (const [key, session] of [...this.sessions.entries()]) {
-      if (session.status === 'closed') this.sessions.delete(key);
+      if (session.status !== 'closed') continue;
+      removedEntries.push([key, session]);
+      this.sessions.delete(key);
     }
-    const removed = before - this.sessions.size;
-    if (removed > 0) await this.persist();
-    return removed;
+    if (removedEntries.length === 0) return 0;
+    try {
+      await this.persist();
+    } catch (error) {
+      for (const [key, session] of removedEntries) {
+        if (!this.sessions.has(key)) this.sessions.set(key, session);
+      }
+      throw error;
+    }
+    return removedEntries.length;
   }
 
   /** 列出某话题下所有角色会话。 */

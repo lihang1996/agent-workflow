@@ -85,10 +85,12 @@ export async function reconcileOrphanedCards(ctx: AppContext): Promise<void> {
   if (orphans.length === 0) return;
 
   console.log(`[任务] 发现 ${orphans.length} 张上次未收尾的任务卡片，正在标记为中断…`);
+  const remaining: PersistedActiveRun[] = [];
   for (const orphan of orphans) {
     const bot = ctx.botsById.get(orphan.botId);
     if (!bot) {
       console.warn(`[任务] 无法收尾卡片 bot=${orphan.botId} card=${orphan.cardId}（Bot 未连接）`);
+      remaining.push(orphan);
       continue;
     }
     try {
@@ -99,13 +101,18 @@ export async function reconcileOrphanedCards(ctx: AppContext): Promise<void> {
       }));
       console.log(`[任务] 已收尾遗留卡片 bot=${orphan.botId} card=${orphan.cardId}`);
     } catch (error) {
+      remaining.push(orphan);
       console.error(
         `[任务] 收尾遗留卡片失败 bot=${orphan.botId} card=${orphan.cardId}:`,
         (error as Error).message,
       );
     }
   }
-  await ctx.activeRunStore.clear();
+  if (remaining.length === 0) await ctx.activeRunStore.clear();
+  else {
+    await ctx.activeRunStore.save(remaining);
+    console.warn(`[任务] 仍有 ${remaining.length} 张遗留卡片待下次启动重试收尾`);
+  }
 }
 
 /** SIGTERM/异常退出时中断未完成任务并刷卡。 */
