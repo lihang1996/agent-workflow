@@ -21,7 +21,7 @@ import {
 } from './active-runs.js';
 import { startCliTask } from './cli-task.js';
 import { runCollabReview } from './collab-runner.js';
-import { runTeamPipeline } from './pipeline-runner.js';
+import { runDeliverySquad, runTeamPipeline } from './pipeline-runner.js';
 import {
   ensureRunnableSession,
   formatSessionStatus,
@@ -333,6 +333,22 @@ export async function handleMessage(
     }
     return;
   }
+  if (command?.name === 'squad') {
+    if (bot.id !== 'dev' && bot.id !== 'ceo') {
+      await bot.reply(msg.messageId, '内部交付小队请由开发工程师或 CEO 发起：/squad <目标>', hasThread);
+      return;
+    }
+    if (!command.arg) {
+      await bot.reply(msg.messageId, '用法：/squad <目标>\n步骤：架构 → 开发 → 评审 → QA', hasThread);
+      return;
+    }
+    try {
+      await runDeliverySquad(ctx, { initiator: bot, msg, goal: command.arg });
+    } catch (error) {
+      await bot.reply(msg.messageId, (error as Error).message, hasThread);
+    }
+    return;
+  }
   if (command?.name === 'reset') {
     try {
       await ctx.sessions.clearCliContext(session.id);
@@ -449,6 +465,7 @@ function buildHelpText(bot: Bot): string {
       `我是 ${bot.name}（${bot.id}）· 团队统一入口`,
       '直接描述目标 → 启动交付流水线（PM→架构→开发→评审→测试→汇总）',
       '/pipeline <目标> 显式启动流水线',
+      '/squad <目标> 启动开发内部交付小队',
       '/handoff <角色> <任务> 只交给某一个角色',
       '/status 查看当前会话',
       '/workdir [路径] 查看/设置本话题项目目录（clear 清除）',
@@ -467,6 +484,7 @@ function buildHelpText(bot: Bot): string {
     '/engine claude|codex 切换执行引擎',
     '/handoff <角色> <任务> 交接给同话题其他角色',
     '/review <任务> 评审→开发协作（意见自动回传，可多轮）',
+    '/squad <目标> 架构→开发→评审→QA 内部交付小队',
     '/reset /reopen /close /clean 会话管理',
     '执行中可点任务卡片「停止任务」（仅发起人）',
   ].join('\n');
