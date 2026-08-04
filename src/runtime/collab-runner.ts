@@ -50,104 +50,117 @@ export async function runCollabReview(
   }
 
   const topicKey = collabTopicKey(msg.chatId, topicIdOf(msg));
-  await ctx.collabStore.setRound(topicKey, round);
-
   const reviewerSession = await ensureRunnableSession(ctx, reviewer, msg);
   if (!reviewerSession) {
     throw new Error(`${reviewer.name} 正在执行任务，请稍后再发起评审`);
   }
+  await ctx.collabStore.setRound(topicKey, round);
+  let failureReported = false;
+  const reportFailure = async (error: Error) => {
+    await ctx.collabStore.clearRound(topicKey).catch((persistError) => {
+      console.error('[协作] 清理失败轮次异常:', (persistError as Error).message);
+    });
+    if (failureReported) return;
+    failureReported = true;
+    if (onFailure) await onFailure(error);
+  };
 
   const reviewPrompt = priorDevResult
     ? buildFollowUpReviewPrompt(task, round, priorDevResult)
     : buildInitialReviewPrompt(task, round);
 
   console.log(`[协作] 第 ${round}/${ctx.collabMaxRounds} 轮评审开始`);
-  await initiator.reply(
-    msg.messageId,
-    `协作第 ${round}/${ctx.collabMaxRounds} 轮：交给 ${reviewer.name} 评审。`,
-    hasThread,
-  );
+  try {
+    await initiator.reply(
+      msg.messageId,
+      `协作第 ${round}/${ctx.collabMaxRounds} 轮：交给 ${reviewer.name} 评审。`,
+      hasThread,
+    );
 
-  await startCliTask(ctx, {
-    bot: reviewer,
-    msg,
-    session: reviewerSession,
-    prompt: reviewPrompt,
-    executionPolicy,
-    approvedScope,
-    onFailure,
-    onSuccess: async (reviewAnswer) => {
-      if (ctx.shuttingDown) return;
-      if (isReviewApproved(reviewAnswer)) {
-        console.log(`[协作] 第 ${round} 轮评审通过`);
-        await ctx.collabStore.clearRound(topicKey);
+    await startCliTask(ctx, {
+      bot: reviewer,
+      msg,
+      session: reviewerSession,
+      prompt: reviewPrompt,
+      executionPolicy,
+      approvedScope,
+      onFailure: reportFailure,
+      onSuccess: async (reviewAnswer) => {
+        if (ctx.shuttingDown) return;
+        if (isReviewApproved(reviewAnswer)) {
+          console.log(`[协作] 第 ${round} 轮评审通过`);
+          await ctx.collabStore.clearRound(topicKey);
+          await initiator.reply(
+            msg.messageId,
+            `第 ${round} 轮评审通过（[APPROVED]）。协作结束。`,
+            hasThread,
+          );
+          if (onComplete) await onComplete({ approved: true, answer: reviewAnswer });
+          return;
+        }
+
+        const devSession = await ensureRunnableSession(ctx, dev, msg);
+        if (!devSession) {
+          await initiator.reply(
+            msg.messageId,
+            `${dev.name} 正忙，评审意见未能自动回传。请稍后手动 /handoff dev。`,
+            hasThread,
+          );
+          await reportFailure(new Error(`${dev.name} 正忙，评审意见未能自动回传。`));
+          return;
+        }
+
+        console.log(`[协作] 第 ${round} 轮：评审意见回传开发`);
         await initiator.reply(
           msg.messageId,
-          `第 ${round} 轮评审通过（[APPROVED]）。协作结束。`,
+          `第 ${round} 轮评审未通过，意见已自动回传给 ${dev.name}。`,
           hasThread,
         );
-        if (onComplete) await onComplete({ approved: true, answer: reviewAnswer });
-        return;
-      }
 
-      const devSession = await ensureRunnableSession(ctx, dev, msg);
-      if (!devSession) {
-        await initiator.reply(
-          msg.messageId,
-          `${dev.name} 正忙，评审意见未能自动回传。请稍后手动 /handoff dev。`,
-          hasThread,
-        );
-        if (onFailure) await onFailure(new Error(`${dev.name} 正忙，评审意见未能自动回传。`));
-        return;
-      }
+        await startCliTask(ctx, {
+          bot: dev,
+          msg,
+          session: devSession,
+          prompt: buildFixFromReviewPrompt(reviewer, reviewAnswer, round),
+          executionPolicy,
+          approvedScope,
+          onFailure: reportFailure,
+          onSuccess: async (devAnswer) => {
+            if (ctx.shuttingDown) return;
+            if (round >= ctx.collabMaxRounds) {
+              console.log(`[协作] 已达最大轮次 ${ctx.collabMaxRounds}，停止自动循环`);
+              await ctx.collabStore.clearRound(topicKey);
+              await initiator.reply(
+                msg.messageId,
+                [
+                  `已完成 ${round} 轮协作（达到上限 ${ctx.collabMaxRounds}）。`,
+                  '如需继续，请再次发送 /review <任务>，或人工确认结果。',
+                ].join('\n'),
+                hasThread,
+              );
+              if (onComplete) await onComplete({ approved: false, answer: devAnswer });
+              return;
+            }
 
-      console.log(`[协作] 第 ${round} 轮：评审意见回传开发`);
-      await initiator.reply(
-        msg.messageId,
-        `第 ${round} 轮评审未通过，意见已自动回传给 ${dev.name}。`,
-        hasThread,
-      );
-
-      await startCliTask(ctx, {
-        bot: dev,
-        msg,
-        session: devSession,
-        prompt: buildFixFromReviewPrompt(reviewer, reviewAnswer, round),
-        executionPolicy,
-        approvedScope,
-        onFailure,
-        onSuccess: async (devAnswer) => {
-          if (ctx.shuttingDown) return;
-          if (round >= ctx.collabMaxRounds) {
-            console.log(`[协作] 已达最大轮次 ${ctx.collabMaxRounds}，停止自动循环`);
-            await ctx.collabStore.clearRound(topicKey);
-            await initiator.reply(
-              msg.messageId,
-              [
-                `已完成 ${round} 轮协作（达到上限 ${ctx.collabMaxRounds}）。`,
-                '如需继续，请再次发送 /review <任务>，或人工确认结果。',
-              ].join('\n'),
-              hasThread,
-            );
-            if (onComplete) await onComplete({ approved: false, answer: devAnswer });
-            return;
-          }
-
-          const nextRound = round + 1;
-          console.log(`[协作] 开发完成，进入第 ${nextRound} 轮复审`);
-          await runCollabReview(ctx, {
-            initiator,
-            msg,
-            task,
-            round: nextRound,
-            priorDevResult: devAnswer,
-            executionPolicy,
-            approvedScope,
-            onComplete,
-            onFailure,
-          });
-        },
-      });
-    },
-  });
+            const nextRound = round + 1;
+            console.log(`[协作] 开发完成，进入第 ${nextRound} 轮复审`);
+            await runCollabReview(ctx, {
+              initiator,
+              msg,
+              task,
+              round: nextRound,
+              priorDevResult: devAnswer,
+              executionPolicy,
+              approvedScope,
+              onComplete,
+              onFailure,
+            });
+          },
+        });
+      },
+    });
+  } catch (error) {
+    await reportFailure(error as Error);
+    throw error;
+  }
 }

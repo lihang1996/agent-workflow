@@ -14,7 +14,15 @@ export function parseMaxRounds(value: string | undefined): number {
 
 /** 评审结果是否判定为通过。 */
 export function isReviewApproved(answer: string): boolean {
-  return /\[APPROVED\]|\bLGTM\b|评审通过|审核通过|可以合并|无需修改/i.test(answer);
+  return answer.normalize('NFKC').split(/\r?\n/).some((line) => {
+    const conclusion = line
+      .trim()
+      .replace(/^(?:[-*+]\s+|#{1,6}\s*)/, '')
+      .replace(/^(?:最终)?结论\s*[:：]\s*/i, '')
+      .trim();
+    return /^(?:\[APPROVED\]|LGTM)(?:\s*[。.!！])?$/i.test(conclusion)
+      || /^(?:评审通过|审核通过|可以合并|无需修改)(?:\s*[。.!！])?$/.test(conclusion);
+  });
 }
 
 /** 构造首轮评审 prompt。 */
