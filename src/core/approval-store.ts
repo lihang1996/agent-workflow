@@ -17,7 +17,7 @@ export const ApprovalSchema = z.object({
   id: z.string().min(1),
   botId: z.string().min(1),
   ownerOpenId: z.string().min(1),
-  action: z.enum(['task', 'pipeline']),
+  action: z.enum(['task', 'pipeline', 'squad']),
   prompt: z.string().min(1),
   reason: z.string().min(1),
   message: StoredMessageSchema,

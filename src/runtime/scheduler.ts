@@ -1,9 +1,11 @@
 import type { ScheduledJob } from '../core/schedule-store.js';
 import { buildLogInspectionPrompt } from '../core/log-inspection.js';
+import { highRiskReason, isHighRiskTask } from '../core/risk.js';
 import type { IncomingMessage } from '../im/lark.js';
 import type { AppContext } from './app-context.js';
 import { startCliTask } from './cli-task.js';
 import { runTeamPipeline } from './pipeline-runner.js';
+import { requestHighRiskApproval } from './approval-runner.js';
 import { ensureRunnableSession } from './sessions.js';
 
 const TICK_MS = 15_000;
@@ -47,7 +49,7 @@ async function runJob(ctx: AppContext, job: ScheduledJob): Promise<void> {
     return;
   }
   const label = job.kind === 'log_inspection' ? '服务端日志巡检' : job.kind === 'pipeline' ? '团队交付流水线' : '定时任务';
-  const kickoffId = await bot.sendText(job.message.chatId, `⏰ ${label}开始执行：${job.prompt}`)
+  const kickoffId = await bot.sendText(job.message.chatId, `⏰ ${label}已触发：${job.prompt}`)
     .catch((error) => {
       console.error(`[定时任务] ${job.id} 无法发送启动消息:`, (error as Error).message);
       return undefined;
@@ -65,6 +67,17 @@ async function runJob(ctx: AppContext, job: ScheduledJob): Promise<void> {
     mentions: [],
     rawContent: JSON.stringify({ text: '' }),
   };
+
+  if (isHighRiskTask(job.prompt)) {
+    await requestHighRiskApproval(ctx, {
+      bot,
+      msg,
+      prompt: job.prompt,
+      action: job.kind === 'pipeline' ? 'pipeline' : 'task',
+      reason: highRiskReason(job.prompt),
+    });
+    return;
+  }
 
   if (job.kind === 'pipeline') {
     if (bot.id !== 'ceo') {

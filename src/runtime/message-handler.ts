@@ -13,9 +13,10 @@ import { requestTaskAbort } from '../core/task-abort.js';
 import { assertWorkdir } from '../core/workdir.js';
 import { formatScheduleInterval, parseScheduleInterval } from '../core/schedule-store.js';
 import { assertLogFile } from '../core/log-inspection.js';
+import { highRiskReason, isHighRiskTask } from '../core/risk.js';
 import { resolveMentions } from '../im/message-parser.js';
 import { isAddressedToBot, type Bot, type IncomingMessage } from '../im/lark.js';
-import { buildQuestionnaireCard, buildSpecConfirmationCard, buildSpecReviewCard } from '../im/workflow-card.js';
+import { buildApprovalCard, buildQuestionnaireCard, buildSpecConfirmationCard, buildSpecReviewCard } from '../im/workflow-card.js';
 import type { AppContext } from './app-context.js';
 import {
   freezeRunCard,
@@ -24,6 +25,7 @@ import {
 import { startCliTask } from './cli-task.js';
 import { runCollabReview } from './collab-runner.js';
 import { runDeliverySquad, runTeamPipeline } from './pipeline-runner.js';
+import { requestHighRiskApproval, runApprovedAction } from './approval-runner.js';
 import {
   ensureRunnableSession,
   formatSessionStatus,
@@ -328,6 +330,20 @@ export async function handleMessage(
       );
       return;
     }
+    if (isHighRiskTask(command.arg)) {
+      try {
+        await requestHighRiskApproval(ctx, {
+          bot,
+          msg,
+          prompt: command.arg,
+          action: 'pipeline',
+          reason: highRiskReason(command.arg),
+        });
+      } catch (error) {
+        await bot.reply(msg.messageId, (error as Error).message, hasThread);
+      }
+      return;
+    }
     try {
       await runTeamPipeline(ctx, { ceo: bot, msg, goal: command.arg });
     } catch (error) {
@@ -344,8 +360,40 @@ export async function handleMessage(
       await bot.reply(msg.messageId, '用法：/squad <目标>\n步骤：架构 → 开发 → 评审 → QA', hasThread);
       return;
     }
+    if (isHighRiskTask(command.arg)) {
+      try {
+        await requestHighRiskApproval(ctx, {
+          bot,
+          msg,
+          prompt: command.arg,
+          action: 'squad',
+          reason: highRiskReason(command.arg),
+        });
+      } catch (error) {
+        await bot.reply(msg.messageId, (error as Error).message, hasThread);
+      }
+      return;
+    }
     try {
       await runDeliverySquad(ctx, { initiator: bot, msg, goal: command.arg });
+    } catch (error) {
+      await bot.reply(msg.messageId, (error as Error).message, hasThread);
+    }
+    return;
+  }
+  if (command?.name === 'approval') {
+    if (!command.arg) {
+      await bot.reply(msg.messageId, '用法：/approval <高风险任务>。批准后才会执行。', hasThread);
+      return;
+    }
+    try {
+      await requestHighRiskApproval(ctx, {
+        bot,
+        msg,
+        prompt: command.arg,
+        action: 'task',
+        reason: '用户显式要求审批',
+      });
     } catch (error) {
       await bot.reply(msg.messageId, (error as Error).message, hasThread);
     }
@@ -528,8 +576,37 @@ export async function handleMessage(
       );
       return;
     }
+    if (isHighRiskTask(goal)) {
+      try {
+        await requestHighRiskApproval(ctx, {
+          bot,
+          msg,
+          prompt: goal,
+          action: 'pipeline',
+          reason: highRiskReason(goal),
+        });
+      } catch (error) {
+        await bot.reply(msg.messageId, (error as Error).message, hasThread);
+      }
+      return;
+    }
     try {
       await runTeamPipeline(ctx, { ceo: bot, msg, goal });
+    } catch (error) {
+      await bot.reply(msg.messageId, (error as Error).message, hasThread);
+    }
+    return;
+  }
+
+  if (isHighRiskTask(resolved)) {
+    try {
+      await requestHighRiskApproval(ctx, {
+        bot,
+        msg,
+        prompt: resolved,
+        action: 'task',
+        reason: highRiskReason(resolved),
+      });
     } catch (error) {
       await bot.reply(msg.messageId, (error as Error).message, hasThread);
     }
@@ -554,6 +631,7 @@ function buildHelpText(bot: Bot): string {
       '/pipeline <目标> 显式启动流水线',
       '/squad <目标> 启动开发内部交付小队',
       '/schedule … 创建/管理定时任务',
+      '/approval <任务> 发起高风险操作审批',
       '/handoff <角色> <任务> 只交给某一个角色',
       '/status 查看当前会话',
       '/workdir [路径] 查看/设置本话题项目目录（clear 清除）',
@@ -574,6 +652,7 @@ function buildHelpText(bot: Bot): string {
     '/review <任务> 评审→开发协作（意见自动回传，可多轮）',
     '/squad <目标> 架构→开发→评审→QA 内部交付小队',
     '/schedule … 创建/管理定时任务',
+    '/approval <任务> 发起高风险操作审批',
     '/reset /reopen /close /clean 会话管理',
     '执行中可点任务卡片「停止任务」（仅发起人）',
   ].join('\n');
@@ -589,6 +668,38 @@ export async function handleCardAction(
     formValue: Record<string, unknown>;
   },
 ) {
+  if (action.value.action === 'approve_high_risk' || action.value.action === 'reject_high_risk') {
+    const approvalId = typeof action.value.approvalId === 'string' ? action.value.approvalId : '';
+    try {
+      const approval = ctx.approvals.get(approvalId);
+      if (!approval) throw new Error('审批不存在或已被删除。');
+      if (action.operatorOpenId !== approval.ownerOpenId) {
+        return { toast: { type: 'warning' as const, content: '只有指定负责人可以处理该审批。' } };
+      }
+      const approved = action.value.action === 'approve_high_risk';
+      const decided = await ctx.approvals.decide(approval.id, approved ? 'approved' : 'rejected', action.operatorOpenId);
+      if (!approved) {
+        return {
+          toast: { type: 'info' as const, content: '已拒绝，高风险任务不会执行。' },
+          card: { type: 'raw' as const, data: buildApprovalCard(decided) },
+        };
+      }
+      try {
+        await runApprovedAction(ctx, decided);
+      } catch (error) {
+        return {
+          toast: { type: 'error' as const, content: `已批准但启动失败：${(error as Error).message}` },
+          card: { type: 'raw' as const, data: buildApprovalCard(decided) },
+        };
+      }
+      return {
+        toast: { type: 'success' as const, content: '已批准，任务开始执行。' },
+        card: { type: 'raw' as const, data: buildApprovalCard(decided) },
+      };
+    } catch (error) {
+      return { toast: { type: 'error' as const, content: (error as Error).message } };
+    }
+  }
   if (action.value.action === 'approve_spec_review' || action.value.action === 'request_spec_changes') {
     const specId = typeof action.value.specId === 'string' ? action.value.specId : '';
     try {

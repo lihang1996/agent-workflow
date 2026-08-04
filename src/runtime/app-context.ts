@@ -4,6 +4,7 @@ import type { JsonCollabStore } from '../core/collab-store.js';
 import type { JsonQuestionnaireStore } from '../core/questionnaire-store.js';
 import type { JsonSpecStore } from '../core/spec-store.js';
 import type { JsonScheduleStore } from '../core/schedule-store.js';
+import type { JsonApprovalStore } from '../core/approval-store.js';
 import type { PipelineStep } from '../core/pipeline.js';
 import type { SessionManager } from '../core/session-manager.js';
 import type { JsonTopicStore } from '../core/topic-store.js';
@@ -30,6 +31,7 @@ export interface AppContext extends AppConfig {
   questionnaires: JsonQuestionnaireStore;
   specs: JsonSpecStore;
   schedules: JsonScheduleStore;
+  approvals: JsonApprovalStore;
   botsById: Map<string, Bot>;
   persistTimer?: ReturnType<typeof setTimeout>;
   schedulerTimer?: ReturnType<typeof setInterval>;
@@ -44,6 +46,7 @@ export interface CreateAppDeps {
   questionnaires: JsonQuestionnaireStore;
   specs: JsonSpecStore;
   schedules: JsonScheduleStore;
+  approvals: JsonApprovalStore;
   config: AppConfig;
 }
 
@@ -61,6 +64,7 @@ export function createAppContext(deps: CreateAppDeps): AppContext {
     questionnaires: deps.questionnaires,
     specs: deps.specs,
     schedules: deps.schedules,
+    approvals: deps.approvals,
     botsById: new Map(),
     schedulerRunning: false,
   };
