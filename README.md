@@ -184,6 +184,19 @@ pnpm probe:cli  # 手工查看 CLI 的 JSON 流事件
 - 运行中任务不能重复执行、切换引擎或切换目录；可用 `/close` 取消任务。
 - `/pipeline` 默认步骤：PM → 架构 → 开发 → 评审协作 → 测试 → CEO 汇总；可用 `PIPELINE_STEPS` 裁剪；未连接的角色会跳过。
 
+## 主动式 Agent
+
+`/schedule` 创建的任务会持久化在 `data/schedules.json`，服务重启后自动恢复。支持 `15m`、`1h`、`2d` 等间隔：
+
+```text
+/schedule every 1h 汇总当前项目的未解决风险
+/schedule pipeline 1d 审查本周产品交付状态
+/schedule logs 1h /absolute/path/server.log
+/schedule list
+```
+
+日志巡检会先确认路径是本机已存在的普通文件，并要求 Agent 仅分析最后 500 行，不执行删除、截断、重启或部署操作。发现高风险建议时，应再经过审批门。
+
 ## 开发与扩展
 
 1. 在 `src/cli/` 实现新的 `CliAdapter`（参数构造和流式事件解析）。

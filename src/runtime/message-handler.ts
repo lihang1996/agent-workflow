@@ -12,6 +12,7 @@ import { filterRunnableSteps } from '../core/pipeline.js';
 import { requestTaskAbort } from '../core/task-abort.js';
 import { assertWorkdir } from '../core/workdir.js';
 import { formatScheduleInterval, parseScheduleInterval } from '../core/schedule-store.js';
+import { assertLogFile } from '../core/log-inspection.js';
 import { resolveMentions } from '../im/message-parser.js';
 import { isAddressedToBot, type Bot, type IncomingMessage } from '../im/lark.js';
 import { buildQuestionnaireCard, buildSpecConfirmationCard, buildSpecReviewCard } from '../im/workflow-card.js';
@@ -399,7 +400,7 @@ export async function handleMessage(
       return;
     }
     const intervalMs = second ? parseScheduleInterval(second) : undefined;
-    const prompt = rest.join(' ').trim();
+    let prompt = rest.join(' ').trim();
     if (!intervalMs || !prompt) {
       await bot.reply(msg.messageId, '间隔使用 15m、1h、2d 等格式，且必须提供任务内容。', hasThread);
       return;
@@ -407,6 +408,14 @@ export async function handleMessage(
     if (operation === 'pipeline' && bot.id !== 'ceo') {
       await bot.reply(msg.messageId, '定时团队流水线仅 CEO 可创建。', hasThread);
       return;
+    }
+    if (operation === 'logs') {
+      try {
+        prompt = await assertLogFile(prompt);
+      } catch (error) {
+        await bot.reply(msg.messageId, (error as Error).message, hasThread);
+        return;
+      }
     }
     const kind = operation === 'pipeline' ? 'pipeline' : operation === 'logs' ? 'log_inspection' : 'task';
     const job = await ctx.schedules.create({

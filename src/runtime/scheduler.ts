@@ -1,4 +1,5 @@
 import type { ScheduledJob } from '../core/schedule-store.js';
+import { buildLogInspectionPrompt } from '../core/log-inspection.js';
 import type { IncomingMessage } from '../im/lark.js';
 import type { AppContext } from './app-context.js';
 import { startCliTask } from './cli-task.js';
@@ -80,11 +81,7 @@ async function runJob(ctx: AppContext, job: ScheduledJob): Promise<void> {
     return;
   }
   const prompt = job.kind === 'log_inspection'
-    ? [
-      '【定时服务端日志巡检】',
-      `日志文件：${job.prompt}`,
-      '请以只读方式检查最近 500 行日志，归纳错误、异常频率、影响等级和下一步建议。不要修改或删除文件。',
-    ].join('\n')
+    ? buildLogInspectionPrompt(job.prompt)
     : job.prompt;
   await startCliTask(ctx, { bot, msg, session, prompt });
 }
