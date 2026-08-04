@@ -13,6 +13,7 @@ import { extractResourceKeys } from '../im/message-parser.js';
 import type { Bot, IncomingMessage } from '../im/lark.js';
 import type { Session } from '../core/session-manager.js';
 import { TaskProgressTracker } from '../core/task-progress.js';
+import { redactSecrets } from '../core/log-inspection.js';
 import type { AppContext } from './app-context.js';
 import type { ActiveRun } from './types.js';
 import {
@@ -206,7 +207,7 @@ export async function startCliTask(
         console.log(`[CLI:${bot.id}/${adapter.id}] session=${event.sessionId}`);
         break;
       case 'assistant':
-        console.log(`[CLI:${bot.id}/${adapter.id}] assistant: ${truncate(event.text)}`);
+        console.log(`[CLI:${bot.id}/${adapter.id}] assistant: ${truncate(redactSecrets(event.text))}`);
         break;
       case 'tool_start':
         console.log(`[CLI:${bot.id}/${adapter.id}] tool_start: ${event.label}`);
@@ -243,7 +244,7 @@ export async function startCliTask(
         break;
       }
       case 'error':
-        console.error(`[CLI:${bot.id}/${adapter.id}] stream error: ${event.message}`);
+        console.error(`[CLI:${bot.id}/${adapter.id}] stream error: ${safeErrorMessage(event.message)}`);
         break;
       case 'result':
         console.log(`[CLI:${bot.id}/${adapter.id}] result event received`);
@@ -271,7 +272,11 @@ export async function startCliTask(
   })
     .then(async (result) => {
       if (result.sessionId && result.sessionId !== session.cliSessionId) {
-        await ctx.sessions.setCliSessionId(session.id, result.sessionId);
+        try {
+          await ctx.sessions.setCliSessionId(session.id, result.sessionId);
+        } catch (error) {
+          console.error('[会话] 保存 CLI 上下文失败:', safeErrorMessage(error));
+        }
       }
       if (result.stats?.contextWindowTokens) {
         ctx.contextWindows.set(session.id, result.stats.contextWindowTokens);
@@ -279,7 +284,7 @@ export async function startCliTask(
       // 先标记成功，防止停机逻辑把绿卡盖成红卡。
       activeRun.terminalStatus = 'success';
       if (activeRun.heartbeat) clearInterval(activeRun.heartbeat);
-      await cardUpdater.finish(buildTaskCard({
+      const finalCard = buildTaskCard({
         title: cardTitle,
         status: 'success',
         detail: '执行完成',
@@ -287,22 +292,49 @@ export async function startCliTask(
         answer: result.answer,
         stats: result.stats,
         recipientOpenId: msg.senderOpenId,
-      }));
-      if (answerNeedsContinuation(result.answer)) {
+      });
+      let cardDelivered = false;
+      try {
+        await cardUpdater.finish(finalCard);
+        cardDelivered = true;
+      } catch (error) {
+        console.error(`[卡片] bot=${bot.id} 写入成功终态失败:`, safeErrorMessage(error));
+        try {
+          await bot.updateCard(cardId, finalCard);
+          cardDelivered = true;
+        } catch (retryError) {
+          console.error(`[卡片] bot=${bot.id} 重试成功终态失败:`, safeErrorMessage(retryError));
+        }
+      }
+      if (!cardDelivered) {
+        for (const chunk of splitLongText(`✅ ${cardTitle} 执行完成\n\n${result.answer}`)) {
+          await bot.reply(msg.messageId, chunk, hasThread).catch((error) => {
+            console.error(`[卡片] bot=${bot.id} 文本兜底发送失败:`, safeErrorMessage(error));
+            return undefined;
+          });
+        }
+      } else if (answerNeedsContinuation(result.answer)) {
         for (const chunk of splitLongText(answerContinuation(result.answer))) {
-          await bot.reply(msg.messageId, chunk, hasThread);
+          await bot.reply(msg.messageId, chunk, hasThread).catch((error) => {
+            console.error(`[卡片] bot=${bot.id} 长回答续发失败:`, safeErrorMessage(error));
+            return undefined;
+          });
         }
       }
       console.log(`[CLI:${bot.id}/${adapter.id}] 完成 session_id=${result.sessionId ?? '(无)'}`);
       if (ctx.activeRuns.get(session.id) === activeRun) ctx.activeRuns.delete(session.id);
       await flushPersistActiveRuns(ctx);
-      await markSessionIdle(ctx, session.id);
+      try {
+        await markSessionIdle(ctx, session.id);
+      } catch (error) {
+        console.error('[会话] 保存空闲状态失败:', safeErrorMessage(error));
+      }
       // 停机中禁止协作续跑，避免与收尾打架。
       if (!ctx.shuttingDown && onSuccess) {
         try {
           await onSuccess(result.answer);
         } catch (error) {
-          const callbackError = error as Error;
+          const callbackError = new Error(safeErrorMessage(error));
           console.error('[工作流] 成功后的续跑失败:', callbackError.message);
           await reportFailure(callbackError);
           await bot.reply(msg.messageId, `任务本身已完成，但后续工作流失败：${callbackError.message}`, hasThread)
@@ -325,16 +357,22 @@ export async function startCliTask(
         return;
       }
       activeRun.terminalStatus = 'failed';
-      const message = (error as Error).message;
+      const message = safeErrorMessage(error);
+      const safeError = new Error(message);
       console.error(`[CLI:${bot.id}/${adapter.id}] 执行失败:`, message);
-      await cardUpdater.finish(buildTaskCard({
-        title: cardTitle,
-        status: 'failed',
-        detail: '执行没有完成。你可以调整指令后，在当前话题里重试。',
-        technicalDetail: message,
-        progress: activeRun.tracker.snapshot(),
-      }));
-      await reportFailure(error as Error);
+      try {
+        await cardUpdater.finish(buildTaskCard({
+          title: cardTitle,
+          status: 'failed',
+          detail: '执行没有完成。你可以调整指令后，在当前话题里重试。',
+          technicalDetail: message,
+          progress: activeRun.tracker.snapshot(),
+        }));
+      } catch (cardError) {
+        console.error(`[卡片] bot=${bot.id} 写入失败终态异常:`, safeErrorMessage(cardError));
+        await bot.reply(msg.messageId, `❌ ${cardTitle} 执行失败：${message}`, hasThread).catch(() => undefined);
+      }
+      await reportFailure(safeError);
     })
     .finally(async () => {
       if (activeRun.heartbeat) clearInterval(activeRun.heartbeat);
@@ -343,11 +381,16 @@ export async function startCliTask(
       try {
         await markSessionIdle(ctx, session.id);
       } catch (error) {
-        console.error('[会话] 保存空闲状态失败:', (error as Error).message);
+        console.error('[会话] 保存空闲状态失败:', safeErrorMessage(error));
       }
       resolveDone();
     })
     .catch((error) => {
-      console.error('[任务] 回传或收尾失败:', (error as Error).message);
+      console.error('[任务] 回传或收尾失败:', safeErrorMessage(error));
     });
+}
+
+function safeErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return redactSecrets(message.trim() || '未知错误').slice(-2_000);
 }

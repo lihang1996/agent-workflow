@@ -29,6 +29,7 @@ interface ClaudeContentBlock {
   input?: unknown;
   tool_use_id?: unknown;
   is_error?: unknown;
+  text?: unknown;
 }
 
 const TOOL_LABELS: Record<string, string> = {
@@ -87,7 +88,7 @@ function messageBlocks(message: unknown): ClaudeContentBlock[] {
   return message.content.filter(isRecord);
 }
 
-function usageTokens(usage: unknown): number | undefined {
+function totalUsageTokens(usage: unknown): number | undefined {
   if (!isRecord(usage)) return undefined;
   const values = [
     asNumber(usage.input_tokens),
@@ -98,6 +99,16 @@ function usageTokens(usage: unknown): number | undefined {
   return values.length
     ? values.reduce((sum, value) => sum + value, 0)
     : undefined;
+}
+
+function contextUsageTokens(usage: unknown): number | undefined {
+  if (!isRecord(usage)) return undefined;
+  const values = [
+    asNumber(usage.input_tokens),
+    asNumber(usage.cache_read_input_tokens),
+    asNumber(usage.cache_creation_input_tokens),
+  ].filter((value): value is number => value !== undefined);
+  return values.length ? values.reduce((sum, value) => sum + value, 0) : undefined;
 }
 
 function contextWindowTokens(modelUsage: unknown): number | undefined {
@@ -111,7 +122,7 @@ function contextWindowTokens(modelUsage: unknown): number | undefined {
 
 function parseStats(event: ClaudeEvent): CliRunStats | undefined {
   const usage = isRecord(event.usage) ? event.usage : {};
-  const totalTokens = usageTokens(usage);
+  const totalTokens = totalUsageTokens(usage);
   const windowTokens = contextWindowTokens(event.modelUsage);
   const stats: CliRunStats = {
     durationMs: asNumber(event.duration_ms),
@@ -190,9 +201,16 @@ export class ClaudeAdapter implements CliAdapter {
     }
     if (event.type === "assistant") {
       const message = isRecord(event.message) ? event.message : {};
-      const usedTokens = usageTokens(message.usage);
+      const usedTokens = contextUsageTokens(message.usage);
       const contextEvent: CliEvent[] =
-        usedTokens === undefined ? [] : [{ type: "context", usedTokens }];
+        usedTokens === undefined
+          ? []
+          : [{ type: "context", usedTokens, ...(sessionId ? { sessionId } : {}) }];
+      const textEvents = messageBlocks(event.message).flatMap((block): CliEvent[] => {
+        if (block.type !== 'text' || typeof (block as { text?: unknown }).text !== 'string') return [];
+        const text = (block as { text: string }).text.trim();
+        return text ? [{ type: 'assistant', text, ...(sessionId ? { sessionId } : {}) }] : [];
+      });
       const toolEvents = messageBlocks(event.message).flatMap(
         (block): CliEvent[] => {
           if (
@@ -209,11 +227,12 @@ export class ClaudeAdapter implements CliAdapter {
               toolName: block.name,
               label: TOOL_LABELS[block.name] ?? `调用 ${block.name}`,
               ...(detail ? { detail } : {}),
+              ...(sessionId ? { sessionId } : {}),
             },
           ];
         },
       );
-      return [...contextEvent, ...toolEvents];
+      return [...contextEvent, ...textEvents, ...toolEvents];
     }
     if (event.type === "user") {
       return messageBlocks(event.message).flatMap((block): CliEvent[] => {
@@ -228,6 +247,7 @@ export class ClaudeAdapter implements CliAdapter {
             type: "tool_end",
             toolUseId: block.tool_use_id,
             failed: block.is_error === true,
+            ...(sessionId ? { sessionId } : {}),
           },
         ];
       });

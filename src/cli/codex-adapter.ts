@@ -4,7 +4,13 @@ import {
   instructionsForExecutionPolicy,
   promptForExecutionPolicy,
 } from './execution-policy.js';
-import type { CliAdapter, CliBuildOptions, CliEvent, CliExecutionPolicy } from './types.js';
+import type {
+  CliAdapter,
+  CliBuildOptions,
+  CliEvent,
+  CliExecutionPolicy,
+  CliRunStats,
+} from './types.js';
 
 interface CodexItem {
   type?: unknown;
@@ -15,6 +21,8 @@ interface CodexItem {
   server?: unknown;
   tool?: unknown;
   query?: unknown;
+  status?: unknown;
+  exit_code?: unknown;
 }
 
 interface CodexEvent {
@@ -25,6 +33,7 @@ interface CodexEvent {
     message?: unknown;
   };
   item?: CodexItem;
+  usage?: unknown;
 }
 
 const TOOL_LABELS: Record<string, string> = {
@@ -50,6 +59,26 @@ function truncate(text: string, max = 72): string {
 
 function toolUseId(item: CodexItem | undefined, fallback: string): string {
   return typeof item?.id === 'string' && item.id ? item.id : fallback;
+}
+
+function codexStats(usage: unknown): CliRunStats | undefined {
+  if (!usage || typeof usage !== 'object') return undefined;
+  const row = usage as Record<string, unknown>;
+  const number = (value: unknown) =>
+    typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+  const inputTokens = number(row.input_tokens);
+  const cacheReadTokens = number(row.cached_input_tokens);
+  const outputTokens = number(row.output_tokens);
+  const totalTokens = number(row.total_tokens)
+    ?? [inputTokens, outputTokens].filter((value): value is number => value !== undefined)
+      .reduce((sum, value) => sum + value, 0);
+  const stats: CliRunStats = {
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    totalTokens: totalTokens || undefined,
+  };
+  return Object.values(stats).some((value) => value !== undefined) ? stats : undefined;
 }
 
 /**
@@ -134,10 +163,12 @@ export class CodexAdapter implements CliAdapter {
 
     if (event.type === 'turn.completed') {
       if (!this.lastAgentText) return [];
+      const stats = codexStats(event.usage);
       return [{
         type: 'result',
         answer: this.lastAgentText,
         ...(sessionId ? { sessionId } : {}),
+        ...(stats ? { stats } : {}),
       }];
     }
 
@@ -239,7 +270,8 @@ export class CodexAdapter implements CliAdapter {
       return [{
         type: 'tool_end',
         toolUseId: knownId,
-        failed: false,
+        failed: item?.status === 'failed'
+          || (typeof item?.exit_code === 'number' && item.exit_code !== 0),
         ...(sessionId ? { sessionId } : {}),
       }];
     }

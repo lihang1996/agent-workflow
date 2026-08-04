@@ -3,6 +3,8 @@ import { createInterface } from 'node:readline';
 import type { CliAdapter, CliEvent, CliExecutionPolicy, CliRunResult } from './types.js';
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
+const MAX_STDERR_CHARS = 64 * 1024;
+const MAX_EVENT_LINE_CHARS = 4 * 1024 * 1024;
 const useProcessGroup = process.platform !== 'win32';
 
 export interface RunCliOptions {
@@ -55,6 +57,13 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
     ? adapter.buildResumeArgs(prompt, sessionId, { executionPolicy, approvedScope })
     : adapter.buildArgs(prompt, { executionPolicy, approvedScope });
 
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return Promise.reject(new Error(`${adapter.displayName} 超时时间必须大于 0`));
+  }
+  if (signal?.aborted) {
+    return Promise.reject(new Error(`${adapter.displayName} 执行已取消`));
+  }
+
   return new Promise((resolve, reject) => {
     // detached 让子进程成为新进程组组长，便于连带杀掉孙子进程。
     const child = spawn(adapter.command, args, {
@@ -67,34 +76,38 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
     let observedSessionId = sessionId;
     let finalResult: CliRunResult | undefined;
     let resultError: Error | undefined;
+    let internalError: Error | undefined;
     let stderr = '';
     let settled = false;
     let timedOut = false;
+    let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const forceKillLater = () => {
+      if (forceKillTimer) return;
+      forceKillTimer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          killProcessTree(child, 'SIGKILL');
+        }
+      }, 2_000);
+      forceKillTimer.unref();
+    };
 
     const onAbort = () => {
       killProcessTree(child, 'SIGTERM');
-      // 仍存活则升级 SIGKILL
-      setTimeout(() => {
-        if (!settled) killProcessTree(child, 'SIGKILL');
-      }, 2_000).unref();
+      forceKillLater();
     };
 
-    if (signal?.aborted) {
-      onAbort();
-    } else {
-      signal?.addEventListener('abort', onAbort, { once: true });
-    }
+    signal?.addEventListener('abort', onAbort, { once: true });
 
     const timer = setTimeout(() => {
       timedOut = true;
       killProcessTree(child, 'SIGTERM');
-      setTimeout(() => {
-        if (!settled) killProcessTree(child, 'SIGKILL');
-      }, 2_000).unref();
+      forceKillLater();
     }, timeoutMs);
 
     const finish = () => {
       clearTimeout(timer);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
       signal?.removeEventListener('abort', onAbort);
     };
     const fail = (error: Error) => {
@@ -105,12 +118,31 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
     };
 
     lines.on('line', (line) => {
-      const events = adapter.parseEvents(line);
+      if (internalError) return;
+      if (line.length > MAX_EVENT_LINE_CHARS) {
+        internalError = new Error(`${adapter.displayName} 返回的单条事件过大`);
+        onAbort();
+        return;
+      }
+      let events: CliEvent[];
+      try {
+        events = adapter.parseEvents(line);
+      } catch (error) {
+        internalError = new Error(`${adapter.displayName} 事件解析失败: ${(error as Error).message}`);
+        onAbort();
+        return;
+      }
       for (const event of events) {
         if ('sessionId' in event && event.sessionId) {
           observedSessionId = event.sessionId;
         }
-        onEvent?.(event);
+        try {
+          onEvent?.(event);
+        } catch (error) {
+          internalError = new Error(`${adapter.displayName} 事件处理失败: ${(error as Error).message}`);
+          onAbort();
+          return;
+        }
         if (event.type === 'error') {
           resultError = new Error(event.message);
           continue;
@@ -126,7 +158,7 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
     });
 
     child.stderr.on('data', (chunk: Buffer | string) => {
-      stderr += chunk.toString();
+      stderr = `${stderr}${chunk.toString()}`.slice(-MAX_STDERR_CHARS);
     });
     child.once('error', (error) => {
       if (timedOut) {
@@ -141,6 +173,7 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
     });
     child.once('close', (code) => {
       if (settled) return;
+      if (internalError) return fail(internalError);
       if (timedOut) {
         return fail(new Error(`${adapter.displayName} 执行超时`));
       }
@@ -154,13 +187,13 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
           || `${adapter.displayName} 退出，状态码 ${code}`,
         ));
       }
+      if (resultError) return fail(resultError);
       if (finalResult) {
         settled = true;
         finish();
         resolve(finalResult);
         return;
       }
-      if (resultError) return fail(resultError);
       return fail(new Error(`${adapter.displayName} 没有返回最终结果`));
     });
   });
