@@ -13,6 +13,7 @@ export interface RunCliOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
   onEvent?: (event: CliEvent) => void;
+  env?: NodeJS.ProcessEnv;
 }
 
 /** 杀掉 CLI 进程组（含孙子进程）。 */
@@ -44,6 +45,7 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
     signal,
     timeoutMs = DEFAULT_TIMEOUT_MS,
     onEvent,
+    env,
   } = options;
   const args = sessionId
     ? adapter.buildResumeArgs(prompt, sessionId)
@@ -55,6 +57,7 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: useProcessGroup,
+      env: { ...process.env, ...env },
     });
     const lines = createInterface({ input: child.stdout });
     let observedSessionId = sessionId;

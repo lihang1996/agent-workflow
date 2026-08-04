@@ -25,7 +25,13 @@ import {
 } from './active-runs.js';
 import { startCliTask } from './cli-task.js';
 import { runCollabReview } from './collab-runner.js';
-import { runDeliverySquad, runTeamPipeline } from './pipeline-runner.js';
+import {
+  runDeliverySquad,
+  runTeamPipeline,
+  resumeWorkflowAfterQuestionnaire,
+  resumeWorkflowAfterSpecConfirmation,
+  resumeWorkflowForSpecRevision,
+} from './pipeline-runner.js';
 import { requestHighRiskApproval, runApprovedAction } from './approval-runner.js';
 import {
   ensureRunnableSession,
@@ -177,6 +183,7 @@ export async function handleMessage(
     try {
       const questionnaire = await ctx.questionnaires.get(command.arg.trim());
       if (!questionnaire) throw new Error(`问卷不存在: ${command.arg.trim()}`);
+      assertQuestionnaireAccess(questionnaire, msg.senderOpenId, msg.chatId, topicIdOf(msg));
       await bot.replyCard(msg.messageId, buildQuestionnaireCard(questionnaire), hasThread);
     } catch (error) {
       await bot.reply(msg.messageId, (error as Error).message, hasThread);
@@ -827,9 +834,26 @@ export async function handleCardAction(
         return { toast: { type: 'info' as const, content: `Spec 当前状态：${spec.status}` } };
       }
       const confirmed = action.value.action === 'confirm_spec';
+      const feedback = typeof action.formValue.confirmationFeedback === 'string'
+        ? action.formValue.confirmationFeedback.trim()
+        : '';
+      if (!confirmed && !feedback) {
+        return { toast: { type: 'warning' as const, content: '退回修改时请填写具体意见。' } };
+      }
       const updated = await ctx.specs.update(spec.id, {
         status: confirmed ? 'confirmed' : 'changes_requested',
       });
+      if (confirmed) {
+        runWorkflowContinuation(
+          resumeWorkflowAfterSpecConfirmation(ctx, updated.id),
+          `恢复 Spec ${updated.id} 后续步骤`,
+        );
+      } else {
+        runWorkflowContinuation(
+          resumeWorkflowForSpecRevision(ctx, updated.id, feedback),
+          `退回 Spec ${updated.id} 给产品经理`,
+        );
+      }
       return {
         toast: { type: confirmed ? 'success' as const : 'info' as const, content: confirmed ? '方案已确认。' : '已退回产品经理修改。' },
         card: { type: 'raw' as const, data: buildSpecConfirmationCard(updated) },
@@ -846,6 +870,7 @@ export async function handleCardAction(
     try {
       const questionnaire = await ctx.questionnaires.get(questionnaireId);
       if (!questionnaire) throw new Error('问卷不存在或已被删除。');
+      assertQuestionnaireAccess(questionnaire, action.operatorOpenId);
       const answers: Record<string, string | string[]> = {};
       for (const question of questionnaire.questions) {
         const raw = action.formValue[question.id];
@@ -853,6 +878,12 @@ export async function handleCardAction(
         else if (Array.isArray(raw)) answers[question.id] = raw.filter((item): item is string => typeof item === 'string');
       }
       const result = await ctx.questionnaires.recordAnswers(questionnaireId, answers);
+      if (result.questionnaire.status === 'answered') {
+        runWorkflowContinuation(
+          resumeWorkflowAfterQuestionnaire(ctx, questionnaireId),
+          `恢复问卷 ${questionnaireId} 对应工作流`,
+        );
+      }
       return {
         toast: {
           type: result.questionnaire.status === 'answered' ? 'success' as const : 'warning' as const,
@@ -904,6 +935,27 @@ export async function handleCardAction(
 /** 指定负责人优先；未指定时由提出需求的人确认。 */
 function assertSpecOwner(specOwnerOpenId: string, operatorOpenId: string): void {
   assertOwnedBy(specOwnerOpenId, operatorOpenId);
+}
+
+function assertQuestionnaireAccess(
+  questionnaire: import('../core/questionnaire-store.js').Questionnaire,
+  operatorOpenId: string,
+  chatId?: string,
+  topicId?: string,
+): void {
+  assertOwnedBy(questionnaire.ownerOpenId ?? '', operatorOpenId);
+  if (chatId && questionnaire.chatId && questionnaire.chatId !== chatId) {
+    throw new Error('问卷不属于当前会话。');
+  }
+  if (topicId && questionnaire.topicId && questionnaire.topicId !== topicId) {
+    throw new Error('问卷不属于当前话题。');
+  }
+}
+
+function runWorkflowContinuation(task: Promise<void>, label: string): void {
+  void task.catch((error) => {
+    console.error(`[工作流] ${label}失败:`, (error as Error).message);
+  });
 }
 
 /** 发布到云文档后，Spec 本地状态切至评审中。 */

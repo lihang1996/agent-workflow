@@ -21,9 +21,10 @@ export async function runCollabReview(
     priorDevResult?: string;
     /** 协作自然结束时回调（通过 / 触顶）；供流水线续跑。 */
     onComplete?: (result: { approved: boolean; answer: string }) => Promise<void>;
+    onFailure?: (error: Error) => Promise<void>;
   },
 ): Promise<void> {
-  const { initiator, msg, task, round, priorDevResult, onComplete } = options;
+  const { initiator, msg, task, round, priorDevResult, onComplete, onFailure } = options;
   const hasThread = !!msg.threadId || !!msg.rootId;
   const reviewer = ctx.botsById.get('reviewer');
   const dev = ctx.botsById.get('dev');
@@ -59,6 +60,7 @@ export async function runCollabReview(
     msg,
     session: reviewerSession,
     prompt: reviewPrompt,
+    onFailure,
     onSuccess: async (reviewAnswer) => {
       if (ctx.shuttingDown) return;
       if (isReviewApproved(reviewAnswer)) {
@@ -80,6 +82,7 @@ export async function runCollabReview(
           `${dev.name} 正忙，评审意见未能自动回传。请稍后手动 /handoff dev。`,
           hasThread,
         );
+        if (onFailure) await onFailure(new Error(`${dev.name} 正忙，评审意见未能自动回传。`));
         return;
       }
 
@@ -95,6 +98,7 @@ export async function runCollabReview(
         msg,
         session: devSession,
         prompt: buildFixFromReviewPrompt(reviewer, reviewAnswer, round),
+        onFailure,
         onSuccess: async (devAnswer) => {
           if (ctx.shuttingDown) return;
           if (round >= ctx.collabMaxRounds) {
@@ -121,6 +125,7 @@ export async function runCollabReview(
             round: nextRound,
             priorDevResult: devAnswer,
             onComplete,
+            onFailure,
           });
         },
       });

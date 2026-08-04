@@ -35,6 +35,7 @@ export const ProductSpecSchema = z.object({
   ownerOpenId: z.string().min(1),
   botId: z.string().min(1),
   questionnaireId: z.string().optional(),
+  workflowId: z.string().uuid().optional(),
   status: SpecStatusSchema,
   docId: z.string().optional(),
   docUrl: z.string().url().optional(),

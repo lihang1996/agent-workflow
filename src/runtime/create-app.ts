@@ -7,6 +7,7 @@ import {
 import { reconcileOrphanedCards, shutdownActiveRuns } from './active-runs.js';
 import { handleCardAction, handleMessage } from './message-handler.js';
 import { startScheduler, stopScheduler } from './scheduler.js';
+import { resumeRecoverableWorkflows } from './pipeline-runner.js';
 
 export interface App {
   ctx: AppContext;
@@ -22,6 +23,7 @@ export interface App {
   shutdownActiveRuns: (reason: string) => Promise<void>;
   startScheduler: () => void;
   stopScheduler: () => void;
+  resumeRecoverableWorkflows: () => Promise<void>;
 }
 
 /** 组装运行时上下文并绑定消息/卡片处理器。 */
@@ -37,6 +39,7 @@ export function createApp(deps: CreateAppDeps): App {
     shutdownActiveRuns: (reason) => shutdownActiveRuns(ctx, reason),
     startScheduler: () => startScheduler(ctx),
     stopScheduler: () => stopScheduler(ctx),
+    resumeRecoverableWorkflows: () => resumeRecoverableWorkflows(ctx),
   };
 }
 

@@ -2,46 +2,25 @@
  * 结构化提问 MCP Server（stdio）。
  * 大纲 6.3：让 Agent 学会结构化提问；6.4 通过 /form 把问卷落成飞书表单。
  */
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { randomUUID } from 'node:crypto';
 import { config as loadEnv } from 'dotenv';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import {
+  JsonQuestionnaireStore,
+  QuestionSchema,
+  type Question,
+  type Questionnaire,
+} from '../core/questionnaire-store.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(process.env.AGENT_OS_ROOT ?? join(here, '../..'));
 loadEnv({ path: join(root, '.env') });
 
 const storeDir = join(root, 'data', 'questionnaires');
-
-const QuestionKind = z.enum(['single_choice', 'multi_choice', 'text']);
-
-const QuestionSchema = z.object({
-  id: z.string().min(1).describe('问题稳定 ID，如 scope / deadline'),
-  prompt: z.string().min(1).describe('问题正文'),
-  kind: QuestionKind.describe('single_choice | multi_choice | text'),
-  options: z
-    .array(z.string().min(1))
-    .optional()
-    .describe('单选/多选的选项列表；文本题可省略'),
-  required: z.boolean().optional().describe('是否必答，默认 true'),
-});
-
-type Question = z.infer<typeof QuestionSchema>;
-
-interface Questionnaire {
-  id: string;
-  title: string;
-  goal?: string;
-  questions: Question[];
-  answers?: Record<string, string | string[]>;
-  status: 'awaiting_answers' | 'answered';
-  createdAt: string;
-  updatedAt: string;
-}
+const store = new JsonQuestionnaireStore(storeDir);
 
 function textResult(payload: unknown) {
   return {
@@ -82,19 +61,17 @@ function buildFeishuPreview(doc: Questionnaire): string {
   return lines.join('\n');
 }
 
-async function loadQuestionnaire(id: string): Promise<Questionnaire | undefined> {
-  try {
-    const raw = await readFile(join(storeDir, `${id}.json`), 'utf8');
-    return JSON.parse(raw) as Questionnaire;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-    throw error;
-  }
+function context(name: string): string | undefined {
+  const value = process.env[name]?.trim();
+  return value || undefined;
 }
 
-async function saveQuestionnaire(doc: Questionnaire): Promise<void> {
-  await mkdir(storeDir, { recursive: true });
-  await writeFile(join(storeDir, `${doc.id}.json`), `${JSON.stringify(doc, null, 2)}\n`, 'utf8');
+function canAccess(doc: Questionnaire): boolean {
+  const workflowId = context('AGENT_OS_WORKFLOW_ID');
+  const ownerOpenId = context('AGENT_OS_OWNER_OPEN_ID');
+  if (doc.workflowId && workflowId !== doc.workflowId) return false;
+  if (doc.ownerOpenId && ownerOpenId !== doc.ownerOpenId) return false;
+  return true;
 }
 
 const server = new McpServer({
@@ -127,17 +104,17 @@ server.registerTool(
       }
     }
 
-    const now = new Date().toISOString();
-    const doc: Questionnaire = {
-      id: randomUUID().slice(0, 8),
+    const doc = await store.create({
       title,
       ...(goal ? { goal } : {}),
       questions,
-      status: 'awaiting_answers',
-      createdAt: now,
-      updatedAt: now,
-    };
-    await saveQuestionnaire(doc);
+      chatId: context('AGENT_OS_CHAT_ID'),
+      topicId: context('AGENT_OS_TOPIC_ID'),
+      ownerOpenId: context('AGENT_OS_OWNER_OPEN_ID'),
+      botId: context('AGENT_OS_BOT_ID'),
+      messageId: context('AGENT_OS_MESSAGE_ID'),
+      workflowId: context('AGENT_OS_WORKFLOW_ID'),
+    });
     const preview = buildFeishuPreview(doc);
     return textResult({
       ok: true,
@@ -163,37 +140,19 @@ server.registerTool(
     },
   },
   async ({ questionnaireId, answers }) => {
-    const doc = await loadQuestionnaire(questionnaireId);
+    const doc = await store.get(questionnaireId);
     if (!doc) {
       return textResult({ ok: false, error: `问卷不存在: ${questionnaireId}` });
     }
-
-    const merged = { ...(doc.answers ?? {}), ...answers };
-    const missing = doc.questions
-      .filter((question) => question.required !== false)
-      .filter((question) => {
-        const value = merged[question.id];
-        if (value == null) return true;
-        if (typeof value === 'string') return value.trim().length === 0;
-        return value.length === 0;
-      })
-      .map((question) => question.id);
-
-    const now = new Date().toISOString();
-    const next: Questionnaire = {
-      ...doc,
-      answers: merged,
-      status: missing.length === 0 ? 'answered' : 'awaiting_answers',
-      updatedAt: now,
-    };
-    await saveQuestionnaire(next);
+    if (!canAccess(doc)) return textResult({ ok: false, error: '问卷不属于当前工作流。' });
+    const { questionnaire: next, missingRequired: missing } = await store.recordAnswers(questionnaireId, answers);
 
     return textResult({
       ok: true,
       questionnaireId: next.id,
       status: next.status,
       missingRequired: missing,
-      answers: merged,
+      answers: next.answers,
       summary: missing.length === 0
         ? '澄清已完成，可以据此写 Spec。'
         : `仍缺必答：${missing.join(', ')}`,
@@ -211,10 +170,11 @@ server.registerTool(
     },
   },
   async ({ questionnaireId }) => {
-    const doc = await loadQuestionnaire(questionnaireId);
+    const doc = await store.get(questionnaireId);
     if (!doc) {
       return textResult({ ok: false, error: `问卷不存在: ${questionnaireId}` });
     }
+    if (!canAccess(doc)) return textResult({ ok: false, error: '问卷不属于当前工作流。' });
     return textResult({
       ok: true,
       questionnaire: doc,

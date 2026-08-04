@@ -31,14 +31,16 @@ export async function startCliTask(
     session: Session;
     prompt: string;
     downloadResources?: boolean;
+    workflowId?: string;
     onSuccess?: (answer: string) => Promise<void>;
+    onFailure?: (error: Error) => Promise<void>;
   },
 ): Promise<void> {
   if (ctx.shuttingDown) {
     throw new Error('服务正在停止，无法启动新任务');
   }
 
-  const { bot, msg, downloadResources = false, onSuccess } = options;
+  const { bot, msg, downloadResources = false, workflowId, onSuccess, onFailure } = options;
   let taskPrompt = options.prompt.trim();
   let session = options.session;
   const hasThread = !!msg.threadId || !!msg.rootId;
@@ -97,6 +99,14 @@ export async function startCliTask(
   console.log(`[卡片] bot=${bot.id} message_id=${cardId} inThread=${hasThread} engine=${adapter.id}`);
 
   let activeRun!: ActiveRun;
+  const reportFailure = async (error: Error) => {
+    if (!onFailure) return;
+    try {
+      await onFailure(error);
+    } catch (callbackError) {
+      console.error('[工作流] 失败回调执行异常:', (callbackError as Error).message);
+    }
+  };
   const cardUpdater = new ThrottledCardUpdater(async (card, options) => {
     // 进度 patch：终态后丢弃，避免盖掉取消/成功卡。
     // finish({ final: true })：必须放行，否则成功/失败卡永远写不上去。
@@ -237,6 +247,14 @@ export async function startCliTask(
     sessionId: session.cliSessionId,
     signal: controller.signal,
     onEvent: onCliEvent,
+    env: {
+      AGENT_OS_CHAT_ID: msg.chatId,
+      AGENT_OS_TOPIC_ID: msg.threadId || msg.rootId || msg.messageId,
+      AGENT_OS_OWNER_OPEN_ID: msg.senderOpenId,
+      AGENT_OS_BOT_ID: bot.id,
+      AGENT_OS_MESSAGE_ID: msg.messageId,
+      ...(workflowId ? { AGENT_OS_WORKFLOW_ID: workflowId } : {}),
+    },
   })
     .then(async (result) => {
       if (result.sessionId && result.sessionId !== session.cliSessionId) {
@@ -267,7 +285,17 @@ export async function startCliTask(
       await flushPersistActiveRuns(ctx);
       await markSessionIdle(ctx, session.id);
       // 停机中禁止协作续跑，避免与收尾打架。
-      if (!ctx.shuttingDown && onSuccess) await onSuccess(result.answer);
+      if (!ctx.shuttingDown && onSuccess) {
+        try {
+          await onSuccess(result.answer);
+        } catch (error) {
+          const callbackError = error as Error;
+          console.error('[工作流] 成功后的续跑失败:', callbackError.message);
+          await reportFailure(callbackError);
+          await bot.reply(msg.messageId, `任务本身已完成，但后续工作流失败：${callbackError.message}`, hasThread)
+            .catch(() => undefined);
+        }
+      }
     })
     .catch(async (error) => {
       if (activeRun.heartbeat) clearInterval(activeRun.heartbeat);
@@ -280,6 +308,7 @@ export async function startCliTask(
         if (!ctx.shuttingDown && !activeRun.cardSettledByCallback) {
           await finishInterruptedRun(activeRun, detail);
         }
+        if (!ctx.shuttingDown) await reportFailure(new Error(detail));
         return;
       }
       activeRun.terminalStatus = 'failed';
@@ -292,6 +321,7 @@ export async function startCliTask(
         technicalDetail: message,
         progress: activeRun.tracker.snapshot(),
       }));
+      await reportFailure(error as Error);
     })
     .finally(async () => {
       if (activeRun.heartbeat) clearInterval(activeRun.heartbeat);

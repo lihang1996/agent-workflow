@@ -60,11 +60,36 @@ export function buildPipelineStepPrompt(
   const prior = priorBlock(priorOutputs);
   switch (step.id) {
     case 'pm':
+      if (priorOutputs.confirmation_feedback) {
+        return [
+          '【团队流水线 · 产品经理修订】',
+          `用户目标：${goal}`,
+          '上一版 Spec：',
+          priorOutputs.previous_spec ?? '(缺失)',
+          '',
+          '负责人退回意见：',
+          priorOutputs.confirmation_feedback,
+          '',
+          '请根据意见重写完整、可执行的产品 Spec，只输出新版正文。',
+        ].join('\n');
+      }
+      if (priorOutputs.clarification) {
+        return [
+          '【团队流水线 · 产品经理】',
+          `用户目标：${goal}`,
+          '用户已经完成结构化澄清：',
+          priorOutputs.clarification,
+          '',
+          '请据此输出可执行产品 Spec，必须包含：背景、用户目标、范围、非目标、交互/业务规则、验收标准、风险与待确认项。',
+          '验收标准使用可勾选清单；只输出 Spec 正文，不再重复提问。',
+        ].join('\n');
+      }
       return [
         '【团队流水线 · 产品经理】',
         `用户目标：${goal}`,
-        '若目标含糊，请先调用 MCP 工具 propose_questions 发起结构化澄清，再用 record_answers 记录结论。',
-        '随后输出简短 Spec：背景、范围、验收标准、非目标。控制在一页以内。',
+        '若目标含糊，请调用 MCP 工具 propose_questions 发起结构化澄清，然后停止并等待用户在飞书表单作答。',
+        '不要自行猜测答案，也不要在澄清完成前输出最终 Spec。',
+        '若信息已经充分，输出可执行 Spec：背景、用户目标、范围、非目标、交互/业务规则、可勾选验收标准、风险与待确认项。',
       ].join('\n');
     case 'architect':
       return [

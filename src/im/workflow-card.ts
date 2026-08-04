@@ -3,11 +3,20 @@ import type { Questionnaire, Question } from '../core/questionnaire-store.js';
 import type { ProductSpec } from '../core/spec-store.js';
 import type { CardJson } from './card.js';
 
-function button(action: string, value: Record<string, string>, text: string, type = 'default') {
+function button(
+  action: string,
+  value: Record<string, string>,
+  text: string,
+  type = 'default',
+  formSubmit = false,
+) {
   return {
     tag: 'button',
+    element_id: `${action}_button`.slice(0, 20),
+    name: `${action}_submit`.slice(0, 20),
     text: { tag: 'plain_text', content: text },
     type,
+    ...(formSubmit ? { action_type: 'form_submit' } : {}),
     behaviors: [{ type: 'callback', value: { action, ...value } }],
   };
 }
@@ -17,7 +26,9 @@ function questionElement(question: Question, answer?: string | string[]) {
   if (question.kind === 'text') {
     return {
       tag: 'input',
+      element_id: `input_${question.id}`.replace(/[^A-Za-z0-9_]/g, '_').slice(0, 20),
       name: question.id,
+      required: question.required !== false,
       label: { tag: 'plain_text', content: `${question.prompt}${required}` },
       placeholder: { tag: 'plain_text', content: '请输入回答' },
       ...(typeof answer === 'string' ? { default_value: answer } : {}),
@@ -25,7 +36,9 @@ function questionElement(question: Question, answer?: string | string[]) {
   }
   return {
     tag: 'select_static',
+    element_id: `select_${question.id}`.replace(/[^A-Za-z0-9_]/g, '_').slice(0, 20),
     name: question.id,
+    required: question.required !== false,
     label: { tag: 'plain_text', content: `${question.prompt}${required}` },
     placeholder: { tag: 'plain_text', content: '请选择' },
     options: (question.options ?? []).map((option) => ({
@@ -54,10 +67,16 @@ export function buildQuestionnaireCard(questionnaire: Questionnaire): CardJson {
       vertical_spacing: '12px',
       elements: [
         { tag: 'markdown', content: `**${questionnaire.title}**${questionnaire.goal ? `\n${questionnaire.goal}` : ''}` },
-        ...questionnaire.questions.map((question) => questionElement(question, questionnaire.answers?.[question.id])),
         ...(answered
           ? [{ tag: 'markdown', content: '✅ 已收到全部必答项，产品经理可以据此生成或更新 Spec。' }]
-          : [button('submit_questionnaire', { questionnaireId: questionnaire.id }, '提交澄清结果', 'primary')]),
+          : [{
+            tag: 'form',
+            name: `questionnaire_${questionnaire.id}`.slice(0, 40),
+            elements: [
+              ...questionnaire.questions.map((question) => questionElement(question, questionnaire.answers?.[question.id])),
+              button('submit_questionnaire', { questionnaireId: questionnaire.id }, '提交澄清结果', 'primary', true),
+            ],
+          }]),
       ],
     },
   };
@@ -75,10 +94,24 @@ export function buildSpecConfirmationCard(spec: ProductSpec): CardJson {
         { tag: 'markdown', content: `**${spec.title}**\n\n${spec.content.slice(0, 5_500)}` },
         { tag: 'markdown', content: confirmed ? '✅ 需求已确认。下一步可发布到飞书云文档。' : spec.status === 'changes_requested' ? '⛔ 已退回产品经理修改。' : '确认后会进入飞书云文档发布流程。' },
         ...(spec.status === 'pending_confirmation'
-          ? [
-            button('confirm_spec', { specId: spec.id }, '确认方案', 'primary'),
-            button('reject_spec', { specId: spec.id }, '退回修改', 'danger'),
-          ]
+          ? [{
+            tag: 'form',
+            name: `spec_confirmation_${spec.id}`.slice(0, 40),
+            elements: [
+              {
+                tag: 'input',
+                element_id: 'spec_feedback_input',
+                name: 'confirmationFeedback',
+                required: false,
+                input_type: 'multiline_text',
+                rows: 3,
+                label: { tag: 'plain_text', content: '退回意见（退回修改时必填）' },
+                placeholder: { tag: 'plain_text', content: '请输入需要产品经理修改的内容' },
+              },
+              button('confirm_spec', { specId: spec.id }, '确认方案', 'primary', true),
+              button('reject_spec', { specId: spec.id }, '退回修改', 'danger', true),
+            ],
+          }]
           : spec.status === 'confirmed'
             ? [button('publish_spec', { specId: spec.id }, '发布到飞书云文档', 'primary')]
             : []),
@@ -101,9 +134,24 @@ export function buildSpecReviewCard(spec: ProductSpec): CardJson {
         ...(comment ? [{ tag: 'markdown', content: `**待处理意见**\n${comment}` }] : []),
         ...(reviewing
           ? [
-            { tag: 'input', name: 'reviewComment', label: { tag: 'plain_text', content: '修改意见（要求修改时必填）' }, placeholder: { tag: 'plain_text', content: '请输入需要产品经理处理的意见' } },
-            button('approve_spec_review', { specId: spec.id }, '评审通过', 'primary'),
-            button('request_spec_changes', { specId: spec.id }, '要求修改', 'danger'),
+            {
+              tag: 'form',
+              name: `spec_review_${spec.id}`.slice(0, 40),
+              elements: [
+                {
+                  tag: 'input',
+                  element_id: 'review_comment_input',
+                  name: 'reviewComment',
+                  required: false,
+                  input_type: 'multiline_text',
+                  rows: 3,
+                  label: { tag: 'plain_text', content: '修改意见（要求修改时必填）' },
+                  placeholder: { tag: 'plain_text', content: '请输入需要产品经理处理的意见' },
+                },
+                button('approve_spec_review', { specId: spec.id }, '评审通过', 'primary', true),
+                button('request_spec_changes', { specId: spec.id }, '要求修改', 'danger', true),
+              ],
+            },
           ]
           : [{ tag: 'markdown', content: spec.status === 'approved' ? '✅ 产品评审已通过。' : '🛠️ 产品经理正在处理评审意见。' }]),
       ],

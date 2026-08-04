@@ -1,4 +1,5 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { z } from 'zod';
 
@@ -23,14 +24,46 @@ export const QuestionnaireSchema = z.object({
   status: z.enum(['awaiting_answers', 'answered']),
   createdAt: z.string().min(1),
   updatedAt: z.string().min(1),
+  chatId: z.string().min(1).optional(),
+  topicId: z.string().min(1).optional(),
+  ownerOpenId: z.string().min(1).optional(),
+  botId: z.string().min(1).optional(),
+  messageId: z.string().min(1).optional(),
+  workflowId: z.string().uuid().optional(),
 });
 export type Questionnaire = z.infer<typeof QuestionnaireSchema>;
+
+const QuestionnaireIdSchema = z.string().regex(/^[A-Za-z0-9-]{8,64}$/);
 
 /** MCP 与飞书表单共用的问卷文件仓库。 */
 export class JsonQuestionnaireStore {
   constructor(private readonly directory = resolve('data', 'questionnaires')) {}
 
+  async create(input: {
+    title: string;
+    goal?: string;
+    questions: Question[];
+    chatId?: string;
+    topicId?: string;
+    ownerOpenId?: string;
+    botId?: string;
+    messageId?: string;
+    workflowId?: string;
+  }): Promise<Questionnaire> {
+    const now = new Date().toISOString();
+    const questionnaire = QuestionnaireSchema.parse({
+      ...input,
+      id: randomUUID(),
+      status: 'awaiting_answers',
+      createdAt: now,
+      updatedAt: now,
+    });
+    await this.save(questionnaire);
+    return questionnaire;
+  }
+
   async get(id: string): Promise<Questionnaire | undefined> {
+    QuestionnaireIdSchema.parse(id);
     try {
       const raw = await readFile(join(this.directory, `${id}.json`), 'utf8');
       const parsed = QuestionnaireSchema.safeParse(JSON.parse(raw));
@@ -40,6 +73,23 @@ export class JsonQuestionnaireStore {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
       throw error;
     }
+  }
+
+  async latestAwaitingForWorkflow(workflowId: string): Promise<Questionnaire | undefined> {
+    let names: string[];
+    try {
+      names = await readdir(this.directory);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
+    }
+    const rows = await Promise.all(names
+      .filter((name) => name.endsWith('.json'))
+      .map((name) => this.get(name.slice(0, -5))));
+    return rows
+      .filter((row): row is Questionnaire =>
+        row?.workflowId === workflowId && row.status === 'awaiting_answers')
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
   }
 
   async recordAnswers(
@@ -69,11 +119,11 @@ export class JsonQuestionnaireStore {
   }
 
   async save(questionnaire: Questionnaire): Promise<void> {
+    const parsed = QuestionnaireSchema.parse(questionnaire);
     await mkdir(this.directory, { recursive: true });
-    await writeFile(
-      join(this.directory, `${questionnaire.id}.json`),
-      `${JSON.stringify(questionnaire, null, 2)}\n`,
-      'utf8',
-    );
+    const destination = join(this.directory, `${parsed.id}.json`);
+    const temp = `${destination}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(temp, `${JSON.stringify(parsed, null, 2)}\n`, 'utf8');
+    await rename(temp, destination);
   }
 }
