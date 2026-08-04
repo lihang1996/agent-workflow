@@ -1,6 +1,6 @@
 /**
  * 结构化提问 MCP Server（stdio）。
- * 大纲 6.3：让 Agent 学会结构化提问；6.4 再把问卷落成飞书表单。
+ * 大纲 6.3：让 Agent 学会结构化提问；6.4 通过 /form 把问卷落成飞书表单。
  */
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
@@ -60,7 +60,7 @@ function kindLabel(kind: Question['kind']): string {
   return '文本';
 }
 
-/** 生成给人看的澄清稿（后续可直接映射成飞书表单）。 */
+/** 生成给人看的澄清稿；同一问卷可用 /form <id> 渲染为飞书表单。 */
 function buildFeishuPreview(doc: Questionnaire): string {
   const lines = [
     `【需求澄清】${doc.title}`,
@@ -107,7 +107,7 @@ server.registerTool(
   {
     title: '发起结构化提问',
     description:
-      '把需求澄清整理成结构化问卷（单选/多选/文本）。会落盘并返回飞书可读预览；下一节可再变成飞书表单。澄清未完成前不要写最终 Spec。',
+      '把需求澄清整理成结构化问卷（单选/多选/文本）。问卷会落盘并返回飞书可读预览；让用户发送 /form <questionnaireId> 可点选提交。澄清未完成前不要写最终 Spec。',
     inputSchema: {
       title: z.string().min(1).describe('问卷标题，如「登录需求澄清」'),
       goal: z.string().optional().describe('用户原始目标摘要'),
@@ -145,7 +145,7 @@ server.registerTool(
       status: doc.status,
       path: join('data', 'questionnaires', `${doc.id}.json`),
       feishuPreview: preview,
-      next: '把 feishuPreview 发给用户；收到答案后调用 record_answers',
+      next: `把 feishuPreview 发给用户；也可让用户发送 /form ${doc.id} 点选提交；收到答案后调用 record_answers`,
     });
   },
 );
