@@ -32,6 +32,7 @@ import {
   resumeWorkflowAfterSpecConfirmation,
   resumeWorkflowForSpecRevision,
 } from './pipeline-runner.js';
+import { approveSpecReview, publishSpecToDoc, requestSpecChangesFromCard } from './spec-review.js';
 import { requestHighRiskApproval, runApprovedAction } from './approval-runner.js';
 import {
   ensureRunnableSession,
@@ -751,9 +752,9 @@ export async function handleCardAction(
       if (spec.status !== 'in_review') throw new Error(`当前 Spec 状态为 ${spec.status}，无法处理评审。`);
 
       if (action.value.action === 'approve_spec_review') {
-        const approved = await ctx.specs.update(spec.id, { status: 'approved' });
+        const approved = await approveSpecReview(ctx, spec.id);
         return {
-          toast: { type: 'success' as const, content: '产品评审已通过。' },
+          toast: { type: 'success' as const, content: '产品评审已通过，内部交付小队开始执行。' },
           card: { type: 'raw' as const, data: buildSpecReviewCard(approved) },
         };
       }
@@ -762,44 +763,12 @@ export async function handleCardAction(
         ? action.formValue.reviewComment.trim()
         : '';
       if (!comment) return { toast: { type: 'warning' as const, content: '请先填写修改意见。' } };
-      let changed = await ctx.specs.addComment(spec.id, action.operatorOpenId, comment);
-      const pm = ctx.botsById.get('pm') ?? ctx.botsById.get(spec.botId);
-      if (!pm) throw new Error('产品经理 Bot 未连接，无法处理评审意见。');
-      if (!changed.docId) throw new Error('Spec 尚未关联飞书云文档，无法发起云文档评审。');
-      const localComment = changed.comments.at(-1);
-      const docCommentId = await pm.createDocumentComment(changed.docId, comment);
-      if (localComment && docCommentId) {
-        changed = await ctx.specs.update(changed.id, {
-          comments: changed.comments.map((item) => item.id === localComment.id
-            ? { ...item, docCommentId }
-            : item),
-        });
-      }
-      const msg = messageForSpec(changed);
-      const session = await ensureRunnableSession(ctx, pm, msg);
-      if (!session) throw new Error(`${pm.name} 正在执行其他任务，请稍后重试。`);
-      await startCliTask(ctx, {
-        bot: pm,
-        msg,
-        session,
-        prompt: [
-          '【产品 Spec 评审修改】',
-          `Spec 标题：${changed.title}`,
-          '当前 Spec：',
-          changed.content,
-          '评审意见：',
-          comment,
-          '请根据意见重写完整、可执行的产品 Spec，只输出新版 Spec 正文。',
-        ].join('\n\n'),
-        onSuccess: async (answer) => {
-          const revised = await ctx.specs.update(changed.id, {
-            content: answer,
-            status: 'pending_confirmation',
-          });
-          await ctx.specs.resolveComments(revised.id);
-          await pm.replyCard(revised.messageId, buildSpecConfirmationCard(ctx.specs.get(revised.id) ?? revised), !!revised.topicId);
-        },
-      });
+      const changed = await requestSpecChangesFromCard(
+        ctx,
+        spec.id,
+        action.operatorOpenId,
+        comment,
+      );
       return {
         toast: { type: 'success' as const, content: '评审意见已交给产品经理处理。' },
         card: { type: 'raw' as const, data: buildSpecReviewCard(changed) },
@@ -956,37 +925,4 @@ function runWorkflowContinuation(task: Promise<void>, label: string): void {
   void task.catch((error) => {
     console.error(`[工作流] ${label}失败:`, (error as Error).message);
   });
-}
-
-/** 发布到云文档后，Spec 本地状态切至评审中。 */
-async function publishSpecToDoc(ctx: AppContext, specId: string) {
-  const spec = ctx.specs.get(specId);
-  if (!spec) throw new Error(`Spec 不存在: ${specId}`);
-  if (spec.status !== 'confirmed') {
-    throw new Error(`当前 Spec 状态为 ${spec.status}，仅已确认方案可以发布。`);
-  }
-  const bot = ctx.botsById.get(spec.botId) ?? ctx.botsById.get('pm');
-  if (!bot) throw new Error('产品经理 Bot 未连接，无法发布云文档。');
-  const document = await bot.createDocument(`产品 Spec · ${spec.title}`, spec.content);
-  return ctx.specs.update(spec.id, {
-    status: 'in_review',
-    docId: document.documentId,
-    docUrl: document.url,
-  });
-}
-
-function messageForSpec(spec: import('../core/spec-store.js').ProductSpec): IncomingMessage {
-  return {
-    messageId: spec.messageId,
-    chatId: spec.chatId,
-    chatType: 'group',
-    messageType: 'text',
-    text: '',
-    rootId: '',
-    threadId: spec.topicId,
-    senderOpenId: spec.ownerOpenId,
-    senderType: 'user',
-    mentions: [],
-    rawContent: JSON.stringify({ text: '' }),
-  };
 }

@@ -123,10 +123,13 @@ export function buildSpecConfirmationCard(spec: ProductSpec): CardJson {
 export function buildSpecReviewCard(spec: ProductSpec): CardJson {
   const comment = spec.comments.filter((item) => !item.resolved).map((item) => `- ${item.content}`).join('\n');
   const reviewing = spec.status === 'in_review';
+  const statusTitle = spec.status === 'approved'
+    ? '产品 Spec · 评审通过'
+    : reviewing ? '产品 Spec · 评审中' : '产品 Spec · 修订中';
   return {
     schema: '2.0',
     config: { update_multi: true, summary: { content: `Spec 评审：${spec.title}` } },
-    header: { template: spec.status === 'approved' ? 'green' : 'blue', title: { tag: 'plain_text', content: '产品 Spec · 评审中' } },
+    header: { template: spec.status === 'approved' ? 'green' : 'blue', title: { tag: 'plain_text', content: statusTitle } },
     body: {
       direction: 'vertical',
       elements: [
@@ -153,7 +156,7 @@ export function buildSpecReviewCard(spec: ProductSpec): CardJson {
               ],
             },
           ]
-          : [{ tag: 'markdown', content: spec.status === 'approved' ? '✅ 产品评审已通过。' : '🛠️ 产品经理正在处理评审意见。' }]),
+          : [{ tag: 'markdown', content: spec.status === 'approved' ? '✅ 产品评审已通过，内部交付小队已启动。' : '🛠️ 产品经理正在处理评审意见。' }]),
       ],
     },
   };

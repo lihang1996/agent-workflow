@@ -27,6 +27,8 @@ export interface BotOptions {
   onMessage: (msg: IncomingMessage, bot: Bot) => Promise<void>;
   /** 卡片按钮回调（如停止任务）。 */
   onCardAction?: (action: CardAction) => Promise<CardActionResponse | undefined>;
+  /** 飞书云文档新增评论/回复回调。 */
+  onDocumentComment?: (event: DocumentCommentEvent, bot: Bot) => Promise<void>;
 }
 
 export interface CardAction {
@@ -39,6 +41,23 @@ export interface CardAction {
 export interface CardActionResponse {
   toast?: { type: 'success' | 'info' | 'warning' | 'error'; content: string };
   card?: { type: 'raw'; data: CardJson };
+}
+
+export interface DocumentCommentEvent {
+  documentId: string;
+  commentId: string;
+  replyId?: string;
+  authorOpenId: string;
+  noticeType: 'add_comment' | 'add_reply';
+}
+
+export interface DocumentComment {
+  id: string;
+  commentId: string;
+  replyId?: string;
+  authorOpenId: string;
+  content: string;
+  resolved: boolean;
 }
 
 /** 解析飞书 card.action.trigger 事件。 */
@@ -68,7 +87,11 @@ export interface Bot {
   replyCard: (messageId: string, card: CardJson, replyInThread?: boolean) => Promise<string | undefined>;
   updateCard: (messageId: string, card: CardJson) => Promise<void>;
   createDocument: (title: string, markdown: string) => Promise<{ documentId: string; url: string }>;
+  updateDocument: (documentId: string, markdown: string) => Promise<void>;
   createDocumentComment: (documentId: string, content: string) => Promise<string | undefined>;
+  listDocumentComments: (documentId: string) => Promise<DocumentComment[]>;
+  getDocumentComment: (documentId: string, commentId: string, replyId?: string) => Promise<DocumentComment | undefined>;
+  resolveDocumentComment: (documentId: string, commentId: string) => Promise<void>;
   downloadResource: (
     messageId: string,
     fileKey: string,
@@ -86,6 +109,233 @@ const CONTENT_TYPE_EXTENSIONS: Record<string, string> = {
   'image/bmp': 'bmp',
   'image/x-icon': 'ico',
 };
+
+const DOCX_BATCH_LIMIT = 1_000;
+const FEISHU_RETRY_DELAYS_MS = [300, 900, 2_100];
+
+interface ConvertedBlock {
+  block_id?: string;
+  children?: string[];
+  block_type: number;
+  table?: Record<string, unknown> & { merge_info?: unknown };
+  [key: string]: unknown;
+}
+
+interface ConvertedBatch {
+  childrenIds: string[];
+  blocks: ConvertedBlock[];
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function apiCode(value: unknown): number | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const code = (value as { code?: unknown }).code;
+  return typeof code === 'number' ? code : undefined;
+}
+
+function apiStatus(value: unknown): number | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const candidate = value as {
+    status?: unknown;
+    statusCode?: unknown;
+    response?: { status?: unknown; data?: { code?: unknown } };
+  };
+  const status = candidate.status ?? candidate.statusCode ?? candidate.response?.status;
+  return typeof status === 'number' ? status : undefined;
+}
+
+function isRateLimited(value: unknown): boolean {
+  const directCode = apiCode(value);
+  const responseCode = value && typeof value === 'object'
+    ? apiCode((value as { response?: { data?: unknown } }).response?.data)
+    : undefined;
+  return apiStatus(value) === 429 || directCode === 99991400 || responseCode === 99991400;
+}
+
+async function withFeishuRetry<T>(label: string, operation: () => Promise<T>): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= FEISHU_RETRY_DELAYS_MS.length; attempt += 1) {
+    try {
+      const result = await operation();
+      const code = apiCode(result);
+      if (code !== undefined && code !== 0) {
+        const response = result as unknown as { msg?: unknown };
+        const message = result && typeof result === 'object' && typeof response.msg === 'string'
+          ? response.msg
+          : '未知错误';
+        const error = Object.assign(new Error(`${label}失败（${code}）：${message}`), { code });
+        throw error;
+      }
+      return result;
+    } catch (error) {
+      lastError = error;
+      if (!isRateLimited(error) || attempt === FEISHU_RETRY_DELAYS_MS.length) throw error;
+      await sleep(FEISHU_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+  throw lastError;
+}
+
+/** 云文档转换不支持直接复用远程图片块；保留为普通链接，避免发布出空图片。 */
+export function normalizeDocumentMarkdown(markdown: string): string {
+  return markdown.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_match, alt: string, target: string) =>
+    `[${alt.trim() || '图片'}](${target})`);
+}
+
+/** 移除转换接口返回的只读表格合并信息。 */
+export function sanitizeConvertedBlocks(blocks: ConvertedBlock[]): ConvertedBlock[] {
+  return blocks.map((block) => {
+    if (!block.table || !Object.prototype.hasOwnProperty.call(block.table, 'merge_info')) return block;
+    const table = { ...block.table };
+    delete table.merge_info;
+    return { ...block, table };
+  });
+}
+
+/** 按一级块的完整子树分批，确保一次嵌套块请求不超过飞书 1000 块限制。 */
+export function partitionConvertedBlocks(
+  firstLevelBlockIds: string[],
+  sourceBlocks: ConvertedBlock[],
+  limit = DOCX_BATCH_LIMIT,
+): ConvertedBatch[] {
+  if (limit < 1) throw new Error('云文档分批上限必须大于 0');
+  const blocks = sanitizeConvertedBlocks(sourceBlocks);
+  if (blocks.some((block) => !block.block_id)) {
+    throw new Error('飞书转换结果包含缺少 block_id 的文档块，已停止发布以避免内容缺失。');
+  }
+  const byId = new Map(blocks.flatMap((block) => block.block_id ? [[block.block_id, block] as const] : []));
+  const seen = new Set<string>();
+
+  const subtree = (rootId: string): ConvertedBlock[] => {
+    const result: ConvertedBlock[] = [];
+    const visit = (id: string) => {
+      if (seen.has(id)) return;
+      const block = byId.get(id);
+      if (!block) throw new Error(`飞书转换结果缺少文档块：${id}`);
+      seen.add(id);
+      result.push(block);
+      for (const childId of block.children ?? []) visit(childId);
+    };
+    visit(rootId);
+    return result;
+  };
+
+  const batches: ConvertedBatch[] = [];
+  let current: ConvertedBatch = { childrenIds: [], blocks: [] };
+  for (const rootId of firstLevelBlockIds) {
+    const tree = subtree(rootId);
+    if (tree.length > limit) {
+      throw new Error(`单个云文档一级块包含 ${tree.length} 个子块，超过飞书单次 ${limit} 块限制，请拆分 Spec 内容。`);
+    }
+    if (current.blocks.length > 0 && current.blocks.length + tree.length > limit) {
+      batches.push(current);
+      current = { childrenIds: [], blocks: [] };
+    }
+    current.childrenIds.push(rootId);
+    current.blocks.push(...tree);
+  }
+  if (current.blocks.length > 0) batches.push(current);
+  if (seen.size !== byId.size) {
+    throw new Error('飞书转换结果包含无法从一级块访问的孤立块，已停止发布以避免文档残缺。');
+  }
+  return batches;
+}
+
+function renderCommentContent(elements: Array<{
+  type: 'text_run' | 'docs_link' | 'person';
+  text_run?: { text: string };
+  docs_link?: { url: string };
+  person?: { user_id: string };
+}>): string {
+  return elements.map((element) =>
+    element.text_run?.text ?? element.docs_link?.url ?? element.person?.user_id ?? '').join('').trim();
+}
+
+function parseDocumentCommentItem(item: any, replyId?: string): DocumentComment | undefined {
+  const commentId = typeof item?.comment_id === 'string' ? item.comment_id : '';
+  if (!commentId) return undefined;
+  const replies = Array.isArray(item?.reply_list?.replies) ? item.reply_list.replies : [];
+  const reply = replyId
+    ? replies.find((candidate: any) => candidate?.reply_id === replyId)
+    : replies[0];
+  if (!reply) return undefined;
+  const elements = Array.isArray(reply?.content?.elements) ? reply.content.elements : [];
+  const content = renderCommentContent(elements);
+  if (!content) return undefined;
+  return {
+    id: replyId ? `${commentId}:${replyId}` : commentId,
+    commentId,
+    ...(replyId ? { replyId } : {}),
+    authorOpenId: typeof reply.user_id === 'string' && reply.user_id
+      ? reply.user_id
+      : typeof item.user_id === 'string' ? item.user_id : '',
+    content,
+    resolved: item.is_solved === true,
+  };
+}
+
+async function convertDocumentMarkdown(client: Lark.Client, markdown: string): Promise<ConvertedBatch[]> {
+  const converted = await withFeishuRetry('转换飞书云文档内容', () => client.docx.v1.document.convert({
+    data: { content_type: 'markdown', content: normalizeDocumentMarkdown(markdown) },
+  }));
+  const firstLevelBlockIds = converted.data?.first_level_block_ids ?? [];
+  const blocks = (converted.data?.blocks ?? []) as ConvertedBlock[];
+  if (firstLevelBlockIds.length === 0 || blocks.length === 0) {
+    throw new Error('飞书云文档内容转换失败，未返回完整文档块');
+  }
+  return partitionConvertedBlocks(firstLevelBlockIds, blocks);
+}
+
+async function documentRootChildCount(client: Lark.Client, documentId: string): Promise<number> {
+  let pageToken: string | undefined;
+  let total = 0;
+  do {
+    const response = await withFeishuRetry('读取飞书云文档目录', () => client.docx.v1.documentBlockChildren.get({
+      path: { document_id: documentId, block_id: documentId },
+      params: { page_size: 500, ...(pageToken ? { page_token: pageToken } : {}) },
+    }));
+    total += response.data?.items?.length ?? 0;
+    pageToken = response.data?.has_more ? response.data.page_token : undefined;
+  } while (pageToken);
+  return total;
+}
+
+async function insertDocumentBatches(
+  client: Lark.Client,
+  documentId: string,
+  batches: ConvertedBatch[],
+  startIndex: number,
+): Promise<void> {
+  let index = startIndex;
+  for (const batch of batches) {
+    await withFeishuRetry('写入飞书云文档内容', () => client.docx.v1.documentBlockDescendant.create({
+      path: { document_id: documentId, block_id: documentId },
+      data: {
+        children_id: batch.childrenIds,
+        descendants: batch.blocks as any,
+        index,
+      },
+    }));
+    index += batch.childrenIds.length;
+  }
+}
+
+/** 先追加新内容再删除旧内容，写入失败时不会把原文档清空。 */
+async function replaceDocumentMarkdown(client: Lark.Client, documentId: string, markdown: string): Promise<void> {
+  if (!markdown.trim()) throw new Error('飞书云文档内容不能为空');
+  const batches = await convertDocumentMarkdown(client, markdown);
+  const oldChildCount = await documentRootChildCount(client, documentId);
+  await insertDocumentBatches(client, documentId, batches, oldChildCount);
+  if (oldChildCount > 0) {
+    await withFeishuRetry('移除飞书云文档旧版本', () => client.docx.v1.documentBlockChildren.batchDelete({
+      path: { document_id: documentId, block_id: documentId },
+      data: { start_index: 0, end_index: oldChildCount },
+    }));
+  }
+}
 
 /** 兼容 Headers / 普通对象取响应头。 */
 function getHeader(headers: any, name: string): string {
@@ -165,7 +415,7 @@ async function fetchBotOpenId(client: Lark.Client): Promise<string> {
 
 /** 启动单个飞书 Bot（WS 收消息 + REST 回复）。 */
 export async function startBot(opts: BotOptions): Promise<Bot> {
-  const { config, onMessage, onCardAction } = opts;
+  const { config, onMessage, onCardAction, onDocumentComment } = opts;
   const { appId, appSecret } = config;
 
   const client = new Lark.Client({ appId, appSecret });
@@ -229,42 +479,27 @@ export async function startBot(opts: BotOptions): Promise<Bot> {
 
     /** 创建飞书云文档，并把 Markdown 转换为文档块写入根节点。 */
     async createDocument(title, markdown) {
-      const created = await client.request({
-        url: '/open-apis/docx/v1/documents',
-        method: 'POST',
+      if (!markdown.trim()) throw new Error('飞书云文档内容不能为空');
+      const batches = await convertDocumentMarkdown(client, markdown);
+      const created = await withFeishuRetry('创建飞书云文档', () => client.docx.v1.document.create({
         data: { title },
-      }) as any;
-      const document = created?.data?.document ?? created?.document ?? created?.data ?? {};
-      const documentId = document.document_id ?? document.documentId;
+      }));
+      const documentId = created.data?.document?.document_id;
       if (typeof documentId !== 'string' || !documentId) {
         throw new Error('飞书云文档创建成功但未返回 document_id');
       }
+      await insertDocumentBatches(client, documentId, batches, 0);
+      return { documentId, url: `https://feishu.cn/docx/${documentId}` };
+    },
 
-      if (markdown.trim()) {
-        const converted = await client.request({
-          url: '/open-apis/docx/v1/documents/blocks/convert',
-          method: 'POST',
-          data: { content_type: 'markdown', content: markdown },
-        }) as any;
-        const blocks = converted?.data?.blocks ?? converted?.blocks ?? [];
-        if (!Array.isArray(blocks) || blocks.length === 0) {
-          throw new Error('飞书云文档内容转换失败，未返回文档块');
-        }
-        await client.request({
-          url: `/open-apis/docx/v1/documents/${documentId}/blocks/${documentId}/children`,
-          method: 'POST',
-          data: { children: blocks },
-        });
-      }
-      const url = typeof document.url === 'string' && document.url
-        ? document.url
-        : `https://feishu.cn/docx/${documentId}`;
-      return { documentId, url };
+    /** 修订时覆盖同一份云文档，保持评审链接不变。 */
+    async updateDocument(documentId, markdown) {
+      await replaceDocumentMarkdown(client, documentId, markdown);
     },
 
     /** 在云文档中添加全文评论，供产品评审与后续追踪使用。 */
     async createDocumentComment(documentId, content) {
-      const res = await client.drive.fileComment.create({
+      const res = await withFeishuRetry('创建飞书云文档评论', () => client.drive.fileComment.create({
         params: { file_type: 'docx', user_id_type: 'open_id' },
         path: { file_token: documentId },
         data: {
@@ -276,8 +511,54 @@ export async function startBot(opts: BotOptions): Promise<Bot> {
             }],
           },
         },
-      });
+      }));
       return res.data?.comment_id;
+    },
+
+    /** 获取全部未解决评论，供重启补偿和事件漏收时同步。 */
+    async listDocumentComments(documentId) {
+      const comments: DocumentComment[] = [];
+      let pageToken: string | undefined;
+      do {
+        const res = await withFeishuRetry('读取飞书云文档评论', () => client.drive.fileComment.list({
+          params: {
+            file_type: 'docx',
+            user_id_type: 'open_id',
+            is_solved: false,
+            page_size: 50,
+            ...(pageToken ? { page_token: pageToken } : {}),
+          },
+          path: { file_token: documentId },
+        }));
+        for (const item of res.data?.items ?? []) {
+          const comment = parseDocumentCommentItem(item);
+          if (comment) comments.push(comment);
+          const replies = item.reply_list?.replies ?? [];
+          for (const reply of replies.slice(1)) {
+            if (!reply.reply_id) continue;
+            const parsed = parseDocumentCommentItem(item, reply.reply_id);
+            if (parsed) comments.push(parsed);
+          }
+        }
+        pageToken = res.data?.has_more ? res.data.page_token : undefined;
+      } while (pageToken);
+      return comments;
+    },
+
+    async getDocumentComment(documentId, commentId, replyId) {
+      const res = await withFeishuRetry('读取飞书云文档评论', () => client.drive.fileComment.get({
+        params: { file_type: 'docx', user_id_type: 'open_id' },
+        path: { file_token: documentId, comment_id: commentId },
+      }));
+      return parseDocumentCommentItem(res.data, replyId);
+    },
+
+    async resolveDocumentComment(documentId, commentId) {
+      await withFeishuRetry('解决飞书云文档评论', () => client.drive.fileComment.patch({
+        params: { file_type: 'docx' },
+        path: { file_token: documentId, comment_id: commentId },
+        data: { is_solved: true },
+      }));
     },
 
     /** 下载消息中的图片/文件到本地。 */
@@ -296,6 +577,21 @@ export async function startBot(opts: BotOptions): Promise<Bot> {
   };
 
   const dispatcher = new Lark.EventDispatcher({}).register({
+    'drive.notice.comment_add_v1': async (data) => {
+      if (!onDocumentComment || data.notice_meta?.file_type !== 'docx') return {};
+      const documentId = data.notice_meta.file_token ?? '';
+      const commentId = data.comment_id ?? '';
+      const noticeType = data.notice_meta.notice_type;
+      if (!documentId || !commentId || (noticeType !== 'add_comment' && noticeType !== 'add_reply')) return {};
+      await onDocumentComment({
+        documentId,
+        commentId,
+        ...(data.reply_id ? { replyId: data.reply_id } : {}),
+        authorOpenId: data.notice_meta.from_user_id?.open_id ?? '',
+        noticeType,
+      }, bot);
+      return {};
+    },
     'card.action.trigger': async (data: any) => {
       const value = data?.action?.value;
       console.log(

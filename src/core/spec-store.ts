@@ -68,6 +68,16 @@ export class JsonSpecStore {
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
+  findByDocumentId(documentId: string): ProductSpec | undefined {
+    return [...this.specs.values()].find((spec) => spec.docId === documentId);
+  }
+
+  listInReview(): ProductSpec[] {
+    return [...this.specs.values()]
+      .filter((spec) => spec.status === 'in_review' && !!spec.docId)
+      .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
+  }
+
   async create(input: Omit<ProductSpec, 'id' | 'status' | 'comments' | 'createdAt' | 'updatedAt'>): Promise<ProductSpec> {
     const now = new Date().toISOString();
     const spec: ProductSpec = {
@@ -92,25 +102,33 @@ export class JsonSpecStore {
     return next;
   }
 
-  async addComment(id: string, authorOpenId: string, content: string): Promise<ProductSpec> {
+  async addComment(
+    id: string,
+    authorOpenId: string,
+    content: string,
+    docCommentId?: string,
+  ): Promise<ProductSpec> {
     const spec = this.get(id);
     if (!spec) throw new Error(`Spec 不存在: ${id}`);
+    if (docCommentId && spec.comments.some((comment) => comment.docCommentId === docCommentId)) return spec;
     const comment: SpecComment = {
-      id: randomUUID().slice(0, 8),
+      id: randomUUID(),
       authorOpenId,
       content,
+      ...(docCommentId ? { docCommentId } : {}),
       resolved: false,
       createdAt: new Date().toISOString(),
     };
     return this.update(id, { comments: [...spec.comments, comment], status: 'changes_requested' });
   }
 
-  async resolveComments(id: string): Promise<ProductSpec> {
+  async resolveComments(id: string, commentIds?: ReadonlySet<string>): Promise<ProductSpec> {
     const spec = this.get(id);
     if (!spec) throw new Error(`Spec 不存在: ${id}`);
     const now = new Date().toISOString();
     return this.update(id, {
       comments: spec.comments.map((comment) => comment.resolved
+        || (commentIds && !commentIds.has(comment.id))
         ? comment
         : { ...comment, resolved: true, resolvedAt: now }),
     });

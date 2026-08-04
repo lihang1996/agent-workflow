@@ -38,6 +38,8 @@ export interface AppContext extends AppConfig {
   persistTimer?: ReturnType<typeof setTimeout>;
   schedulerTimer?: ReturnType<typeof setInterval>;
   schedulerRunning: boolean;
+  specReviewTimer?: ReturnType<typeof setInterval>;
+  specReviewRunning: boolean;
 }
 
 export interface CreateAppDeps {
@@ -71,5 +73,6 @@ export function createAppContext(deps: CreateAppDeps): AppContext {
     workflows: deps.workflows,
     botsById: new Map(),
     schedulerRunning: false,
+    specReviewRunning: false,
   };
 }

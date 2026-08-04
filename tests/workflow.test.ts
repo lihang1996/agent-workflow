@@ -5,8 +5,13 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { buildPipelineStepPrompt, DEFAULT_PIPELINE_STEPS } from '../src/core/pipeline.js';
 import { JsonQuestionnaireStore } from '../src/core/questionnaire-store.js';
+import { JsonSpecStore } from '../src/core/spec-store.js';
 import { JsonWorkflowStore } from '../src/core/workflow-store.js';
+import { normalizeDocumentMarkdown, partitionConvertedBlocks } from '../src/im/lark.js';
 import { buildQuestionnaireCard, buildSpecConfirmationCard, buildSpecReviewCard } from '../src/im/workflow-card.js';
+import { resumeWorkflowAfterProductReview } from '../src/runtime/pipeline-runner.js';
+import { publishSpecToDoc } from '../src/runtime/spec-review.js';
+import type { AppContext } from '../src/runtime/app-context.js';
 
 test('问卷带工作流作用域并可持久化答案', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agent-os-questionnaire-'));
@@ -130,6 +135,125 @@ test('工作流支持在云文档评审节点暂停', async () => {
     const waiting = await store.update(workflow.id, { status: 'awaiting_doc_review', nextStepIndex: 1 });
     assert.equal(waiting.status, 'awaiting_doc_review');
     assert.equal(store.listRecoverable().length, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('飞书 Markdown 转换保留图片链接并按完整子树分批', () => {
+  assert.equal(normalizeDocumentMarkdown('查看 ![原型图](https://example.com/a.png)'), '查看 [原型图](https://example.com/a.png)');
+  const batches = partitionConvertedBlocks([
+    'root-1',
+    'root-2',
+  ], [
+    { block_id: 'root-1', block_type: 3, children: ['child-1'] },
+    { block_id: 'child-1', block_type: 31, table: { merge_info: [{ row_span: 2 }] } },
+    { block_id: 'root-2', block_type: 2 },
+  ], 2);
+  assert.equal(batches.length, 2);
+  assert.deepEqual(batches.map((batch) => batch.childrenIds), [['root-1'], ['root-2']]);
+  assert.equal(Object.hasOwn(batches[0].blocks[1].table ?? {}, 'merge_info'), false);
+});
+
+test('Spec 修订发布覆盖原云文档且不创建新链接', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-spec-update-'));
+  try {
+    const specs = await JsonSpecStore.open(join(root, 'specs.json'));
+    const created = await specs.create({
+      title: '登录',
+      content: '新版 Spec',
+      chatId: 'oc',
+      topicId: 'omt',
+      messageId: 'om',
+      ownerOpenId: 'ou',
+      botId: 'pm',
+      docId: 'doc-existing',
+      docUrl: 'https://feishu.cn/docx/doc-existing',
+    });
+    await specs.update(created.id, { status: 'confirmed' });
+    const calls: string[] = [];
+    const bot = {
+      id: 'pm',
+      updateDocument: async (documentId: string, markdown: string) => {
+        calls.push(`update:${documentId}:${markdown}`);
+      },
+      createDocument: async () => {
+        calls.push('create');
+        return { documentId: 'new', url: 'https://feishu.cn/docx/new' };
+      },
+    } as any;
+    const published = await publishSpecToDoc({
+      specs,
+      botsById: new Map([['pm', bot]]),
+    } as AppContext, created.id);
+    assert.deepEqual(calls, ['update:doc-existing:新版 Spec']);
+    assert.equal(published.docId, 'doc-existing');
+    assert.equal(published.status, 'in_review');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('产品评审通过后恢复内部交付工作流', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-review-resume-'));
+  try {
+    const workflows = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const specs = await JsonSpecStore.open(join(root, 'specs.json'));
+    const workflow = await workflows.create({
+      kind: 'team',
+      name: '团队交付流水线',
+      initiatorBotId: 'ceo',
+      goal: '登录',
+      stepIds: ['pm'],
+      message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt', senderOpenId: 'ou' },
+    });
+    const spec = await specs.create({
+      title: '登录',
+      content: '最终 Spec',
+      chatId: 'oc',
+      topicId: 'omt',
+      messageId: 'om',
+      ownerOpenId: 'ou',
+      botId: 'pm',
+      workflowId: workflow.id,
+    });
+    await specs.update(spec.id, { status: 'approved' });
+    await workflows.update(workflow.id, {
+      status: 'awaiting_doc_review',
+      nextStepIndex: 1,
+      specId: spec.id,
+    });
+    const replies: string[] = [];
+    const ceo = { id: 'ceo', reply: async (_id: string, text: string) => { replies.push(text); } } as any;
+    await resumeWorkflowAfterProductReview({
+      shuttingDown: false,
+      workflows,
+      specs,
+      botsById: new Map([['ceo', ceo]]),
+    } as AppContext, spec.id);
+    assert.equal(workflows.get(workflow.id)?.status, 'completed');
+    assert.equal(workflows.get(workflow.id)?.priorOutputs.pm, '最终 Spec');
+    assert.match(replies[0], /全部完成/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('云文档评论按远端 ID 去重并只解决本轮意见', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-spec-comments-'));
+  try {
+    const specs = await JsonSpecStore.open(join(root, 'specs.json'));
+    let spec = await specs.create({
+      title: '登录', content: 'Spec', chatId: 'oc', topicId: 'omt', messageId: 'om', ownerOpenId: 'ou', botId: 'pm',
+    });
+    spec = await specs.addComment(spec.id, 'ou-a', '意见 A', 'comment-a');
+    const commentA = spec.comments[0];
+    spec = await specs.addComment(spec.id, 'ou-a', '重复意见', 'comment-a');
+    assert.equal(spec.comments.length, 1);
+    spec = await specs.addComment(spec.id, 'ou-b', '意见 B', 'comment-b');
+    spec = await specs.resolveComments(spec.id, new Set([commentA.id]));
+    assert.equal(spec.comments.find((item) => item.docCommentId === 'comment-a')?.resolved, true);
+    assert.equal(spec.comments.find((item) => item.docCommentId === 'comment-b')?.resolved, false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -177,7 +177,18 @@ async function completeProductStep(
   }
 
   const existing = workflow.specId ? ctx.specs.get(workflow.specId) : undefined;
-  const spec = existing
+  const handledCommentIds = new Set(
+    (workflow.priorOutputs.review_comment_ids ?? '').split(',').map((id) => id.trim()).filter(Boolean),
+  );
+  if (existing?.docId && handledCommentIds.size > 0) {
+    const documentCommentIds = new Set(existing.comments
+      .filter((comment) => handledCommentIds.has(comment.id) && comment.docCommentId)
+      .map((comment) => comment.docCommentId!.split(':', 1)[0]));
+    for (const commentId of documentCommentIds) {
+      await actor.resolveDocumentComment(existing.docId, commentId);
+    }
+  }
+  let spec = existing
     ? await ctx.specs.update(existing.id, {
       content: answer,
       status: 'pending_confirmation',
@@ -194,11 +205,18 @@ async function completeProductStep(
       questionnaireId: workflow.questionnaireId,
       workflowId: workflow.id,
     });
+  if (existing && handledCommentIds.size > 0) {
+    spec = await ctx.specs.resolveComments(existing.id, handledCommentIds);
+  }
+  const nextPriorOutputs = { ...workflow.priorOutputs };
+  delete nextPriorOutputs.previous_spec;
+  delete nextPriorOutputs.confirmation_feedback;
+  delete nextPriorOutputs.review_comment_ids;
   workflow = await ctx.workflows.update(workflow.id, {
     status: 'awaiting_spec_confirmation',
     specId: spec.id,
     nextStepIndex: stepIndex + 1,
-    priorOutputs: { ...workflow.priorOutputs, pm: answer },
+    priorOutputs: { ...nextPriorOutputs, pm: answer },
     error: undefined,
   });
   await actor.replyCard(msg.messageId, buildSpecConfirmationCard(spec), hasThread(msg));
@@ -259,6 +277,7 @@ export async function resumeWorkflowForSpecRevision(
   ctx: AppContext,
   specId: string,
   feedback: string,
+  commentIds: string[] = [],
 ): Promise<void> {
   const spec = ctx.specs.get(specId);
   if (!spec?.workflowId) return;
@@ -272,7 +291,26 @@ export async function resumeWorkflowForSpecRevision(
       ...workflow.priorOutputs,
       previous_spec: spec.content,
       confirmation_feedback: feedback,
+      ...(commentIds.length > 0 ? { review_comment_ids: commentIds.join(',') } : {}),
     },
+    error: undefined,
+  });
+  await continueDeliveryWorkflow(ctx, workflow.id);
+}
+
+/** 产品评审通过后，启动架构、开发、评审和 QA 内部交付步骤。 */
+export async function resumeWorkflowAfterProductReview(ctx: AppContext, specId: string): Promise<void> {
+  const spec = ctx.specs.get(specId);
+  if (!spec) throw new Error(`Spec 不存在: ${specId}`);
+  if (!spec.workflowId) throw new Error(`Spec ${spec.id} 没有关联交付工作流。`);
+  if (spec.status !== 'approved') throw new Error(`Spec ${spec.id} 尚未通过产品评审。`);
+  const workflow = requireWorkflow(ctx, spec.workflowId);
+  if (workflow.status !== 'awaiting_doc_review' || workflow.specId !== spec.id) {
+    throw new Error(`工作流当前状态为 ${workflow.status}，无法启动内部交付小队。`);
+  }
+  await ctx.workflows.update(workflow.id, {
+    status: 'ready',
+    priorOutputs: { ...workflow.priorOutputs, pm: spec.content },
     error: undefined,
   });
   await continueDeliveryWorkflow(ctx, workflow.id);

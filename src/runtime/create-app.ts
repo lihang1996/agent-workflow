@@ -8,6 +8,11 @@ import { reconcileOrphanedCards, shutdownActiveRuns } from './active-runs.js';
 import { handleCardAction, handleMessage } from './message-handler.js';
 import { startScheduler, stopScheduler } from './scheduler.js';
 import { resumeRecoverableWorkflows } from './pipeline-runner.js';
+import {
+  handleDocumentComment,
+  startSpecReviewSync,
+  stopSpecReviewSync,
+} from './spec-review.js';
 
 export interface App {
   ctx: AppContext;
@@ -23,6 +28,12 @@ export interface App {
   shutdownActiveRuns: (reason: string) => Promise<void>;
   startScheduler: () => void;
   stopScheduler: () => void;
+  startSpecReviewSync: () => void;
+  stopSpecReviewSync: () => void;
+  handleDocumentComment: (
+    event: import('../im/lark.js').DocumentCommentEvent,
+    bot: Bot,
+  ) => Promise<void>;
   resumeRecoverableWorkflows: () => Promise<void>;
 }
 
@@ -39,6 +50,9 @@ export function createApp(deps: CreateAppDeps): App {
     shutdownActiveRuns: (reason) => shutdownActiveRuns(ctx, reason),
     startScheduler: () => startScheduler(ctx),
     stopScheduler: () => stopScheduler(ctx),
+    startSpecReviewSync: () => startSpecReviewSync(ctx),
+    stopSpecReviewSync: () => stopSpecReviewSync(ctx),
+    handleDocumentComment: (event, bot) => handleDocumentComment(ctx, event, bot),
     resumeRecoverableWorkflows: () => resumeRecoverableWorkflows(ctx),
   };
 }

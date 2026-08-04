@@ -102,6 +102,7 @@ for (const config of botConfigs) {
       config,
       onMessage: app.handleMessage,
       onCardAction: app.handleCardAction,
+      onDocumentComment: app.handleDocumentComment,
     });
     app.botsById.set(bot.id, bot);
     console.log(
@@ -115,11 +116,13 @@ for (const config of botConfigs) {
 await app.reconcileOrphanedCards();
 await app.resumeRecoverableWorkflows();
 app.startScheduler();
+app.startSpecReviewSync();
 
 /** 收尾进行中任务后退出进程。 */
 async function shutdownAndExit(reason: string, exitCode = 0): Promise<void> {
   console.log(`[进程] ${reason}，开始收尾进行中任务…`);
   app.stopScheduler();
+  app.stopSpecReviewSync();
   try {
     await app.shutdownActiveRuns(reason);
   } catch (error) {
