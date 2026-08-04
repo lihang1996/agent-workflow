@@ -20,6 +20,11 @@ export type ScheduleJobExecutor = (
   job: ScheduledJob,
 ) => Promise<ScheduleExecutionResult>;
 
+/** 日志巡检只把受控路径交给宿主读取，不能把路径中的敏感词误当成待执行指令。 */
+export function scheduleRequiresApproval(job: ScheduledJob): boolean {
+  return job.kind !== 'log_inspection' && isHighRiskTask(job.prompt);
+}
+
 /** 启动后立即检查一次；之后按固定 tick 检查持久化任务。 */
 export function startScheduler(ctx: AppContext): void {
   if (ctx.schedulerTimer) return;
@@ -121,7 +126,8 @@ async function runJob(ctx: AppContext, job: ScheduledJob): Promise<ScheduleExecu
     rawContent: JSON.stringify({ text: '' }),
   };
 
-  if (isHighRiskTask(job.prompt)) {
+  // 日志任务的 prompt 是经过校验的文件路径，只执行宿主只读截取，不应把路径文本误判成待执行高风险指令。
+  if (scheduleRequiresApproval(job)) {
     await requestHighRiskApproval(ctx, {
       bot,
       msg,
@@ -142,7 +148,11 @@ async function runJob(ctx: AppContext, job: ScheduledJob): Promise<ScheduleExecu
 
   const session = await ensureRunnableSession(ctx, bot, msg);
   if (!session) {
-    await bot.sendText(job.message.chatId, `⏭️ 定时任务 ${job.id} 跳过：${bot.name} 正在忙。`);
+    await bot.reply(
+      job.message.messageId,
+      `⏭️ 定时任务 ${job.id} 跳过：${bot.name} 正在忙。`,
+      !!job.message.threadId || !!job.message.rootId,
+    );
     return { outcome: 'skipped', reason: `${bot.name} 正在忙` };
   }
   const prompt = job.kind === 'log_inspection'
