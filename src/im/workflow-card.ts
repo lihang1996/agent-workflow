@@ -64,17 +64,22 @@ export function buildQuestionnaireCard(questionnaire: Questionnaire): CardJson {
 }
 
 export function buildSpecConfirmationCard(spec: ProductSpec): CardJson {
+  const confirmed = spec.status === 'confirmed' || spec.status === 'published' || spec.status === 'in_review' || spec.status === 'approved';
   return {
     schema: '2.0',
     config: { update_multi: true, summary: { content: `Spec 待确认：${spec.title}` } },
-    header: { template: 'orange', title: { tag: 'plain_text', content: '产品 Spec · 待确认' } },
+    header: { template: confirmed ? 'green' : spec.status === 'changes_requested' ? 'red' : 'orange', title: { tag: 'plain_text', content: `产品 Spec · ${confirmed ? '已确认' : spec.status === 'changes_requested' ? '待修改' : '待确认'}` } },
     body: {
       direction: 'vertical',
       elements: [
         { tag: 'markdown', content: `**${spec.title}**\n\n${spec.content.slice(0, 5_500)}` },
-        { tag: 'markdown', content: '确认后会发布到飞书云文档，并进入评审。' },
-        button('confirm_spec', { specId: spec.id }, '确认并发布', 'primary'),
-        button('reject_spec', { specId: spec.id }, '退回修改', 'danger'),
+        { tag: 'markdown', content: confirmed ? '✅ 需求已确认。下一步可发布到飞书云文档。' : spec.status === 'changes_requested' ? '⛔ 已退回产品经理修改。' : '确认后会进入飞书云文档发布流程。' },
+        ...(spec.status === 'pending_confirmation'
+          ? [
+            button('confirm_spec', { specId: spec.id }, '确认方案', 'primary'),
+            button('reject_spec', { specId: spec.id }, '退回修改', 'danger'),
+          ]
+          : []),
       ],
     },
   };

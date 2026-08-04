@@ -13,7 +13,7 @@ import { requestTaskAbort } from '../core/task-abort.js';
 import { assertWorkdir } from '../core/workdir.js';
 import { resolveMentions } from '../im/message-parser.js';
 import { isAddressedToBot, type Bot, type IncomingMessage } from '../im/lark.js';
-import { buildQuestionnaireCard } from '../im/workflow-card.js';
+import { buildQuestionnaireCard, buildSpecConfirmationCard } from '../im/workflow-card.js';
 import type { AppContext } from './app-context.js';
 import {
   freezeRunCard,
@@ -171,6 +171,31 @@ export async function handleMessage(
     } catch (error) {
       await bot.reply(msg.messageId, (error as Error).message, hasThread);
     }
+    return;
+  }
+  if (command?.name === 'spec') {
+    const [subcommand = 'list', specId] = command.arg?.trim().split(/\s+/, 2) ?? [];
+    const topicSpecs = ctx.specs.listByTopic(msg.chatId, topicIdOf(msg));
+    if (subcommand === 'list') {
+      await bot.reply(
+        msg.messageId,
+        topicSpecs.length
+          ? topicSpecs.map((spec) => `${spec.id} · ${spec.status} · ${spec.title}`).join('\n')
+          : '当前话题还没有产品 Spec。产品经理完成流水线需求阶段后会自动生成。',
+        hasThread,
+      );
+      return;
+    }
+    if (subcommand === 'show' && specId) {
+      const spec = ctx.specs.get(specId);
+      if (!spec || spec.chatId !== msg.chatId || spec.topicId !== topicIdOf(msg)) {
+        await bot.reply(msg.messageId, `找不到本话题 Spec：${specId}`, hasThread);
+        return;
+      }
+      await bot.replyCard(msg.messageId, buildSpecConfirmationCard(spec), hasThread);
+      return;
+    }
+    await bot.reply(msg.messageId, '用法：/spec list 或 /spec show <specId>', hasThread);
     return;
   }
   if (command?.name === 'handoff') {
@@ -445,6 +470,31 @@ export async function handleCardAction(
     formValue: Record<string, unknown>;
   },
 ) {
+  if (action.value.action === 'confirm_spec' || action.value.action === 'reject_spec') {
+    const specId = typeof action.value.specId === 'string' ? action.value.specId : '';
+    if (!specId) return { toast: { type: 'error' as const, content: 'Spec ID 缺失。' } };
+    try {
+      const spec = ctx.specs.get(specId);
+      if (!spec) throw new Error('Spec 不存在或已被删除。');
+      const owner = process.env.OWNER_OPEN_ID?.trim() || spec.ownerOpenId;
+      if (action.operatorOpenId !== owner) {
+        return { toast: { type: 'warning' as const, content: '只有需求发起人或指定负责人可以确认方案。' } };
+      }
+      if (spec.status !== 'pending_confirmation') {
+        return { toast: { type: 'info' as const, content: `Spec 当前状态：${spec.status}` } };
+      }
+      const confirmed = action.value.action === 'confirm_spec';
+      const updated = await ctx.specs.update(spec.id, {
+        status: confirmed ? 'confirmed' : 'changes_requested',
+      });
+      return {
+        toast: { type: confirmed ? 'success' as const : 'info' as const, content: confirmed ? '方案已确认。' : '已退回产品经理修改。' },
+        card: { type: 'raw' as const, data: buildSpecConfirmationCard(updated) },
+      };
+    } catch (error) {
+      return { toast: { type: 'error' as const, content: (error as Error).message } };
+    }
+  }
   if (action.value.action === 'submit_questionnaire') {
     const questionnaireId = typeof action.value.questionnaireId === 'string'
       ? action.value.questionnaireId

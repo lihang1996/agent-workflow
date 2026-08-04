@@ -10,7 +10,8 @@ export type CommandName =
   | "handoff"
   | "review"
   | "pipeline"
-  | "form";
+  | "form"
+  | "spec";
 
 export interface SlashCommand {
   name: CommandName;
@@ -19,7 +20,7 @@ export interface SlashCommand {
 
 // workdir / handoff / review / pipeline 参数可能含空格，因此吃到行尾。
 const COMMAND_RE =
-  /^(?:@.+\s+)?\/(close|status|help|engine|workdir|reset|reopen|clean|handoff|review|pipeline|form)(?:\s+(.+))?$/;
+  /^(?:@.+\s+)?\/(close|status|help|engine|workdir|reset|reopen|clean|handoff|review|pipeline|form|spec)(?:\s+(.+))?$/;
 
 /** 从消息文本解析斜杠命令。 */
 export function parseCommand(text: string): SlashCommand | undefined {
