@@ -482,6 +482,62 @@ export async function handleCardAction(
     formValue: Record<string, unknown>;
   },
 ) {
+  if (action.value.action === 'approve_spec_review' || action.value.action === 'request_spec_changes') {
+    const specId = typeof action.value.specId === 'string' ? action.value.specId : '';
+    try {
+      const spec = ctx.specs.get(specId);
+      if (!spec) throw new Error('Spec 不存在或已被删除。');
+      assertSpecOwner(spec.ownerOpenId, action.operatorOpenId);
+      if (spec.status !== 'in_review') throw new Error(`当前 Spec 状态为 ${spec.status}，无法处理评审。`);
+
+      if (action.value.action === 'approve_spec_review') {
+        const approved = await ctx.specs.update(spec.id, { status: 'approved' });
+        return {
+          toast: { type: 'success' as const, content: '产品评审已通过。' },
+          card: { type: 'raw' as const, data: buildSpecReviewCard(approved) },
+        };
+      }
+
+      const comment = typeof action.formValue.reviewComment === 'string'
+        ? action.formValue.reviewComment.trim()
+        : '';
+      if (!comment) return { toast: { type: 'warning' as const, content: '请先填写修改意见。' } };
+      const changed = await ctx.specs.addComment(spec.id, action.operatorOpenId, comment);
+      const pm = ctx.botsById.get('pm') ?? ctx.botsById.get(spec.botId);
+      if (!pm) throw new Error('产品经理 Bot 未连接，无法处理评审意见。');
+      const msg = messageForSpec(changed);
+      const session = await ensureRunnableSession(ctx, pm, msg);
+      if (!session) throw new Error(`${pm.name} 正在执行其他任务，请稍后重试。`);
+      await startCliTask(ctx, {
+        bot: pm,
+        msg,
+        session,
+        prompt: [
+          '【产品 Spec 评审修改】',
+          `Spec 标题：${changed.title}`,
+          '当前 Spec：',
+          changed.content,
+          '评审意见：',
+          comment,
+          '请根据意见重写完整、可执行的产品 Spec，只输出新版 Spec 正文。',
+        ].join('\n\n'),
+        onSuccess: async (answer) => {
+          const revised = await ctx.specs.update(changed.id, {
+            content: answer,
+            status: 'pending_confirmation',
+          });
+          await ctx.specs.resolveComments(revised.id);
+          await pm.replyCard(revised.messageId, buildSpecConfirmationCard(ctx.specs.get(revised.id) ?? revised), !!revised.topicId);
+        },
+      });
+      return {
+        toast: { type: 'success' as const, content: '评审意见已交给产品经理处理。' },
+        card: { type: 'raw' as const, data: buildSpecReviewCard(changed) },
+      };
+    } catch (error) {
+      return { toast: { type: 'error' as const, content: (error as Error).message } };
+    }
+  }
   if (action.value.action === 'publish_spec') {
     const specId = typeof action.value.specId === 'string' ? action.value.specId : '';
     try {
@@ -605,4 +661,20 @@ async function publishSpecToDoc(ctx: AppContext, specId: string) {
     docId: document.documentId,
     docUrl: document.url,
   });
+}
+
+function messageForSpec(spec: import('../core/spec-store.js').ProductSpec): IncomingMessage {
+  return {
+    messageId: spec.messageId,
+    chatId: spec.chatId,
+    chatType: 'group',
+    messageType: 'text',
+    text: '',
+    rootId: '',
+    threadId: spec.topicId,
+    senderOpenId: spec.ownerOpenId,
+    senderType: 'user',
+    mentions: [],
+    rawContent: JSON.stringify({ text: '' }),
+  };
 }

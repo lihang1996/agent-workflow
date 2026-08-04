@@ -89,6 +89,7 @@ export function buildSpecConfirmationCard(spec: ProductSpec): CardJson {
 
 export function buildSpecReviewCard(spec: ProductSpec): CardJson {
   const comment = spec.comments.filter((item) => !item.resolved).map((item) => `- ${item.content}`).join('\n');
+  const reviewing = spec.status === 'in_review';
   return {
     schema: '2.0',
     config: { update_multi: true, summary: { content: `Spec 评审：${spec.title}` } },
@@ -98,9 +99,13 @@ export function buildSpecReviewCard(spec: ProductSpec): CardJson {
       elements: [
         { tag: 'markdown', content: `**${spec.title}**\n${spec.docUrl ? `[打开飞书云文档](${spec.docUrl})` : '云文档发布中或尚未发布。'}` },
         ...(comment ? [{ tag: 'markdown', content: `**待处理意见**\n${comment}` }] : []),
-        { tag: 'input', name: 'reviewComment', label: { tag: 'plain_text', content: '修改意见（要求修改时必填）' }, placeholder: { tag: 'plain_text', content: '请输入需要产品经理处理的意见' } },
-        button('approve_spec_review', { specId: spec.id }, '评审通过', 'primary'),
-        button('request_spec_changes', { specId: spec.id }, '要求修改', 'danger'),
+        ...(reviewing
+          ? [
+            { tag: 'input', name: 'reviewComment', label: { tag: 'plain_text', content: '修改意见（要求修改时必填）' }, placeholder: { tag: 'plain_text', content: '请输入需要产品经理处理的意见' } },
+            button('approve_spec_review', { specId: spec.id }, '评审通过', 'primary'),
+            button('request_spec_changes', { specId: spec.id }, '要求修改', 'danger'),
+          ]
+          : [{ tag: 'markdown', content: spec.status === 'approved' ? '✅ 产品评审已通过。' : '🛠️ 产品经理正在处理评审意见。' }]),
       ],
     },
   };
