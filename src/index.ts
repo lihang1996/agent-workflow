@@ -5,7 +5,13 @@
 import 'dotenv/config';
 import { join, resolve } from 'node:path';
 import { startBot, isAddressedToBot, type Bot, type IncomingMessage } from './im/lark.js';
-import { buildTaskCard, ThrottledCardUpdater } from './im/card.js';
+import {
+  answerContinuation,
+  answerNeedsContinuation,
+  buildTaskCard,
+  splitLongText,
+  ThrottledCardUpdater,
+} from './im/card.js';
 import { resolveMentions, extractResourceKeys } from './im/message-parser.js';
 import { parseCommand } from './core/command-parser.js';
 import { loadBotConfigs } from './core/bot-config.js';
@@ -33,6 +39,8 @@ import {
   filterRunnableSteps,
   parsePipelineSteps,
 } from './core/pipeline.js';
+import { requestTaskAbort } from './core/task-abort.js';
+import { TaskProgressTracker } from './core/task-progress.js';
 import { SessionManager, type Session } from './core/session-manager.js';
 import { JsonSessionStore } from './core/session-store.js';
 import { JsonTopicStore } from './core/topic-store.js';
@@ -42,12 +50,11 @@ import { runCli } from './cli/runner.js';
 import { isCliId, type CliEvent, type CliId } from './cli/types.js';
 
 const defaultCliId = parseDefaultCliId(process.env.DEFAULT_CLI);
-const MAX_ACTIVITIES = 5;
 const COLLAB_MAX_ROUNDS = parseMaxRounds(process.env.COLLAB_MAX_ROUNDS);
 const PIPELINE_STEPS = parsePipelineSteps(process.env.PIPELINE_STEPS);
 const SHUTDOWN_GRACE_MS = 15_000;
 const ACTIVE_RUN_PERSIST_DEBOUNCE_MS = 800;
-const THINKING_HEARTBEAT_MS = 15_000;
+const PROGRESS_HEARTBEAT_MS = 15_000;
 const botConfigs = loadBotConfigs();
 const botsById = new Map<string, Bot>();
 
@@ -106,22 +113,25 @@ type TerminalStatus = 'success' | 'failed' | 'interrupted';
 
 interface ActiveRun {
   controller: AbortController;
+  ownerOpenId: string;
+  cancelMode?: 'stop' | 'close';
   bot: Bot;
   cardId: string;
   cardTitle: string;
   cardUpdater: ThrottledCardUpdater;
-  progress: number;
-  detail: string;
-  activities: string[];
+  tracker: TaskProgressTracker;
   lastEventAt: number;
   heartbeat?: ReturnType<typeof setInterval>;
   terminalStatus?: TerminalStatus;
+  /** 卡片已在回调响应里收尾，避免异步 patch 再盖一次。 */
+  cardSettledByCallback?: boolean;
   interruptReason?: string;
   done: Promise<void>;
   resolveDone: () => void;
 }
 
 const activeRuns = new Map<string, ActiveRun>();
+const contextWindows = new Map<string, number>();
 let shuttingDown = false;
 let persistTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -130,16 +140,19 @@ function snapshotActiveRuns(): PersistedActiveRun[] {
   const now = new Date().toISOString();
   return [...activeRuns.entries()]
     .filter(([, run]) => run.terminalStatus !== 'success')
-    .map(([sessionId, run]) => ({
-      sessionId,
-      botId: run.bot.id,
-      cardId: run.cardId,
-      cardTitle: run.cardTitle,
-      progress: run.progress,
-      detail: run.detail,
-      activities: [...run.activities],
-      updatedAt: now,
-    }));
+    .map(([sessionId, run]) => {
+      const snap = run.tracker.snapshot();
+      return {
+        sessionId,
+        botId: run.bot.id,
+        cardId: run.cardId,
+        cardTitle: run.cardTitle,
+        progress: Math.min(90, Math.round(snap.elapsedMs / 1_000)),
+        detail: snap.current,
+        activities: snap.activities.slice(0, 5).map((a) => a.label),
+        updatedAt: now,
+      };
+    });
 }
 
 /** 立即写入 active-runs.json。 */
@@ -172,18 +185,17 @@ async function flushPersistActiveRuns(): Promise<void> {
   await persistActiveRuns();
 }
 
-/** 构造「已中断」失败卡片。 */
-function interruptedCard(run: Pick<ActiveRun, 'cardTitle' | 'progress' | 'detail' | 'activities'>, detail: string) {
+/** 构造「已中断」失败/取消卡片。 */
+function interruptedCard(run: ActiveRun, detail: string) {
   return buildTaskCard({
     title: run.cardTitle,
-    status: 'failed',
-    progress: run.progress,
+    status: 'cancelled',
     detail,
-    activities: run.activities,
+    progress: run.tracker.snapshot(),
   });
 }
 
-/** 把进行中任务卡片刷成失败；已成功的跳过。 */
+/** 把进行中任务卡片刷成取消；已成功的跳过。 */
 async function finishInterruptedRun(run: ActiveRun, detail: string): Promise<void> {
   if (run.terminalStatus === 'success') return;
   run.terminalStatus = 'interrupted';
@@ -213,10 +225,8 @@ async function reconcileOrphanedCards(): Promise<void> {
     try {
       await bot.updateCard(orphan.cardId, buildTaskCard({
         title: orphan.cardTitle,
-        status: 'failed',
-        progress: orphan.progress,
+        status: 'cancelled',
         detail: '上次服务异常退出，任务已中断',
-        activities: orphan.activities,
       }));
       console.log(`[任务] 已收尾遗留卡片 bot=${orphan.botId} card=${orphan.cardId}`);
     } catch (error) {
@@ -269,15 +279,10 @@ async function shutdownActiveRuns(reason: string): Promise<void> {
   await flushPersistActiveRuns().catch(() => undefined);
 }
 
-/** 单行截断，供卡片/日志展示。 */
+/** 单行截断，供日志展示。 */
 function truncate(text: string, max = 80): string {
   const oneLine = text.replace(/\s+/g, ' ').trim();
   return oneLine.length > max ? `${oneLine.slice(0, max)}…` : oneLine;
-}
-
-/** 进度条递增，完成前最高 90%。 */
-function bumpProgress(current: number, step = 8): number {
-  return Math.min(90, current + step);
 }
 
 const STATUS_LABELS: Record<Session['status'], string> = {
@@ -377,14 +382,21 @@ async function startCliTask(options: {
     resolveDone = resolve;
   });
 
+  const tracker = new TaskProgressTracker(
+    Date.now,
+    contextWindows.get(session.id),
+    !session.cliSessionId,
+  );
+
   // 先发卡并同步落盘，再下载资源，缩短孤儿卡窗口。
   let cardId: string | undefined;
   try {
     cardId = await bot.replyCard(msg.messageId, buildTaskCard({
       title: cardTitle,
       status: 'running',
-      progress: 0,
       detail: `正在启动 ${adapter.displayName}`,
+      progress: tracker.snapshot(),
+      abortSessionId: session.id,
     }), hasThread);
   } catch (error) {
     await markSessionIdle(session.id);
@@ -400,16 +412,21 @@ async function startCliTask(options: {
   }
   console.log(`[卡片] bot=${bot.id} message_id=${cardId} inThread=${hasThread} engine=${adapter.id}`);
 
-  const cardUpdater = new ThrottledCardUpdater((card) => bot.updateCard(cardId, card));
-  const activeRun: ActiveRun = {
+  let activeRun!: ActiveRun;
+  const cardUpdater = new ThrottledCardUpdater(async (card, options) => {
+    // 进度 patch：终态后丢弃，避免盖掉取消/成功卡。
+    // finish({ final: true })：必须放行，否则成功/失败卡永远写不上去。
+    if (activeRun.terminalStatus && !options?.final) return;
+    await bot.updateCard(cardId, card);
+  });
+  activeRun = {
     controller,
+    ownerOpenId: msg.senderOpenId,
     bot,
     cardId,
     cardTitle,
     cardUpdater,
-    progress: 5,
-    detail: `${adapter.displayName} 已启动`,
-    activities: [],
+    tracker,
     lastEventAt: Date.now(),
     done,
     resolveDone,
@@ -460,54 +477,64 @@ async function startCliTask(options: {
 
   const pushLiveCard = () => {
     if (activeRun.terminalStatus) return;
+    const snapshot = activeRun.tracker.snapshot();
     cardUpdater.push(buildTaskCard({
       title: cardTitle,
       status: 'running',
-      progress: activeRun.progress,
-      detail: activeRun.detail,
-      activities: activeRun.activities,
+      detail: snapshot.current,
+      progress: snapshot,
+      abortSessionId: session.id,
     }));
     schedulePersistActiveRuns();
   };
 
   activeRun.heartbeat = setInterval(() => {
     if (activeRun.terminalStatus || shuttingDown) return;
-    if (Date.now() - activeRun.lastEventAt < THINKING_HEARTBEAT_MS) return;
-    activeRun.detail = '模型处理中，请稍候…';
-    activeRun.progress = Math.min(90, Math.max(activeRun.progress, activeRun.progress + 1));
-    if (!activeRun.activities.includes('模型处理中…')) {
-      activeRun.activities.push('模型处理中…');
-      while (activeRun.activities.length > MAX_ACTIVITIES) activeRun.activities.shift();
-    }
     pushLiveCard();
-  }, THINKING_HEARTBEAT_MS);
+  }, PROGRESS_HEARTBEAT_MS);
   activeRun.heartbeat.unref?.();
 
   const onCliEvent = (event: CliEvent) => {
     activeRun.lastEventAt = Date.now();
     switch (event.type) {
       case 'session':
-        activeRun.detail = '会话已建立，开始执行';
-        activeRun.progress = Math.max(activeRun.progress, 10);
-        activeRun.activities.push(`会话 ${event.sessionId.slice(0, 8)}…`);
         console.log(`[CLI:${bot.id}/${adapter.id}] session=${event.sessionId}`);
         break;
-      case 'assistant': {
-        const text = truncate(event.text);
-        activeRun.detail = text;
-        activeRun.progress = bumpProgress(activeRun.progress, 6);
-        activeRun.activities.push(`模型：${text}`);
-        console.log(`[CLI:${bot.id}/${adapter.id}] assistant: ${text}`);
+      case 'assistant':
+        console.log(`[CLI:${bot.id}/${adapter.id}] assistant: ${truncate(event.text)}`);
         break;
-      }
+      case 'tool_start':
+        console.log(`[CLI:${bot.id}/${adapter.id}] tool_start: ${event.label}`);
+        activeRun.tracker.accept(event);
+        pushLiveCard();
+        break;
+      case 'tool_end':
+        activeRun.tracker.accept(event);
+        pushLiveCard();
+        break;
+      case 'context':
+        activeRun.tracker.accept(event);
+        pushLiveCard();
+        break;
       case 'tool': {
-        const summary = event.inputSummary
-          ? `${event.name} ${truncate(event.inputSummary, 60)}`
-          : event.name;
-        activeRun.detail = `调用工具：${summary}`;
-        activeRun.progress = bumpProgress(activeRun.progress, 10);
-        activeRun.activities.push(`工具：${summary}`);
-        console.log(`[CLI:${bot.id}/${adapter.id}] tool: ${summary}`);
+        // 兼容旧适配器：合成 start/end 对，避免进度空白
+        const toolUseId = `legacy-${event.name}-${Date.now()}`;
+        activeRun.tracker.accept({
+          type: 'tool_start',
+          toolUseId,
+          toolName: event.name,
+          label: event.name,
+          ...(event.inputSummary ? { detail: truncate(event.inputSummary, 60) } : {}),
+          sessionId: event.sessionId,
+        });
+        activeRun.tracker.accept({
+          type: 'tool_end',
+          toolUseId,
+          failed: false,
+          sessionId: event.sessionId,
+        });
+        console.log(`[CLI:${bot.id}/${adapter.id}] tool: ${event.name}`);
+        pushLiveCard();
         break;
       }
       case 'error':
@@ -516,10 +543,6 @@ async function startCliTask(options: {
       case 'result':
         console.log(`[CLI:${bot.id}/${adapter.id}] result event received`);
         break;
-    }
-    while (activeRun.activities.length > MAX_ACTIVITIES) activeRun.activities.shift();
-    if (event.type === 'session' || event.type === 'assistant' || event.type === 'tool') {
-      pushLiveCard();
     }
   };
 
@@ -535,17 +558,26 @@ async function startCliTask(options: {
       if (result.sessionId && result.sessionId !== session.cliSessionId) {
         await sessions.setCliSessionId(session.id, result.sessionId);
       }
+      if (result.stats?.contextWindowTokens) {
+        contextWindows.set(session.id, result.stats.contextWindowTokens);
+      }
       // 先标记成功，防止停机逻辑把绿卡盖成红卡。
       activeRun.terminalStatus = 'success';
       if (activeRun.heartbeat) clearInterval(activeRun.heartbeat);
       await cardUpdater.finish(buildTaskCard({
         title: cardTitle,
         status: 'success',
-        progress: 100,
         detail: '执行完成',
-        activities: activeRun.activities,
+        progress: activeRun.tracker.snapshot(),
+        answer: result.answer,
+        stats: result.stats,
+        recipientOpenId: msg.senderOpenId,
       }));
-      await bot.reply(msg.messageId, result.answer, hasThread);
+      if (answerNeedsContinuation(result.answer)) {
+        for (const chunk of splitLongText(answerContinuation(result.answer))) {
+          await bot.reply(msg.messageId, chunk, hasThread);
+        }
+      }
       console.log(`[CLI:${bot.id}/${adapter.id}] 完成 session_id=${result.sessionId ?? '(无)'}`);
       if (activeRuns.get(session.id) === activeRun) activeRuns.delete(session.id);
       await flushPersistActiveRuns();
@@ -556,9 +588,12 @@ async function startCliTask(options: {
     .catch(async (error) => {
       if (activeRun.heartbeat) clearInterval(activeRun.heartbeat);
       if (controller.signal.aborted) {
-        const detail = activeRun.interruptReason ?? '任务已取消';
+        const detail = activeRun.interruptReason
+          ?? (activeRun.cancelMode === 'close'
+            ? '本次任务已停止，当前会话已经关闭。'
+            : '本次任务已停止。你可以继续在当前话题里提问。');
         console.log(`[CLI:${bot.id}/${adapter.id}] ${detail}`);
-        if (!shuttingDown) {
+        if (!shuttingDown && !activeRun.cardSettledByCallback) {
           await finishInterruptedRun(activeRun, detail);
         }
         return;
@@ -569,11 +604,10 @@ async function startCliTask(options: {
       await cardUpdater.finish(buildTaskCard({
         title: cardTitle,
         status: 'failed',
-        progress: 0,
-        detail: message,
-        activities: activeRun.activities,
+        detail: '执行没有完成。你可以调整指令后，在当前话题里重试。',
+        technicalDetail: message,
+        progress: activeRun.tracker.snapshot(),
       }));
-      await bot.reply(msg.messageId, `${bot.name} / ${adapter.displayName} 执行失败：${message}`, hasThread);
     })
     .finally(async () => {
       if (activeRun.heartbeat) clearInterval(activeRun.heartbeat);
@@ -847,6 +881,7 @@ async function handleMessage(msg: IncomingMessage, bot: Bot): Promise<void> {
       '/reopen 重新打开已关闭会话',
       '/close 关闭当前会话',
       '/clean 清理所有已关闭会话记录',
+      '执行中可点任务卡片「停止任务」（仅发起人）',
       '/help 查看命令',
     );
     await bot.reply(msg.messageId, lines.join('\n'), hasThread);
@@ -1110,7 +1145,8 @@ async function handleMessage(msg: IncomingMessage, bot: Bot): Promise<void> {
   if (command?.name === 'close') {
     const running = activeRuns.get(session.id);
     if (running) {
-      running.interruptReason = '任务已取消';
+      running.cancelMode = 'close';
+      running.interruptReason = '本次任务已停止，当前会话已经关闭。';
       running.controller.abort();
     }
     if (session.status !== 'closed') await sessions.transition(session.id, 'closed');
@@ -1156,11 +1192,64 @@ async function handleMessage(msg: IncomingMessage, bot: Bot): Promise<void> {
   });
 }
 
+/** 立刻停掉进度刷新，避免与卡片回调响应抢 patch。 */
+function freezeRunCard(run: ActiveRun): void {
+  if (run.heartbeat) {
+    clearInterval(run.heartbeat);
+    run.heartbeat = undefined;
+  }
+  void run.cardUpdater.cancel();
+}
+
+/** 卡片「停止任务」按钮：仅发起人可停。 */
+async function handleCardAction(action: {
+  operatorOpenId: string;
+  messageId: string;
+  value: Record<string, unknown>;
+}) {
+  if (action.value.action !== 'abort_task') return {};
+
+  const sessionId =
+    typeof action.value.sessionId === 'string' ? action.value.sessionId : '';
+  const run = activeRuns.get(sessionId);
+  console.log(
+    `[卡片] 停止回调 session=${sessionId || '(空)'} operator=${action.operatorOpenId} found=${!!run}`,
+  );
+
+  if (!run) {
+    return { toast: { type: 'info' as const, content: '任务已经结束，无需再次停止。' } };
+  }
+  if (action.operatorOpenId !== run.ownerOpenId) {
+    return { toast: { type: 'warning' as const, content: '只有任务发起人可以停止它。' } };
+  }
+  if (run.controller.signal.aborted) {
+    freezeRunCard(run);
+    return { toast: { type: 'info' as const, content: '正在停止任务，请稍候。' } };
+  }
+
+  // 先冻结进度 patch，再 abort，并在回调响应里直接回取消卡（须 3 秒内完成）。
+  freezeRunCard(run);
+  run.terminalStatus = 'interrupted';
+  run.cardSettledByCallback = true;
+  const detail = '本次任务已停止。你可以继续在当前话题里提问。';
+  run.interruptReason = detail;
+  const outcome = requestTaskAbort(activeRuns, sessionId, action.operatorOpenId);
+  if (outcome !== 'stopped' && outcome !== 'already_stopping') {
+    return { toast: { type: 'info' as const, content: '任务已经结束，无需再次停止。' } };
+  }
+
+  return {
+    toast: { type: 'success' as const, content: '已发送停止指令。' },
+    card: { type: 'raw' as const, data: interruptedCard(run, detail) },
+  };
+}
+
 for (const config of botConfigs) {
   try {
     const bot = await startBot({
       config,
       onMessage: handleMessage,
+      onCardAction: handleCardAction,
     });
     botsById.set(bot.id, bot);
     console.log(

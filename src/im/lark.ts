@@ -25,6 +25,29 @@ export interface IncomingMessage {
 export interface BotOptions {
   config: BotConfig;
   onMessage: (msg: IncomingMessage, bot: Bot) => Promise<void>;
+  /** 卡片按钮回调（如停止任务）。 */
+  onCardAction?: (action: CardAction) => Promise<CardActionResponse | undefined>;
+}
+
+export interface CardAction {
+  operatorOpenId: string;
+  messageId: string;
+  value: Record<string, unknown>;
+}
+
+export interface CardActionResponse {
+  toast?: { type: 'success' | 'info' | 'warning' | 'error'; content: string };
+  card?: { type: 'raw'; data: CardJson };
+}
+
+/** 解析飞书 card.action.trigger 事件。 */
+export function parseCardAction(data: any): CardAction {
+  const value = data?.action?.value;
+  return {
+    operatorOpenId: data?.operator?.open_id ?? data?.operator_id?.open_id ?? '',
+    messageId: data?.context?.open_message_id ?? data?.open_message_id ?? '',
+    value: value && typeof value === 'object' ? value as Record<string, unknown> : {},
+  };
 }
 
 export interface Bot {
@@ -135,7 +158,7 @@ async function fetchBotOpenId(client: Lark.Client): Promise<string> {
 
 /** 启动单个飞书 Bot（WS 收消息 + REST 回复）。 */
 export async function startBot(opts: BotOptions): Promise<Bot> {
-  const { config, onMessage } = opts;
+  const { config, onMessage, onCardAction } = opts;
   const { appId, appSecret } = config;
 
   const client = new Lark.Client({ appId, appSecret });
@@ -200,6 +223,28 @@ export async function startBot(opts: BotOptions): Promise<Bot> {
   };
 
   const dispatcher = new Lark.EventDispatcher({}).register({
+    'card.action.trigger': async (data: any) => {
+      const value = data?.action?.value;
+      console.log(
+        `[卡片] bot=${bot.id} 收到 card.action.trigger`,
+        `operator=${data?.operator?.open_id ?? '(无)'}`,
+        `value=${JSON.stringify(value ?? null)}`,
+      );
+      if (!onCardAction) {
+        console.warn(`[卡片] bot=${bot.id} 未注册 onCardAction，忽略按钮回调`);
+        return {};
+      }
+      try {
+        const response = await onCardAction(parseCardAction(data));
+        // 必须返回对象；undefined 时飞书客户端可能当成交互失败。
+        return response ?? {};
+      } catch (error) {
+        console.error(`[卡片] bot=${bot.id} 处理按钮回调失败:`, (error as Error).message);
+        return {
+          toast: { type: 'error', content: '停止失败，请稍后重试。' },
+        };
+      }
+    },
     'im.message.receive_v1': async (data) => {
       const m = data.message;
       const msg: IncomingMessage = {

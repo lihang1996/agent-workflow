@@ -100,7 +100,9 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
     lines.on('line', (line) => {
       const events = adapter.parseEvents(line);
       for (const event of events) {
-        if (event.sessionId) observedSessionId = event.sessionId;
+        if ('sessionId' in event && event.sessionId) {
+          observedSessionId = event.sessionId;
+        }
         onEvent?.(event);
         if (event.type === 'error') {
           resultError = new Error(event.message);
@@ -110,6 +112,7 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
           finalResult = {
             answer: event.answer,
             sessionId: event.sessionId ?? observedSessionId,
+            ...(event.stats ? { stats: event.stats } : {}),
           };
         }
       }
