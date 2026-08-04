@@ -36,6 +36,8 @@ export async function runTeamPipeline(
     executionPolicy: options.executionPolicy,
     approvalId: options.approvalId,
     approvalAttempt: options.approvalAttempt,
+    scheduleJobId: options.scheduleJobId,
+    scheduleRunCount: options.scheduleRunCount,
   });
 }
 

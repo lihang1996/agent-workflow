@@ -17,7 +17,10 @@ import {
   settleApprovalSchedule,
 } from '../src/runtime/approval-status.js';
 import { runDueSchedules } from '../src/runtime/scheduler.js';
-import { resumeRecoverableWorkflows } from '../src/runtime/pipeline-runner.js';
+import {
+  resumeRecoverableWorkflows,
+  runTeamPipeline,
+} from '../src/runtime/pipeline-runner.js';
 
 function message() {
   return {
@@ -226,4 +229,62 @@ test('定时流水线按工作流真实终态结算并可跨重启修复', async
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('定时团队流水线把运行轮次写入持久化工作流', async () => {
+  let createdInput: Record<string, unknown> | undefined;
+  const workflow = {
+    id: '6b4ca8b5-b1f3-48e4-839f-9007ce250aa1',
+    kind: 'team' as const,
+    name: '团队交付流水线',
+    initiatorBotId: 'ceo',
+    goal: '整理文档',
+    stepIds: ['summary'] as const,
+    nextStepIndex: 0,
+    priorOutputs: {},
+    status: 'ready' as const,
+    executionPolicy: 'standard' as const,
+    scheduleJobId: 'job-pipeline',
+    scheduleRunCount: 3,
+    message: message(),
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  const workflows = {
+    create: async (input: Record<string, unknown>) => {
+      createdInput = input;
+      return workflow;
+    },
+    get: () => workflow,
+    update: async () => ({ ...workflow, status: 'failed' as const }),
+  };
+  const ceo = {
+    id: 'ceo',
+    name: 'CEO助手',
+    reply: async () => { throw new Error('停止在工作流创建之后'); },
+  };
+  const ctx = {
+    shuttingDown: false,
+    pipelineSteps: [{ id: 'summary', botId: 'ceo', title: '交付汇总' }],
+    botsById: new Map([['ceo', ceo]]),
+    workflows,
+    schedules: { get: () => undefined },
+  } as unknown as AppContext;
+  const msg = {
+    ...message(),
+    messageType: 'text', text: '', senderType: 'user', mentions: [], rawContent: '{"text":""}',
+  };
+
+  await assert.rejects(
+    () => runTeamPipeline(ctx, {
+      ceo: ceo as never,
+      msg,
+      goal: '整理文档',
+      scheduleJobId: 'job-pipeline',
+      scheduleRunCount: 3,
+    }),
+    /停止在工作流创建之后/,
+  );
+  assert.equal(createdInput?.scheduleJobId, 'job-pipeline');
+  assert.equal(createdInput?.scheduleRunCount, 3);
 });
