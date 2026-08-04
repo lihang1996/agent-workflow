@@ -3,7 +3,8 @@ import type { Bot, IncomingMessage } from '../im/lark.js';
 import type { AppContext } from './app-context.js';
 import { runCollabReview } from './collab-runner.js';
 import { startCliTask } from './cli-task.js';
-import { ensureRunnableSession, truncate } from './sessions.js';
+import { ensureRunnableSession, topicIdOf, truncate } from './sessions.js';
+import { buildSpecConfirmationCard } from '../im/workflow-card.js';
 
 /** CEO 团队交付流水线：按步骤串联各角色，最后由 CEO 汇总。 */
 export async function runTeamPipeline(
@@ -95,6 +96,19 @@ export async function runTeamPipeline(
       onSuccess: async (answer) => {
         if (ctx.shuttingDown) return;
         priorOutputs[step.id] = answer;
+        if (step.id === 'pm') {
+          const spec = await ctx.specs.create({
+            title: goal.slice(0, 80),
+            content: answer,
+            chatId: msg.chatId,
+            topicId: topicIdOf(msg),
+            messageId: msg.messageId,
+            ownerOpenId: msg.senderOpenId,
+            botId: actor.id,
+          });
+          await actor.replyCard(msg.messageId, buildSpecConfirmationCard(spec), hasThread);
+          await ceo.reply(msg.messageId, `产品 Spec 已生成（${spec.id}），等待确认卡片操作。`, hasThread);
+        }
         await runStep(stepIndex + 1);
       },
     });

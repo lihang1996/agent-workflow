@@ -14,6 +14,7 @@ import { SessionManager } from './core/session-manager.js';
 import { JsonSessionStore } from './core/session-store.js';
 import { JsonTopicStore } from './core/topic-store.js';
 import { JsonQuestionnaireStore } from './core/questionnaire-store.js';
+import { JsonSpecStore } from './core/spec-store.js';
 import { resolveWorkdir } from './core/workdir.js';
 import { listEngines } from './cli/registry.js';
 import { isCliId, type CliId } from './cli/types.js';
@@ -64,6 +65,7 @@ const topics = await JsonTopicStore.open(join('data', 'topics.json'));
 const collabStore = await JsonCollabStore.open(join('data', 'collab-rounds.json'));
 const activeRunStore = new JsonActiveRunStore(join('data', 'active-runs.json'));
 const questionnaires = new JsonQuestionnaireStore();
+const specs = await JsonSpecStore.open(join('data', 'specs.json'));
 console.log(
   `[会话] 已恢复 ${sessions.size} 个会话，${topics.size} 个话题项目目录，${collabStore.size} 个协作轮次`,
 );
@@ -74,6 +76,7 @@ const app = createApp({
   collabStore,
   activeRunStore,
   questionnaires,
+  specs,
   config: {
     defaultCliId,
     collabMaxRounds,

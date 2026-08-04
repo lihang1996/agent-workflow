@@ -2,6 +2,7 @@ import type { CliId } from '../cli/types.js';
 import type { JsonActiveRunStore } from '../core/active-run-store.js';
 import type { JsonCollabStore } from '../core/collab-store.js';
 import type { JsonQuestionnaireStore } from '../core/questionnaire-store.js';
+import type { JsonSpecStore } from '../core/spec-store.js';
 import type { PipelineStep } from '../core/pipeline.js';
 import type { SessionManager } from '../core/session-manager.js';
 import type { JsonTopicStore } from '../core/topic-store.js';
@@ -26,6 +27,7 @@ export interface AppContext extends AppConfig {
   collabStore: JsonCollabStore;
   activeRunStore: JsonActiveRunStore;
   questionnaires: JsonQuestionnaireStore;
+  specs: JsonSpecStore;
   botsById: Map<string, Bot>;
   persistTimer?: ReturnType<typeof setTimeout>;
 }
@@ -36,6 +38,7 @@ export interface CreateAppDeps {
   collabStore: JsonCollabStore;
   activeRunStore: JsonActiveRunStore;
   questionnaires: JsonQuestionnaireStore;
+  specs: JsonSpecStore;
   config: AppConfig;
 }
 
@@ -51,6 +54,7 @@ export function createAppContext(deps: CreateAppDeps): AppContext {
     collabStore: deps.collabStore,
     activeRunStore: deps.activeRunStore,
     questionnaires: deps.questionnaires,
+    specs: deps.specs,
     botsById: new Map(),
   };
 }
