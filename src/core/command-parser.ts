@@ -8,16 +8,17 @@ export type CommandName =
   | "reopen"
   | "clean"
   | "handoff"
-  | "review";
+  | "review"
+  | "pipeline";
 
 export interface SlashCommand {
   name: CommandName;
   arg?: string;
 }
 
-// workdir / handoff / review 参数可能含空格，因此吃到行尾。
+// workdir / handoff / review / pipeline 参数可能含空格，因此吃到行尾。
 const COMMAND_RE =
-  /^(?:@.+\s+)?\/(close|status|help|engine|workdir|reset|reopen|clean|handoff|review)(?:\s+(.+))?$/;
+  /^(?:@.+\s+)?\/(close|status|help|engine|workdir|reset|reopen|clean|handoff|review|pipeline)(?:\s+(.+))?$/;
 
 /** 从消息文本解析斜杠命令。 */
 export function parseCommand(text: string): SlashCommand | undefined {

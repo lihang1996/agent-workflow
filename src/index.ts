@@ -1,6 +1,6 @@
 /**
  * Agent OS 入口。
- * 多 Bot 入群 + 话题项目目录 + 任务交接 + Claude/Codex 双引擎。
+ * 多 Bot 入群 + 话题项目目录 + 任务交接 + CEO 团队流水线 + Claude/Codex 双引擎。
  */
 import 'dotenv/config';
 import { join, resolve } from 'node:path';
@@ -28,6 +28,11 @@ import {
   type PersistedActiveRun,
 } from './core/active-run-store.js';
 import { JsonCollabStore } from './core/collab-store.js';
+import {
+  buildPipelineStepPrompt,
+  filterRunnableSteps,
+  parsePipelineSteps,
+} from './core/pipeline.js';
 import { SessionManager, type Session } from './core/session-manager.js';
 import { JsonSessionStore } from './core/session-store.js';
 import { JsonTopicStore } from './core/topic-store.js';
@@ -39,6 +44,7 @@ import { isCliId, type CliEvent, type CliId } from './cli/types.js';
 const defaultCliId = parseDefaultCliId(process.env.DEFAULT_CLI);
 const MAX_ACTIVITIES = 5;
 const COLLAB_MAX_ROUNDS = parseMaxRounds(process.env.COLLAB_MAX_ROUNDS);
+const PIPELINE_STEPS = parsePipelineSteps(process.env.PIPELINE_STEPS);
 const SHUTDOWN_GRACE_MS = 15_000;
 const ACTIVE_RUN_PERSIST_DEBOUNCE_MS = 800;
 const THINKING_HEARTBEAT_MS = 15_000;
@@ -79,6 +85,7 @@ for (const engine of listEngines()) {
 }
 console.log(`[CLI] 默认引擎=${defaultCliId}`);
 console.log(`[协作] 最大轮次=${COLLAB_MAX_ROUNDS}`);
+console.log(`[流水线] 步骤=${PIPELINE_STEPS.map((s) => s.id).join(' → ')}`);
 console.log(`[Bot] 将启动 ${botConfigs.length} 个角色: ${botConfigs.map((b) => b.id).join(', ')}`);
 for (const config of botConfigs) {
   if (config.workdir) console.log(`[Bot] ${config.id} 默认工作目录=${config.workdir}`);
@@ -591,8 +598,10 @@ async function runCollabReview(options: {
   task: string;
   round: number;
   priorDevResult?: string;
+  /** 协作自然结束时回调（通过 / 触顶）；供流水线续跑。 */
+  onComplete?: (result: { approved: boolean; answer: string }) => Promise<void>;
 }): Promise<void> {
-  const { initiator, msg, task, round, priorDevResult } = options;
+  const { initiator, msg, task, round, priorDevResult, onComplete } = options;
   const hasThread = !!msg.threadId || !!msg.rootId;
   const reviewer = botsById.get('reviewer');
   const dev = botsById.get('dev');
@@ -638,6 +647,7 @@ async function runCollabReview(options: {
           `第 ${round} 轮评审通过（[APPROVED]）。协作结束。`,
           hasThread,
         );
+        if (onComplete) await onComplete({ approved: true, answer: reviewAnswer });
         return;
       }
 
@@ -676,6 +686,7 @@ async function runCollabReview(options: {
               ].join('\n'),
               hasThread,
             );
+            if (onComplete) await onComplete({ approved: false, answer: devAnswer });
             return;
           }
 
@@ -687,11 +698,107 @@ async function runCollabReview(options: {
             task,
             round: nextRound,
             priorDevResult: devAnswer,
+            onComplete,
           });
         },
       });
     },
   });
+}
+
+/** CEO 团队交付流水线：按步骤串联各角色，最后由 CEO 汇总。 */
+async function runTeamPipeline(options: {
+  ceo: Bot;
+  msg: IncomingMessage;
+  goal: string;
+}): Promise<void> {
+  const { ceo, msg, goal } = options;
+  const hasThread = !!msg.threadId || !!msg.rootId;
+  if (shuttingDown) throw new Error('服务正在停止，无法启动流水线');
+
+  const available = new Set(botsById.keys());
+  const steps = filterRunnableSteps(PIPELINE_STEPS, available);
+  if (steps.length === 0) {
+    throw new Error('没有可执行的流水线步骤，请检查 Bot 配置');
+  }
+
+  console.log(`[流水线] 目标=${truncate(goal, 60)} 步骤=${steps.map((s) => s.id).join(' → ')}`);
+  await ceo.reply(
+    msg.messageId,
+    [
+      '已启动团队交付流水线。',
+      `目标：${goal}`,
+      `步骤：${steps.map((s, i) => `${i + 1}.${s.title}`).join(' → ')}`,
+    ].join('\n'),
+    hasThread,
+  );
+
+  const priorOutputs: Record<string, string> = {};
+
+  const runStep = async (stepIndex: number): Promise<void> => {
+    if (shuttingDown) return;
+    if (stepIndex >= steps.length) {
+      await ceo.reply(msg.messageId, '团队交付流水线已全部完成。', hasThread);
+      return;
+    }
+
+    const step = steps[stepIndex];
+    const stepLabel = `步骤 ${stepIndex + 1}/${steps.length} · ${step.title}`;
+
+    if (step.id === 'review') {
+      await ceo.reply(msg.messageId, `${stepLabel}：启动评审协作。`, hasThread);
+      await runCollabReview({
+        initiator: ceo,
+        msg,
+        task: buildPipelineStepPrompt(step, goal, priorOutputs),
+        round: 1,
+        onComplete: async ({ approved, answer }) => {
+          priorOutputs.review = answer;
+          await ceo.reply(
+            msg.messageId,
+            approved
+              ? `${stepLabel} 已通过，继续下一步。`
+              : `${stepLabel} 已结束（未完全通过或达轮次上限），继续下一步。`,
+            hasThread,
+          );
+          await runStep(stepIndex + 1);
+        },
+      });
+      return;
+    }
+
+    const actor = botsById.get(step.botId);
+    if (!actor) {
+      await ceo.reply(msg.messageId, `${stepLabel}：角色 ${step.botId} 未连接，跳过。`, hasThread);
+      await runStep(stepIndex + 1);
+      return;
+    }
+
+    const actorSession = await ensureRunnableSession(actor, msg);
+    if (!actorSession) {
+      await ceo.reply(
+        msg.messageId,
+        `${stepLabel}：${actor.name} 正忙，流水线中止。请稍后重试 /pipeline。`,
+        hasThread,
+      );
+      return;
+    }
+
+    await ceo.reply(msg.messageId, `${stepLabel}：交给 ${actor.name}。`, hasThread);
+    await startCliTask({
+      bot: actor,
+      msg,
+      session: actorSession,
+      prompt: buildPipelineStepPrompt(step, goal, priorOutputs),
+      onSuccess: async (answer) => {
+        if (shuttingDown) return;
+        priorOutputs[step.id] = answer;
+        await runStep(stepIndex + 1);
+      },
+    });
+  };
+
+  await runStep(0);
 }
 
 /** 处理单条入站消息：命令或交给 CLI。 */
@@ -724,23 +831,25 @@ async function handleMessage(msg: IncomingMessage, bot: Bot): Promise<void> {
 
   const command = parseCommand(resolved);
   if (command?.name === 'help') {
-    await bot.reply(
-      msg.messageId,
-      [
-        `我是 ${bot.name}（${bot.id}）`,
-        '/status 查看当前会话',
-        '/workdir [路径] 查看/设置本话题项目目录（clear 清除）',
-        '/engine claude|codex 切换执行引擎',
-        '/handoff <角色> <任务> 交接给同话题其他角色',
-        '/review <任务> 评审→开发协作（意见自动回传，可多轮）',
-        '/reset 清理 CLI 上下文（保留会话）',
-        '/reopen 重新打开已关闭会话',
-        '/close 关闭当前会话',
-        '/clean 清理所有已关闭会话记录',
-        '/help 查看命令',
-      ].join('\n'),
-      hasThread,
+    const lines = [
+      `我是 ${bot.name}（${bot.id}）`,
+      '/status 查看当前会话',
+      '/workdir [路径] 查看/设置本话题项目目录（clear 清除）',
+      '/engine claude|codex 切换执行引擎',
+      '/handoff <角色> <任务> 交接给同话题其他角色',
+      '/review <任务> 评审→开发协作（意见自动回传，可多轮）',
+    ];
+    if (bot.id === 'ceo') {
+      lines.push('/pipeline <目标> 启动团队交付流水线（PM→架构→开发→评审→测试→汇总）');
+    }
+    lines.push(
+      '/reset 清理 CLI 上下文（保留会话）',
+      '/reopen 重新打开已关闭会话',
+      '/close 关闭当前会话',
+      '/clean 清理所有已关闭会话记录',
+      '/help 查看命令',
     );
+    await bot.reply(msg.messageId, lines.join('\n'), hasThread);
     return;
   }
   if (command?.name === 'status') {
@@ -921,6 +1030,38 @@ async function handleMessage(msg: IncomingMessage, bot: Bot): Promise<void> {
         task: command.arg,
         round: 1,
       });
+    } catch (error) {
+      await bot.reply(msg.messageId, (error as Error).message, hasThread);
+    }
+    return;
+  }
+  if (command?.name === 'pipeline') {
+    if (bot.id !== 'ceo') {
+      await bot.reply(
+        msg.messageId,
+        '团队流水线请 @CEO助手 使用：/pipeline <目标>',
+        hasThread,
+      );
+      return;
+    }
+    if (!command.arg) {
+      const preview = filterRunnableSteps(PIPELINE_STEPS, new Set(botsById.keys()))
+        .map((s) => s.title)
+        .join(' → ');
+      await bot.reply(
+        msg.messageId,
+        [
+          '用法：/pipeline <目标>',
+          `当前步骤：${preview || '(无可用步骤)'}`,
+          '可用 PIPELINE_STEPS 定制，例如：pm,architect,dev,review,qa,summary',
+          '示例：/pipeline 给 README 补一节快速开始说明',
+        ].join('\n'),
+        hasThread,
+      );
+      return;
+    }
+    try {
+      await runTeamPipeline({ ceo: bot, msg, goal: command.arg });
     } catch (error) {
       await bot.reply(msg.messageId, (error as Error).message, hasThread);
     }

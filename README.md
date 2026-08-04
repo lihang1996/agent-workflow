@@ -59,19 +59,57 @@ src/index.ts（路由、命令、任务编排）
 
 ## 快速开始
 
+### 1. 准备环境
+
+- Node.js `>= 22`
+- pnpm
+- 至少一个飞书 Bot 的 App ID 和 App Secret，并为应用开启事件长连接
+- 默认使用 Claude 时，确保 `claude` CLI 已在 PATH 中；使用 Codex 时额外确保 `codex` CLI 可用
+
+### 2. 安装依赖
+
 ```bash
 pnpm install
+```
+
+### 3. 配置环境变量
+
+复制示例配置并填入至少一个角色的真实飞书凭证：
+
+```bash
 cp .env.example .env
-# 编辑 .env，至少配置一个 BOT_*_APP_ID / BOT_*_APP_SECRET
+```
+
+编辑 `.env`，至少配置一个 `BOT_*_APP_ID` 和对应的 `BOT_*_APP_SECRET`。角色前缀、引擎和工作目录等配置详见[配置说明](#配置说明)，完整示例见[.env.example](./.env.example)。
+
+### 4. 检查并启动
+
+先执行 TypeScript 构建检查，再启动本地服务：
+
+```bash
 pnpm build
 pnpm start
 ```
 
-开发时可使用：
+`pnpm start` 使用 `tsx watch` 监听源码和 `.env`，适合本地开发热重载；如需不带 watch 的前台启动，可使用：
 
 ```bash
-pnpm dev        # tsx watch
-pnpm start:once # 单次启动
+pnpm start:once
+```
+
+### 5. 验证启动
+
+- `pnpm build` 无报错。
+- 终端出现 `Agent OS 启动` 和至少一个 `[Bot] 已连接` 日志。
+- 在飞书私聊已连接的 Bot 发送 `/help` 或 `/status`，确认收到回复。
+- 群聊中需要先 @ 对应 Bot；项目没有 HTTP 服务或固定端口，验证方式以启动日志和飞书消息回复为准。
+
+更多命令参见[飞书内置命令](#飞书内置命令)，遇到问题可查看[故障排查](#故障排查)。
+
+开发时还可使用：
+
+```bash
+pnpm dev        # pnpm start 的别名
 pnpm probe:cli  # 手工查看 CLI 的 JSON 流事件
 ```
 
@@ -92,14 +130,16 @@ pnpm probe:cli  # 手工查看 CLI 的 JSON 流事件
 
 每个前缀至少需要 `<PREFIX>_APP_ID` 和 `<PREFIX>_APP_SECRET`，还可设置 `<PREFIX>_NAME`、`<PREFIX>_WORKDIR`。开发 Bot 兼容旧变量 `BOT_A_APP_ID` / `BOT_A_APP_SECRET`。
 
-### 引擎和工作目录
+### 引擎、流水线和工作目录
 
-| 变量 | 说明 | 默认值 |
+| 变量 | 说明 | 默认/回退 |
 | --- | --- | --- |
 | `DEFAULT_CLI` | 新会话默认引擎：`claude` 或 `codex` | `claude` |
+| `COLLAB_MAX_ROUNDS` | `/review` 评审↔开发的最大协作轮次（1–10；非法值回退为 2） | `2` |
+| `PIPELINE_STEPS` | CEO `/pipeline` 的步骤，逗号分隔：`pm`、`architect`、`dev`、`review`、`qa`、`summary` | `pm,architect,dev,review,qa,summary` |
 | `CLAUDE_WORKDIR` | Claude 全局回退目录 | 当前工作目录 |
-| `CODEX_WORKDIR` | Codex 全局回退目录 | `CODEX_WORKDIR`、`CLAUDE_WORKDIR` 或当前目录 |
-| `CODEX_SANDBOX` | Codex 沙箱模式 | `workspace-write` |
+| `CODEX_WORKDIR` | Codex 全局回退目录；未设置时继续回退到 `CLAUDE_WORKDIR`、当前工作目录 | 未设置时按上述顺序回退 |
+| `CODEX_SANDBOX` | Codex 沙箱模式：`read-only`、`workspace-write` 或 `danger-full-access` | `workspace-write` |
 
 不要把真实 Secret 提交到 git；`.env` 和 `data/` 已被忽略。
 
@@ -114,6 +154,8 @@ pnpm probe:cli  # 手工查看 CLI 的 JSON 流事件
 | `/workdir [路径]` | 查看或设置本话题项目目录；`/workdir clear` 清除 |
 | `/engine claude\|codex` | 切换当前会话引擎并清理旧 CLI 上下文 |
 | `/handoff <角色> <任务>` | 将任务交给同话题的其他 Bot |
+| `/review <任务>` | 评审→开发协作（意见自动回传，可多轮；需同时配置 reviewer 和 dev Bot） |
+| `/pipeline <目标>` | **仅 CEO**：启动团队交付流水线；未配置的步骤会跳过 |
 | `/reset` | 清理 CLI 上下文，但保留 Agent OS 会话 |
 | `/close` | 关闭当前会话 |
 | `/reopen` | 重新打开已关闭会话 |
@@ -125,6 +167,7 @@ pnpm probe:cli  # 手工查看 CLI 的 JSON 流事件
 /workdir /path/to/project
 /engine codex
 /handoff dev 根据当前仓库写一段 README 大纲
+@CEO助手 /pipeline 给 README 补一节快速开始说明
 ```
 
 ## 会话与协作模型
@@ -134,6 +177,7 @@ pnpm probe:cli  # 手工查看 CLI 的 JSON 流事件
 - `/workdir` 绑定的是话题目录，同一话题下的 Bot 共享该目录。
 - 切换或清除话题目录、切换引擎、`/reset` 和 `/reopen` 都会清理对应 CLI 上下文，避免跨目录或跨引擎恢复错误会话。
 - 运行中任务不能重复执行、切换引擎或切换目录；可用 `/close` 取消任务。
+- `/pipeline` 默认步骤：PM → 架构 → 开发 → 评审协作 → 测试 → CEO 汇总；可用 `PIPELINE_STEPS` 裁剪；未连接的角色会跳过。
 
 ## 开发与扩展
 
