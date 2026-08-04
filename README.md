@@ -112,6 +112,7 @@ pnpm start:once
 
 ```bash
 pnpm dev        # pnpm start 的别名
+pnpm probe      # 只校验 Bot 凭证和机器人身份，不发送消息
 pnpm probe:cli  # 手工查看 CLI 的 JSON 流事件
 ```
 

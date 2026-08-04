@@ -113,6 +113,11 @@ for (const config of botConfigs) {
   }
 }
 
+if (app.botsById.size === 0) {
+  console.error('所有 Bot 均启动失败，Agent OS 无法接收飞书消息。请先运行 pnpm probe 检查凭证。');
+  process.exit(1);
+}
+
 await app.reconcileOrphanedCards();
 await app.reconcileApprovalExecutions();
 await app.resumeRecoverableWorkflows();

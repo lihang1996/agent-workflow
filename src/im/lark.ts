@@ -384,18 +384,13 @@ export function isAddressedToBot(msg: IncomingMessage, bot: Bot): boolean {
 
 /** 拉取本应用 open_id，用于群聊 @ 匹配。 */
 async function fetchBotOpenId(client: Lark.Client): Promise<string> {
-  try {
-    const res = await withFeishuRetry('获取 Bot 信息', () => client.request({
-      url: '/open-apis/bot/v3/info',
-      method: 'GET',
-    })) as { bot?: { open_id?: string }; data?: { bot?: { open_id?: string } } };
-    return res.bot?.open_id
-      ?? res.data?.bot?.open_id
-      ?? '';
-  } catch (error) {
-    console.warn('[飞书] 获取 bot open_id 失败:', (error as Error).message);
-    return '';
-  }
+  const res = await withFeishuRetry('获取 Bot 信息', () => client.request({
+    url: '/open-apis/bot/v3/info',
+    method: 'GET',
+  })) as { bot?: { open_id?: string }; data?: { bot?: { open_id?: string } } };
+  const openId = res.bot?.open_id ?? res.data?.bot?.open_id ?? '';
+  if (!openId) throw new Error('飞书 Bot 信息缺少 open_id，请检查应用是否已启用机器人能力。');
+  return openId;
 }
 
 /** 启动单个飞书 Bot（WS 收消息 + REST 回复）。 */
