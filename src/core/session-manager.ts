@@ -31,6 +31,7 @@ export interface SessionManagerOptions {
   now?: () => Date;
   createId?: () => string;
   store?: SessionStore;
+  defaultCliId?: CliId;
 }
 
 const ALLOWED_TRANSITIONS: Record<SessionStatus, SessionStatus[]> = {
@@ -53,11 +54,13 @@ export class SessionManager {
   private readonly now: () => Date;
   private readonly createId: () => string;
   private readonly store?: SessionStore;
+  private readonly defaultCliId: CliId;
 
   constructor(options: SessionManagerOptions = {}) {
     this.now = options.now ?? (() => new Date());
     this.createId = options.createId ?? randomUUID;
     this.store = options.store;
+    this.defaultCliId = options.defaultCliId ?? 'claude';
   }
 
   static async open(options: SessionManagerOptions = {}): Promise<SessionManager> {
@@ -88,7 +91,7 @@ export class SessionManager {
       id: this.createId(),
       threadId,
       chatId: message.chatId,
-      cliId: 'claude',
+      cliId: this.defaultCliId,
       status: 'creating',
       createdAt: now,
       updatedAt: now,
@@ -134,6 +137,35 @@ export class SessionManager {
     const updated: Session = {
       ...current,
       cliSessionId,
+      updatedAt: this.now().toISOString(),
+    };
+    const key = sessionKey(updated.chatId, updated.threadId);
+    this.sessions.set(key, updated);
+    try {
+      await this.persist();
+    } catch (error) {
+      if (this.sessions.get(key) === updated) this.sessions.set(key, current);
+      throw error;
+    }
+    return updated;
+  }
+
+  /** 切换执行引擎；会清空旧引擎的 CLI 会话，避免跨引擎 resume。 */
+  async setCliId(sessionId: string, cliId: CliId): Promise<Session> {
+    const current = this.get(sessionId);
+    if (!current) throw new Error(`会话不存在: ${sessionId}`);
+    if (current.status === 'active') {
+      throw new Error('任务执行中，无法切换引擎');
+    }
+    if (current.status === 'closed') {
+      throw new Error('会话已关闭，无法切换引擎');
+    }
+    if (current.cliId === cliId) return current;
+
+    const updated: Session = {
+      ...current,
+      cliId,
+      cliSessionId: undefined,
       updatedAt: this.now().toISOString(),
     };
     const key = sessionKey(updated.chatId, updated.threadId);

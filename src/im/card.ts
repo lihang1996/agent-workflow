@@ -86,7 +86,8 @@ export class ThrottledCardUpdater {
   ) {}
 
   push(card: CardJson): void {
-    if (this.closed) throw new Error("卡片更新器已经结束");
+    // finish/cancel 之后忽略迟到的进度推送，避免流式收尾竞态抛错。
+    if (this.closed) return;
     this.pendingCard = card;
     this.schedule();
   }

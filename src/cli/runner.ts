@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import type { CliAdapter, CliRunResult } from './types.js';
+import type { CliAdapter, CliEvent, CliRunResult } from './types.js';
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -11,6 +11,7 @@ export interface RunCliOptions {
   sessionId?: string;
   signal?: AbortSignal;
   timeoutMs?: number;
+  onEvent?: (event: CliEvent) => void;
 }
 
 export function runCli(options: RunCliOptions): Promise<CliRunResult> {
@@ -21,6 +22,7 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
     sessionId,
     signal,
     timeoutMs = DEFAULT_TIMEOUT_MS,
+    onEvent,
   } = options;
   const args = sessionId
     ? adapter.buildResumeArgs(prompt, sessionId)
@@ -54,18 +56,20 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
     };
 
     lines.on('line', (line) => {
-      const event = adapter.parseEvent(line);
-      if (!event) return;
-      if (event.sessionId) observedSessionId = event.sessionId;
-      if (event.type === 'error') {
-        resultError = new Error(event.message);
-        return;
-      }
-      if (event.type === 'result') {
-        finalResult = {
-          answer: event.answer,
-          sessionId: event.sessionId ?? observedSessionId,
-        };
+      const events = adapter.parseEvents(line);
+      for (const event of events) {
+        if (event.sessionId) observedSessionId = event.sessionId;
+        onEvent?.(event);
+        if (event.type === 'error') {
+          resultError = new Error(event.message);
+          continue;
+        }
+        if (event.type === 'result') {
+          finalResult = {
+            answer: event.answer,
+            sessionId: event.sessionId ?? observedSessionId,
+          };
+        }
       }
     });
 
@@ -91,18 +95,22 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
       if (signal?.aborted) {
         return fail(new Error(`${adapter.displayName} 执行已取消`));
       }
-      if (resultError) return fail(resultError);
       if (code !== 0) {
         return fail(new Error(
-          stderr.trim() || `${adapter.displayName} 退出，状态码 ${code}`,
+          resultError?.message
+          || stderr.trim()
+          || `${adapter.displayName} 退出，状态码 ${code}`,
         ));
       }
-      if (!finalResult) {
-        return fail(new Error(`${adapter.displayName} 没有返回最终结果`));
+      // 进程正常退出时：有最终结果则成功；仅有中间 error、没有结果才失败。
+      if (finalResult) {
+        settled = true;
+        finish();
+        resolve(finalResult);
+        return;
       }
-      settled = true;
-      finish();
-      resolve(finalResult);
+      if (resultError) return fail(resultError);
+      return fail(new Error(`${adapter.displayName} 没有返回最终结果`));
     });
   });
 }
