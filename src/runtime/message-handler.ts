@@ -11,7 +11,7 @@ import { collabTopicKey } from '../core/collab.js';
 import { filterRunnableSteps } from '../core/pipeline.js';
 import { requestTaskAbort } from '../core/task-abort.js';
 import { assertWorkdir } from '../core/workdir.js';
-import { formatScheduleInterval, parseScheduleInterval } from '../core/schedule-store.js';
+import { formatScheduleInterval, formatScheduleRunStatus, parseScheduleInterval } from '../core/schedule-store.js';
 import { assertLogFile } from '../core/log-inspection.js';
 import { highRiskReason, isHighRiskTask } from '../core/risk.js';
 import { assertOwnedBy, isAuthorizedOperator } from '../core/access.js';
@@ -465,7 +465,11 @@ export async function handleMessage(
       await bot.reply(
         msg.messageId,
         jobs.length
-          ? jobs.map((job) => `${job.id} · ${job.enabled ? '运行中' : '已暂停'} · ${job.kind} · 每 ${formatScheduleInterval(job.intervalMs)} · 下次 ${job.nextRunAt}`).join('\n')
+          ? jobs.map((job) => [
+            `${job.id} · ${job.enabled ? '已启用' : '已暂停'} · ${job.kind}`,
+            `每 ${formatScheduleInterval(job.intervalMs)} · 下次 ${job.nextRunAt}`,
+            `上次 ${formatScheduleRunStatus(job.lastStatus)} · 已触发 ${job.runCount} 次${job.lastError ? ` · ${job.lastError}` : ''}`,
+          ].join(' · ')).join('\n')
           : '当前话题没有定时任务。',
         hasThread,
       );
@@ -477,12 +481,18 @@ export async function handleMessage(
         await bot.reply(msg.messageId, `找不到本话题定时任务：${second}`, hasThread);
         return;
       }
-      if (operation === 'remove') {
-        await ctx.schedules.remove(job.id);
-        await bot.reply(msg.messageId, `已删除定时任务 ${job.id}。`, hasThread);
-      } else {
-        const updated = await ctx.schedules.setEnabled(job.id, operation === 'resume');
-        await bot.reply(msg.messageId, `定时任务 ${updated.id} 已${updated.enabled ? '恢复' : '暂停'}。`, hasThread);
+      try {
+        assertOwnedBy(job.ownerOpenId, msg.senderOpenId);
+        if (operation === 'remove') {
+          if (job.lastStatus === 'running') throw new Error('定时任务正在执行，请等待本轮结束或先停止对应任务卡片。');
+          await ctx.schedules.remove(job.id);
+          await bot.reply(msg.messageId, `已删除定时任务 ${job.id}。`, hasThread);
+        } else {
+          const updated = await ctx.schedules.setEnabled(job.id, operation === 'resume');
+          await bot.reply(msg.messageId, `定时任务 ${updated.id} 已${updated.enabled ? '恢复' : '暂停'}。`, hasThread);
+        }
+      } catch (error) {
+        await bot.reply(msg.messageId, (error as Error).message, hasThread);
       }
       return;
     }

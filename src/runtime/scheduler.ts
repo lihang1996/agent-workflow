@@ -10,6 +10,16 @@ import { ensureRunnableSession } from './sessions.js';
 
 const TICK_MS = 15_000;
 
+export type ScheduleExecutionResult =
+  | { outcome: 'succeeded' }
+  | { outcome: 'skipped'; reason: string }
+  | { outcome: 'deferred' };
+
+export type ScheduleJobExecutor = (
+  ctx: AppContext,
+  job: ScheduledJob,
+) => Promise<ScheduleExecutionResult>;
+
 /** 启动后立即检查一次；之后按固定 tick 检查持久化任务。 */
 export function startScheduler(ctx: AppContext): void {
   if (ctx.schedulerTimer) return;
@@ -26,43 +36,86 @@ export function stopScheduler(ctx: AppContext): void {
   console.log('[定时任务] scheduler 已停止');
 }
 
-async function runDueSchedules(ctx: AppContext): Promise<void> {
+export async function runDueSchedules(
+  ctx: AppContext,
+  executeJob: ScheduleJobExecutor = runJob,
+): Promise<void> {
   if (ctx.shuttingDown || ctx.schedulerRunning) return;
   ctx.schedulerRunning = true;
   try {
     for (const job of ctx.schedules.listDue()) {
-      // 先推进下次执行时间，避免任务本身耗时期间被重复触发。
-      await ctx.schedules.markRun(job.id);
-      await runJob(ctx, job);
+      let claimed: ScheduledJob | undefined;
+      try {
+        // 先认领并推进下次时间，避免相邻 tick 重复触发同一任务。
+        claimed = await ctx.schedules.claimRun(job.id);
+        const result = await executeJob(ctx, claimed);
+        if (result.outcome === 'deferred') continue;
+        await ctx.schedules.finishRun(
+          claimed.id,
+          result.outcome,
+          result.outcome === 'skipped' ? result.reason : undefined,
+        );
+      } catch (error) {
+        const message = (error as Error).message;
+        console.error(`[定时任务] ${job.id} 执行失败:`, message);
+        if (claimed && ctx.schedules.get(claimed.id)?.lastStatus === 'running') {
+          await ctx.schedules.finishRun(claimed.id, 'failed', message).catch((persistError) => {
+            console.error(`[定时任务] ${claimed!.id} 保存失败状态异常:`, (persistError as Error).message);
+          });
+        }
+        const bot = ctx.botsById.get(job.botId);
+        if (bot) {
+          await bot.reply(
+            job.message.messageId,
+            `⚠️ 定时任务 ${job.id} 本次执行失败：${message}。系统会自动补偿重试。`,
+            !!job.message.threadId || !!job.message.rootId,
+          ).catch(() => undefined);
+        }
+      }
     }
-  } catch (error) {
-    console.error('[定时任务] 调度失败:', (error as Error).message);
   } finally {
     ctx.schedulerRunning = false;
   }
 }
 
-async function runJob(ctx: AppContext, job: ScheduledJob): Promise<void> {
+async function settleDeferredRun(
+  ctx: AppContext,
+  jobId: string,
+  outcome: 'succeeded' | 'failed',
+  error?: string,
+): Promise<void> {
+  const current = ctx.schedules.get(jobId);
+  if (!current || current.lastStatus !== 'running') return;
+  try {
+    await ctx.schedules.finishRun(jobId, outcome, error);
+  } catch (persistError) {
+    console.error(`[定时任务] ${jobId} 保存异步结果失败:`, (persistError as Error).message);
+  }
+}
+
+async function runJob(ctx: AppContext, job: ScheduledJob): Promise<ScheduleExecutionResult> {
   const bot = ctx.botsById.get(job.botId);
   if (!bot) {
-    console.warn(`[定时任务] ${job.id} 跳过：Bot ${job.botId} 未连接`);
-    return;
+    const reason = `Bot ${job.botId} 未连接`;
+    console.warn(`[定时任务] ${job.id} 跳过：${reason}`);
+    return { outcome: 'skipped', reason };
   }
   const label = job.kind === 'log_inspection' ? '服务端日志巡检' : job.kind === 'pipeline' ? '团队交付流水线' : '定时任务';
-  const kickoffId = await bot.sendText(job.message.chatId, `⏰ ${label}已触发：${job.prompt}`)
-    .catch((error) => {
-      console.error(`[定时任务] ${job.id} 无法发送启动消息:`, (error as Error).message);
-      return undefined;
-    });
+  const kickoffId = await bot.reply(
+    job.message.messageId,
+    `⏰ ${label}已触发：${job.prompt}`,
+    !!job.message.threadId || !!job.message.rootId,
+  );
+  if (!kickoffId) throw new Error('飞书未返回定时任务启动消息 ID');
   const msg: IncomingMessage = {
-    messageId: kickoffId ?? job.message.messageId,
+    messageId: kickoffId,
     chatId: job.message.chatId,
     chatType: job.message.chatType,
     messageType: 'text',
     text: '',
     rootId: job.message.rootId,
     threadId: job.message.threadId,
-    senderOpenId: job.ownerOpenId,
+    senderOpenId: job.message.senderOpenId,
     senderType: 'user',
     mentions: [],
     rawContent: JSON.stringify({ text: '' }),
@@ -76,25 +129,32 @@ async function runJob(ctx: AppContext, job: ScheduledJob): Promise<void> {
       action: job.kind === 'pipeline' ? 'pipeline' : 'task',
       reason: highRiskReason(job.prompt),
     });
-    return;
+    return { outcome: 'succeeded' };
   }
 
   if (job.kind === 'pipeline') {
     if (bot.id !== 'ceo') {
-      console.warn(`[定时任务] ${job.id} 跳过：pipeline 只能由 CEO Bot 发起`);
-      return;
+      throw new Error('pipeline 只能由 CEO Bot 发起');
     }
     await runTeamPipeline(ctx, { ceo: bot, msg, goal: job.prompt });
-    return;
+    return { outcome: 'succeeded' };
   }
 
   const session = await ensureRunnableSession(ctx, bot, msg);
   if (!session) {
     await bot.sendText(job.message.chatId, `⏭️ 定时任务 ${job.id} 跳过：${bot.name} 正在忙。`);
-    return;
+    return { outcome: 'skipped', reason: `${bot.name} 正在忙` };
   }
   const prompt = job.kind === 'log_inspection'
     ? buildLogInspectionPrompt(job.prompt, await readLogTail(job.prompt))
     : job.prompt;
-  await startCliTask(ctx, { bot, msg, session, prompt });
+  await startCliTask(ctx, {
+    bot,
+    msg,
+    session,
+    prompt,
+    onSuccess: async () => settleDeferredRun(ctx, job.id, 'succeeded'),
+    onFailure: async (error) => settleDeferredRun(ctx, job.id, 'failed', error.message),
+  });
+  return { outcome: 'deferred' };
 }

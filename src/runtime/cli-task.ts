@@ -94,7 +94,7 @@ export async function startCliTask(
     console.error('[卡片] 响应里没有 message_id，无法继续更新');
     await markSessionIdle(ctx, session.id);
     resolveDone();
-    return;
+    throw new Error('飞书未返回任务卡片 message_id，任务没有启动');
   }
   console.log(`[卡片] bot=${bot.id} message_id=${cardId} inThread=${hasThread} engine=${adapter.id}`);
 

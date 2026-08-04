@@ -6,6 +6,9 @@ import type { StoredMessage } from './approval-store.js';
 
 export const ScheduleKindSchema = z.enum(['task', 'pipeline', 'log_inspection']);
 export type ScheduleKind = z.infer<typeof ScheduleKindSchema>;
+export const ScheduleRunStatusSchema = z.enum(['idle', 'running', 'succeeded', 'failed', 'skipped']);
+export type ScheduleRunStatus = z.infer<typeof ScheduleRunStatusSchema>;
+export type ScheduleRunOutcome = Exclude<ScheduleRunStatus, 'idle' | 'running'>;
 
 const StoredMessageSchema = z.object({
   messageId: z.string().min(1),
@@ -23,12 +26,17 @@ export const ScheduleSchema = z.object({
   kind: ScheduleKindSchema,
   prompt: z.string().min(1),
   intervalMs: z.number().int().min(60_000),
-  nextRunAt: z.string().min(1),
-  lastRunAt: z.string().optional(),
+  nextRunAt: z.string().datetime(),
+  lastRunAt: z.string().datetime().optional(),
+  lastFinishedAt: z.string().datetime().optional(),
+  lastStatus: ScheduleRunStatusSchema.default('idle'),
+  lastError: z.string().optional(),
+  runCount: z.number().int().min(0).default(0),
+  consecutiveFailures: z.number().int().min(0).default(0),
   enabled: z.boolean(),
   message: StoredMessageSchema,
-  createdAt: z.string().min(1),
-  updatedAt: z.string().min(1),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
 });
 export type ScheduledJob = z.infer<typeof ScheduleSchema>;
 
@@ -50,6 +58,16 @@ export function formatScheduleInterval(intervalMs: number): string {
   return `${intervalMs / 60_000}m`;
 }
 
+export function formatScheduleRunStatus(status: ScheduleRunStatus): string {
+  return {
+    idle: '尚未执行',
+    running: '执行中',
+    succeeded: '成功',
+    failed: '失败',
+    skipped: '已跳过',
+  }[status];
+}
+
 export class JsonScheduleStore {
   private readonly jobs = new Map<string, ScheduledJob>();
   private writeQueue: Promise<void> = Promise.resolve();
@@ -59,6 +77,7 @@ export class JsonScheduleStore {
   static async open(filePath: string): Promise<JsonScheduleStore> {
     const store = new JsonScheduleStore(filePath);
     await store.load();
+    await store.recoverInterruptedRuns();
     return store;
   }
 
@@ -74,7 +93,9 @@ export class JsonScheduleStore {
 
   listDue(now = new Date()): ScheduledJob[] {
     const nowIso = now.toISOString();
-    return [...this.jobs.values()].filter((job) => job.enabled && job.nextRunAt <= nowIso);
+    return [...this.jobs.values()]
+      .filter((job) => job.enabled && job.lastStatus !== 'running' && job.nextRunAt <= nowIso)
+      .sort((a, b) => a.nextRunAt.localeCompare(b.nextRunAt));
   }
 
   async create(input: {
@@ -88,8 +109,11 @@ export class JsonScheduleStore {
     const now = new Date();
     const job: ScheduledJob = {
       ...input,
-      id: randomUUID().slice(0, 8),
+      id: randomUUID(),
       nextRunAt: new Date(now.getTime() + input.intervalMs).toISOString(),
+      lastStatus: 'idle',
+      runCount: 0,
+      consecutiveFailures: 0,
       enabled: true,
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
@@ -99,15 +123,52 @@ export class JsonScheduleStore {
     return job;
   }
 
-  async markRun(id: string, now = new Date()): Promise<ScheduledJob> {
+  /** 原子认领一次到期任务并提前推进 nextRunAt，防止调度 tick 重复启动。 */
+  async claimRun(id: string, now = new Date()): Promise<ScheduledJob> {
     const current = this.get(id);
     if (!current) throw new Error(`定时任务不存在: ${id}`);
+    if (!current.enabled) throw new Error(`定时任务已暂停: ${id}`);
+    if (current.lastStatus === 'running') throw new Error(`定时任务正在执行: ${id}`);
+    if (current.nextRunAt > now.toISOString()) throw new Error(`定时任务尚未到期: ${id}`);
     const next: ScheduledJob = {
       ...current,
       lastRunAt: now.toISOString(),
+      lastStatus: 'running',
+      lastError: undefined,
+      runCount: current.runCount + 1,
       nextRunAt: new Date(now.getTime() + current.intervalMs).toISOString(),
       updatedAt: now.toISOString(),
     };
+    this.jobs.set(id, next);
+    await this.persist();
+    return next;
+  }
+
+  /** 记录本次触发结果；失败/跳过会在不超过 5 分钟后补偿重试。 */
+  async finishRun(
+    id: string,
+    outcome: ScheduleRunOutcome,
+    error?: string,
+    now = new Date(),
+  ): Promise<ScheduledJob> {
+    const current = this.get(id);
+    if (!current) throw new Error(`定时任务不存在: ${id}`);
+    if (current.lastStatus !== 'running') throw new Error(`定时任务当前未在执行: ${id}`);
+    const failed = outcome !== 'succeeded';
+    const failures = failed ? current.consecutiveFailures + 1 : 0;
+    const regularNext = new Date(current.nextRunAt).getTime();
+    const nextRunAt = failed
+      ? new Date(now.getTime() + Math.min(current.intervalMs, 5 * 60_000)).toISOString()
+      : new Date(Math.max(regularNext, now.getTime() + current.intervalMs)).toISOString();
+    const next = ScheduleSchema.parse({
+      ...current,
+      lastStatus: outcome,
+      lastFinishedAt: now.toISOString(),
+      lastError: error?.trim() || undefined,
+      consecutiveFailures: failures,
+      nextRunAt,
+      updatedAt: now.toISOString(),
+    });
     this.jobs.set(id, next);
     await this.persist();
     return next;
@@ -131,6 +192,23 @@ export class JsonScheduleStore {
     const removed = this.jobs.delete(id);
     if (removed) await this.persist();
     return removed;
+  }
+
+  private async recoverInterruptedRuns(now = new Date()): Promise<void> {
+    const interrupted = [...this.jobs.values()].filter((job) => job.lastStatus === 'running');
+    if (interrupted.length === 0) return;
+    for (const job of interrupted) {
+      this.jobs.set(job.id, ScheduleSchema.parse({
+        ...job,
+        lastStatus: 'failed',
+        lastFinishedAt: now.toISOString(),
+        lastError: '上次执行被服务重启中断，已安排补偿重试。',
+        consecutiveFailures: job.consecutiveFailures + 1,
+        nextRunAt: now.toISOString(),
+        updatedAt: now.toISOString(),
+      }));
+    }
+    await this.persist();
   }
 
   private async load(): Promise<void> {
