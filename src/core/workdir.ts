@@ -1,6 +1,49 @@
-import { stat } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { realpath, stat } from 'node:fs/promises';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
 import type { CliId } from '../cli/types.js';
+
+/** 从可信配置中读取 Agent 可访问的根目录。 */
+export async function allowedFilesystemRoots(): Promise<string[]> {
+  const configured = [
+    process.cwd(),
+    process.env.CLAUDE_WORKDIR,
+    process.env.CODEX_WORKDIR,
+    ...(process.env.AGENT_OS_ALLOWED_ROOTS?.split(/[\n,]+/) ?? []),
+    ...Object.entries(process.env)
+      .filter(([key]) => /^BOT_[A-Z0-9_]+_WORKDIR$/.test(key))
+      .map(([, value]) => value),
+  ]
+    .map((value) => value?.trim() ?? '')
+    .filter(Boolean);
+
+  const roots = new Set<string>();
+  for (const path of configured) {
+    try {
+      roots.add(await realpath(resolve(path)));
+    } catch {
+      // 无效的可选配置由实际使用点给出更具体的错误。
+    }
+  }
+  return [...roots];
+}
+
+function isInsideRoot(path: string, root: string): boolean {
+  const rel = relative(root, path);
+  return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`));
+}
+
+/** 校验路径已解析符号链接，且没有逃出可信根目录。 */
+export async function assertAllowedPath(path: string): Promise<string> {
+  const canonical = await realpath(resolve(path));
+  const roots = await allowedFilesystemRoots();
+  if (!roots.some((root) => isInsideRoot(canonical, root))) {
+    throw new Error(
+      `路径不在 Agent OS 允许范围内: ${canonical}\n`
+      + '请通过 AGENT_OS_ALLOWED_ROOTS 显式配置可信根目录。',
+    );
+  }
+  return canonical;
+}
 
 /** 校验路径存在且为目录，返回绝对路径。 */
 export async function assertWorkdir(path: string): Promise<string> {
@@ -14,7 +57,7 @@ export async function assertWorkdir(path: string): Promise<string> {
   if (!info.isDirectory()) {
     throw new Error(`路径不是目录: ${absolute}`);
   }
-  return absolute;
+  return assertAllowedPath(absolute);
 }
 
 /** 优先级：话题项目目录 > Bot 默认目录 > 引擎/全局默认 > cwd */

@@ -4,6 +4,7 @@ import { buildApprovalCard } from '../im/workflow-card.js';
 import type { AppContext } from './app-context.js';
 import { startCliTask } from './cli-task.js';
 import { runDeliverySquad, runTeamPipeline } from './pipeline-runner.js';
+import { runCollabReview } from './collab-runner.js';
 import { ensureRunnableSession } from './sessions.js';
 
 export async function requestHighRiskApproval(
@@ -64,6 +65,10 @@ export async function runApprovedAction(ctx: AppContext, approval: ApprovalReque
   }
   if (approval.action === 'squad') {
     await runDeliverySquad(ctx, { initiator: bot, msg, goal: approval.prompt });
+    return;
+  }
+  if (approval.action === 'review') {
+    await runCollabReview(ctx, { initiator: bot, msg, task: approval.prompt, round: 1 });
     return;
   }
   const session = await ensureRunnableSession(ctx, bot, msg);

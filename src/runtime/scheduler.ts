@@ -1,5 +1,5 @@
 import type { ScheduledJob } from '../core/schedule-store.js';
-import { buildLogInspectionPrompt } from '../core/log-inspection.js';
+import { buildLogInspectionPrompt, readLogTail } from '../core/log-inspection.js';
 import { highRiskReason, isHighRiskTask } from '../core/risk.js';
 import type { IncomingMessage } from '../im/lark.js';
 import type { AppContext } from './app-context.js';
@@ -94,7 +94,7 @@ async function runJob(ctx: AppContext, job: ScheduledJob): Promise<void> {
     return;
   }
   const prompt = job.kind === 'log_inspection'
-    ? buildLogInspectionPrompt(job.prompt)
+    ? buildLogInspectionPrompt(job.prompt, await readLogTail(job.prompt))
     : job.prompt;
   await startCliTask(ctx, { bot, msg, session, prompt });
 }

@@ -14,6 +14,7 @@ import { assertWorkdir } from '../core/workdir.js';
 import { formatScheduleInterval, parseScheduleInterval } from '../core/schedule-store.js';
 import { assertLogFile } from '../core/log-inspection.js';
 import { highRiskReason, isHighRiskTask } from '../core/risk.js';
+import { assertOwnedBy, isAuthorizedOperator } from '../core/access.js';
 import { resolveMentions } from '../im/message-parser.js';
 import { isAddressedToBot, type Bot, type IncomingMessage } from '../im/lark.js';
 import { buildApprovalCard, buildQuestionnaireCard, buildSpecConfirmationCard, buildSpecReviewCard } from '../im/workflow-card.js';
@@ -47,6 +48,11 @@ export async function handleMessage(
   }
   if (!isAddressedToBot(msg, bot)) {
     console.log(`[忽略] bot=${bot.id} 未被 @`);
+    return;
+  }
+  if (!isAuthorizedOperator({ senderOpenId: msg.senderOpenId, chatType: msg.chatType })) {
+    console.warn(`[拒绝] bot=${bot.id} 未授权用户 sender=${msg.senderOpenId || '(空)'}`);
+    await bot.reply(msg.messageId, '当前用户没有操作这个 Agent OS 的权限。', !!msg.threadId || !!msg.rootId);
     return;
   }
 
@@ -242,6 +248,21 @@ export async function handleMessage(
       return;
     }
 
+    if (isHighRiskTask(parsed.task)) {
+      try {
+        await requestHighRiskApproval(ctx, {
+          bot: target,
+          msg,
+          prompt: buildHandoffPrompt(bot, parsed.task),
+          action: 'task',
+          reason: highRiskReason(parsed.task),
+        });
+      } catch (error) {
+        await bot.reply(msg.messageId, (error as Error).message, hasThread);
+      }
+      return;
+    }
+
     try {
       const targetSession = await ensureRunnableSession(ctx, target, msg);
       if (!targetSession) {
@@ -286,6 +307,20 @@ export async function handleMessage(
         ].join('\n'),
         hasThread,
       );
+      return;
+    }
+    if (isHighRiskTask(command.arg)) {
+      try {
+        await requestHighRiskApproval(ctx, {
+          bot,
+          msg,
+          prompt: command.arg,
+          action: 'review',
+          reason: highRiskReason(command.arg),
+        });
+      } catch (error) {
+        await bot.reply(msg.messageId, (error as Error).message, hasThread);
+      }
       return;
     }
     try {
@@ -868,10 +903,7 @@ export async function handleCardAction(
 
 /** 指定负责人优先；未指定时由提出需求的人确认。 */
 function assertSpecOwner(specOwnerOpenId: string, operatorOpenId: string): void {
-  const owner = process.env.OWNER_OPEN_ID?.trim() || specOwnerOpenId;
-  if (operatorOpenId !== owner) {
-    throw new Error('只有需求发起人或指定负责人可以操作该 Spec。');
-  }
+  assertOwnedBy(specOwnerOpenId, operatorOpenId);
 }
 
 /** 发布到云文档后，Spec 本地状态切至评审中。 */

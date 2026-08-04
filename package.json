@@ -10,7 +10,8 @@
     "probe": "tsx src/probe-lark.ts",
     "build": "tsc",
     "probe:cli": "tsx src/probe-cli.ts",
-    "mcp:server": "tsx src/mcp/ask-server.ts"
+    "mcp:server": "tsx src/mcp/ask-server.ts",
+    "test": "node --import tsx --test tests/**/*.test.ts"
   },
   "engines": {
     "node": ">=22"
