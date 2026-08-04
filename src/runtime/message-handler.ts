@@ -107,29 +107,43 @@ export async function handleMessage(
       );
       return;
     }
-    if (command.arg === 'clear' || command.arg === '-') {
-      await ctx.topics.clearWorkdir(msg.chatId, topicId);
-      const cleared = await ctx.sessions.clearCliContextForTopic(msg.chatId, topicId);
-      console.log(`[项目] bot=${bot.id} 清除话题目录 chat=${msg.chatId} topic=${topicId} clearedCtx=${cleared}`);
+    const activePeers = ctx.sessions.listByTopic(msg.chatId, topicId)
+      .filter((peer) => peer.status === 'active');
+    if (activePeers.length > 0) {
       await bot.reply(
         msg.messageId,
-        [
-          `已清除本话题项目目录。`,
-          `已清理 ${cleared} 个角色的 CLI 上下文。`,
-          `后续将回退到：${workdirFor(ctx, session, bot, msg)}`,
-        ].join('\n'),
+        `本话题仍有角色在执行任务（${activePeers.map((peer) => peer.botId).join('、')}），请全部结束后再切换工作目录。`,
         hasThread,
       );
       return;
     }
-    if (session.status === 'active') {
-      await bot.reply(msg.messageId, '任务执行中，请结束后再切换工作目录。', hasThread);
+    if (command.arg === 'clear' || command.arg === '-') {
+      try {
+        const hadBinding = !!ctx.topics.getWorkdir(msg.chatId, topicId);
+        const cleared = hadBinding
+          ? await ctx.sessions.clearCliContextForTopic(msg.chatId, topicId)
+          : 0;
+        await ctx.topics.clearWorkdir(msg.chatId, topicId);
+        console.log(`[项目] bot=${bot.id} 清除话题目录 chat=${msg.chatId} topic=${topicId} clearedCtx=${cleared}`);
+        await bot.reply(
+          msg.messageId,
+          [
+            hadBinding ? '已清除本话题项目目录。' : '本话题未设置项目目录。',
+            `已清理 ${cleared} 个角色的 CLI 上下文。`,
+            `后续将回退到：${workdirFor(ctx, session, bot, msg)}`,
+          ].join('\n'),
+          hasThread,
+        );
+      } catch (error) {
+        await bot.reply(msg.messageId, (error as Error).message, hasThread);
+      }
       return;
     }
     try {
       const absolute = await assertWorkdir(command.arg);
-      await ctx.topics.setWorkdir(msg.chatId, topicId, absolute);
+      // 先清旧上下文，再切共享目录；即使目录落盘失败，也不会把旧上下文带到新项目。
       const cleared = await ctx.sessions.clearCliContextForTopic(msg.chatId, topicId);
+      await ctx.topics.setWorkdir(msg.chatId, topicId, absolute);
       console.log(`[项目] bot=${bot.id} 话题目录=${absolute} chat=${msg.chatId} topic=${topicId} clearedCtx=${cleared}`);
       await bot.reply(
         msg.messageId,

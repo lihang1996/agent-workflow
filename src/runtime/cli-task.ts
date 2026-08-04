@@ -14,6 +14,7 @@ import type { Bot, IncomingMessage } from '../im/lark.js';
 import type { Session } from '../core/session-manager.js';
 import { TaskProgressTracker } from '../core/task-progress.js';
 import { redactSecrets } from '../core/log-inspection.js';
+import { assertWorkdir } from '../core/workdir.js';
 import type { AppContext } from './app-context.js';
 import type { ActiveRun } from './types.js';
 import {
@@ -70,7 +71,8 @@ export async function startCliTask(
 
   const adapter = createAdapter(session.cliId);
   const cardTitle = `${bot.name} · ${adapter.displayName}`;
-  const cwd = workdirFor(ctx, session, bot, msg);
+  // 持久化路径可能在服务运行期间被删除或被符号链接改向；每次执行前重新校验。
+  const cwd = await assertWorkdir(workdirFor(ctx, session, bot, msg));
   console.log(`[项目] bot=${bot.id} 本次 cwd=${cwd}`);
 
   await ctx.sessions.transition(session.id, 'active');

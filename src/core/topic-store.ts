@@ -52,21 +52,39 @@ export class JsonTopicStore implements TopicStore {
 
   /** 设置话题工作目录并落盘。 */
   async setWorkdir(chatId: string, threadId: string, workdir: string): Promise<TopicProject> {
-    const project: TopicProject = {
+    const key = topicKey(chatId, threadId);
+    const previous = this.topics.get(key);
+    const project = TopicSchema.parse({
       chatId,
       threadId,
       workdir,
       updatedAt: new Date().toISOString(),
-    };
-    this.topics.set(topicKey(chatId, threadId), project);
-    await this.persist();
+    });
+    this.topics.set(key, project);
+    try {
+      await this.persist();
+    } catch (error) {
+      if (this.topics.get(key) === project) {
+        if (previous) this.topics.set(key, previous);
+        else this.topics.delete(key);
+      }
+      throw error;
+    }
     return project;
   }
 
   /** 清除话题工作目录。 */
   async clearWorkdir(chatId: string, threadId: string): Promise<void> {
-    if (!this.topics.delete(topicKey(chatId, threadId))) return;
-    await this.persist();
+    const key = topicKey(chatId, threadId);
+    const previous = this.topics.get(key);
+    if (!previous) return;
+    this.topics.delete(key);
+    try {
+      await this.persist();
+    } catch (error) {
+      if (!this.topics.has(key)) this.topics.set(key, previous);
+      throw error;
+    }
   }
 
   /** 从磁盘恢复。 */
@@ -79,15 +97,29 @@ export class JsonTopicStore implements TopicStore {
       throw error;
     }
 
-    const rows: unknown = JSON.parse(content);
+    let rows: unknown;
+    try {
+      rows = JSON.parse(content);
+    } catch (error) {
+      throw new Error(`话题文件不是有效 JSON: ${this.filePath}`, { cause: error });
+    }
     if (!Array.isArray(rows)) {
       throw new Error(`话题文件格式错误: ${this.filePath}`);
     }
 
-    for (const row of rows) {
+    for (const [index, row] of rows.entries()) {
       const result = TopicSchema.safeParse(row);
-      if (!result.success) continue;
-      this.topics.set(topicKey(result.data.chatId, result.data.threadId), result.data);
+      if (!result.success) {
+        const issue = result.error.issues[0];
+        throw new Error(
+          `话题文件第 ${index + 1} 条记录格式错误: ${issue?.path.join('.') || '(根)'} ${issue?.message ?? ''}`.trim(),
+        );
+      }
+      const key = topicKey(result.data.chatId, result.data.threadId);
+      if (this.topics.has(key)) {
+        throw new Error(`话题文件包含重复目录绑定: ${result.data.chatId}/${result.data.threadId}`);
+      }
+      this.topics.set(key, result.data);
     }
   }
 

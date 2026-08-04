@@ -6,6 +6,7 @@ import test from 'node:test';
 import { JsonActiveRunStore } from '../src/core/active-run-store.js';
 import { SessionManager, type Session } from '../src/core/session-manager.js';
 import { JsonSessionStore, type SessionStore } from '../src/core/session-store.js';
+import { JsonTopicStore } from '../src/core/topic-store.js';
 import type { AppContext } from '../src/runtime/app-context.js';
 import { reconcileOrphanedCards } from '../src/runtime/active-runs.js';
 
@@ -71,6 +72,30 @@ test('遗留任务卡刷新失败时保留快照供下次重试', async () => {
       botsById: new Map([['dev', bot]]),
     } as unknown as AppContext);
     assert.deepEqual(await activeRunStore.load(), [orphan]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('话题目录落盘失败时回滚内存绑定', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-topic-rollback-'));
+  try {
+    const store = new JsonTopicStore(root); // 目标路径是目录，rename 必然失败。
+    await assert.rejects(() => store.setWorkdir('oc', 'omt', root));
+    assert.equal(store.size, 0);
+    assert.equal(store.getWorkdir('oc', 'omt'), undefined);
+  } finally {
+    await rm(`${root}.tmp`, { force: true });
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('话题目录文件损坏时拒绝静默跳过', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-topic-invalid-'));
+  const path = join(root, 'topics.json');
+  try {
+    await writeFile(path, JSON.stringify([{ chatId: 'oc' }]));
+    await assert.rejects(() => JsonTopicStore.open(path), /第 1 条记录格式错误/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
