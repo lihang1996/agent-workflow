@@ -2,11 +2,18 @@
  * 飞书接入：WS 长连接收消息 + REST 回消息。
  */
 import * as Lark from '@larksuiteoapi/node-sdk';
+import { createHash } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { extname, join } from 'node:path';
 import type { BotConfig } from '../core/bot-config.js';
-import { parseMentions, type Mention } from './message-parser.js';
+import {
+  extractMessageText,
+  parseMentions,
+  type Mention,
+} from './message-parser.js';
 import type { CardJson } from './card.js';
+
+export { extractMessageText } from './message-parser.js';
 
 export interface IncomingMessage {
   messageId: string;
@@ -354,37 +361,15 @@ function resourceExtension(type: 'image' | 'file', fileName: string | undefined,
   return CONTENT_TYPE_EXTENSIONS[mime] ?? (type === 'image' ? 'img' : 'bin');
 }
 
-interface PostElement {
-  tag?: string;
-  text?: string;
-  user_id?: string;
-}
-
-/** 将富文本元素转成纯文本片段。 */
-function renderPostElement(element: PostElement): string {
-  if (element.tag === 'at') return element.user_id ?? '';
-  if (element.tag === 'br') return '\n';
-  if (['text', 'a', 'code', 'code_block', 'md'].includes(element.tag ?? '')) {
-    return element.text ?? '';
-  }
-  return '';
-}
-
-/** 从飞书消息 content 提取可读文本。 */
-export function extractMessageText(messageType: string, content: string): string {
-  const parsed = JSON.parse(content);
-  if (messageType === 'text') {
-    return parsed.text ?? '';
-  }
-  if (messageType === 'post') {
-    const paragraphs: PostElement[][] = parsed.content ?? [];
-    return paragraphs
-      .map((paragraph) => paragraph.map(renderPostElement).join(''))
-      .filter(Boolean)
-      .join('\n')
-      .trim();
-  }
-  return '';
+/** 资源 key 不直接进入文件名，避免异常 key 造成目录穿越或跨消息覆盖。 */
+export function resourceLocalName(
+  fileKey: string,
+  type: 'image' | 'file',
+  fileName: string | undefined,
+  contentType: string,
+): string {
+  const digest = createHash('sha256').update(`${type}\0${fileKey}`).digest('hex').slice(0, 32);
+  return `${type}-${digest}.${resourceExtension(type, fileName, contentType)}`;
 }
 
 /** 群聊需 @ 到自己；单聊直接受理。 */
@@ -400,10 +385,10 @@ export function isAddressedToBot(msg: IncomingMessage, bot: Bot): boolean {
 /** 拉取本应用 open_id，用于群聊 @ 匹配。 */
 async function fetchBotOpenId(client: Lark.Client): Promise<string> {
   try {
-    const res = await client.request({
+    const res = await withFeishuRetry('获取 Bot 信息', () => client.request({
       url: '/open-apis/bot/v3/info',
       method: 'GET',
-    }) as { bot?: { open_id?: string }; data?: { bot?: { open_id?: string } } };
+    })) as { bot?: { open_id?: string }; data?: { bot?: { open_id?: string } } };
     return res.bot?.open_id
       ?? res.data?.bot?.open_id
       ?? '';
@@ -420,6 +405,16 @@ export async function startBot(opts: BotOptions): Promise<Bot> {
 
   const client = new Lark.Client({ appId, appSecret });
   const openId = await fetchBotOpenId(client);
+  const handledMessageIds = new Set<string>();
+  const rememberMessage = (messageId: string): boolean => {
+    if (handledMessageIds.has(messageId)) return false;
+    handledMessageIds.add(messageId);
+    if (handledMessageIds.size > 2_000) {
+      const oldest = handledMessageIds.values().next().value;
+      if (typeof oldest === 'string') handledMessageIds.delete(oldest);
+    }
+    return true;
+  };
 
   const bot: Bot = {
     id: config.id,
@@ -432,49 +427,49 @@ export async function startBot(opts: BotOptions): Promise<Bot> {
 
     /** 回复文本消息。 */
     async reply(messageId, text, replyInThread = false) {
-      const res = await client.im.v1.message.reply({
+      const res = await withFeishuRetry('回复飞书消息', () => client.im.v1.message.reply({
         path: { message_id: messageId },
         data: {
           msg_type: 'text',
           content: JSON.stringify({ text }),
           ...(replyInThread ? { reply_in_thread: true } : {}),
         },
-      });
+      }));
       return res.data?.message_id;
     },
 
     /** 主动往指定会话发送文本（供定时任务等没有新用户消息的场景）。 */
     async sendText(chatId, text) {
-      const res = await client.im.v1.message.create({
+      const res = await withFeishuRetry('发送飞书消息', () => client.im.v1.message.create({
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: chatId,
           msg_type: 'text',
           content: JSON.stringify({ text }),
         },
-      });
+      }));
       return res.data?.message_id;
     },
 
     /** 回复交互卡片，返回卡片 message_id。 */
     async replyCard(messageId, card, replyInThread = false) {
-      const res = await client.im.v1.message.reply({
+      const res = await withFeishuRetry('回复飞书卡片', () => client.im.v1.message.reply({
         path: { message_id: messageId },
         data: {
           msg_type: 'interactive',
           content: JSON.stringify(card),
           ...(replyInThread ? { reply_in_thread: true } : {}),
         },
-      });
+      }));
       return res.data?.message_id;
     },
 
     /** 原地更新已发出的卡片。 */
     async updateCard(messageId, card) {
-      await client.im.v1.message.patch({
+      await withFeishuRetry('更新飞书卡片', () => client.im.v1.message.patch({
         path: { message_id: messageId },
         data: { content: JSON.stringify(card) },
-      });
+      }));
     },
 
     /** 创建飞书云文档，并把 Markdown 转换为文档块写入根节点。 */
@@ -563,13 +558,12 @@ export async function startBot(opts: BotOptions): Promise<Bot> {
 
     /** 下载消息中的图片/文件到本地。 */
     async downloadResource(messageId, fileKey, type, saveDir, fileName) {
-      const res = await client.im.v1.messageResource.get({
+      const res = await withFeishuRetry('下载飞书消息资源', () => client.im.v1.messageResource.get({
         path: { message_id: messageId, file_key: fileKey },
         params: { type },
-      });
+      }));
       const contentType = getHeader(res.headers, 'content-type');
-      const extension = resourceExtension(type, fileName, contentType);
-      const savePath = join(saveDir, `${fileKey}.${extension}`);
+      const savePath = join(saveDir, resourceLocalName(fileKey, type, fileName, contentType));
       await mkdir(saveDir, { recursive: true });
       await res.writeFile(savePath);
       return savePath;
@@ -610,26 +604,41 @@ export async function startBot(opts: BotOptions): Promise<Bot> {
       } catch (error) {
         console.error(`[卡片] bot=${bot.id} 处理按钮回调失败:`, (error as Error).message);
         return {
-          toast: { type: 'error', content: '停止失败，请稍后重试。' },
+          toast: { type: 'error', content: '操作失败，请稍后重试。' },
         };
       }
     },
     'im.message.receive_v1': async (data) => {
       const m = data.message;
+      if (!m?.message_id || !m.chat_id) {
+        console.warn(`[飞书] bot=${bot.id} 忽略缺少 message_id/chat_id 的消息事件`);
+        return {};
+      }
+      if (!rememberMessage(m.message_id)) {
+        console.log(`[飞书] bot=${bot.id} 忽略重复消息 message_id=${m.message_id}`);
+        return {};
+      }
+      const rawContent = typeof m.content === 'string' ? m.content : '{}';
       const msg: IncomingMessage = {
         messageId: m.message_id,
         chatId: m.chat_id,
-        chatType: m.chat_type,
-        messageType: m.message_type,
-        text: extractMessageText(m.message_type, m.content),
+        chatType: m.chat_type ?? '',
+        messageType: m.message_type ?? '',
+        text: extractMessageText(m.message_type ?? '', rawContent),
         rootId: m.root_id ?? '',
         threadId: m.thread_id ?? '',
-        senderOpenId: data.sender.sender_id?.open_id ?? '',
-        senderType: data.sender.sender_type ?? '',
+        senderOpenId: data.sender?.sender_id?.open_id ?? '',
+        senderType: data.sender?.sender_type ?? '',
         mentions: parseMentions(m.mentions),
-        rawContent: m.content,
+        rawContent,
       };
-      await onMessage(msg, bot);
+      try {
+        await onMessage(msg, bot);
+      } catch (error) {
+        handledMessageIds.delete(m.message_id);
+        throw error;
+      }
+      return {};
     },
   });
 
