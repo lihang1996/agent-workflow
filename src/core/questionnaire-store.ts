@@ -7,23 +7,48 @@ export const QuestionKindSchema = z.enum(['single_choice', 'multi_choice', 'text
 export type QuestionKind = z.infer<typeof QuestionKindSchema>;
 
 export const QuestionSchema = z.object({
-  id: z.string().min(1),
-  prompt: z.string().min(1),
+  id: z.string()
+    .regex(/^[A-Za-z][A-Za-z0-9_-]{0,39}$/, '问题 ID 必须以字母开头，且只包含字母、数字、下划线或连字符')
+    .refine((id) => !['constructor', 'prototype'].includes(id), '问题 ID 使用了保留名称'),
+  prompt: z.string().trim().min(1).max(300),
   kind: QuestionKindSchema,
-  options: z.array(z.string().min(1)).optional(),
+  options: z.array(z.string().trim().min(1).max(100)).max(20).optional(),
   required: z.boolean().optional(),
+}).superRefine((question, ctx) => {
+  if (question.kind === 'text' && question.options?.length) {
+    ctx.addIssue({ code: 'custom', path: ['options'], message: '文本题不能配置 options' });
+  }
+  if (question.kind !== 'text') {
+    if (!question.options || question.options.length < 2) {
+      ctx.addIssue({ code: 'custom', path: ['options'], message: '选择题至少需要 2 个 options' });
+      return;
+    }
+    if (new Set(question.options).size !== question.options.length) {
+      ctx.addIssue({ code: 'custom', path: ['options'], message: '选择题 options 不能重复' });
+    }
+  }
 });
 export type Question = z.infer<typeof QuestionSchema>;
 
+const QuestionsSchema = z.array(QuestionSchema).min(1).max(20).superRefine((questions, ctx) => {
+  const seen = new Set<string>();
+  questions.forEach((question, index) => {
+    if (seen.has(question.id)) {
+      ctx.addIssue({ code: 'custom', path: [index, 'id'], message: `问题 ID 重复: ${question.id}` });
+    }
+    seen.add(question.id);
+  });
+});
+
 export const QuestionnaireSchema = z.object({
-  id: z.string().min(1),
-  title: z.string().min(1),
-  goal: z.string().optional(),
-  questions: z.array(QuestionSchema).min(1),
+  id: z.string().uuid(),
+  title: z.string().trim().min(1).max(100),
+  goal: z.string().trim().max(2_000).optional(),
+  questions: QuestionsSchema,
   answers: z.record(z.string(), z.union([z.string(), z.array(z.string())])).optional(),
   status: z.enum(['awaiting_answers', 'answered']),
-  createdAt: z.string().min(1),
-  updatedAt: z.string().min(1),
+  createdAt: z.iso.datetime(),
+  updatedAt: z.iso.datetime(),
   chatId: z.string().min(1).optional(),
   topicId: z.string().min(1).optional(),
   ownerOpenId: z.string().min(1).optional(),
@@ -33,10 +58,12 @@ export const QuestionnaireSchema = z.object({
 });
 export type Questionnaire = z.infer<typeof QuestionnaireSchema>;
 
-const QuestionnaireIdSchema = z.string().regex(/^[A-Za-z0-9-]{8,64}$/);
+const QuestionnaireIdSchema = z.string().uuid();
 
 /** MCP 与飞书表单共用的问卷文件仓库。 */
 export class JsonQuestionnaireStore {
+  private mutationQueue: Promise<void> = Promise.resolve();
+
   constructor(private readonly directory = resolve('data', 'questionnaires')) {}
 
   async create(input: {
@@ -58,7 +85,7 @@ export class JsonQuestionnaireStore {
       createdAt: now,
       updatedAt: now,
     });
-    await this.save(questionnaire);
+    await this.enqueueMutation(() => this.write(questionnaire));
     return questionnaire;
   }
 
@@ -66,8 +93,14 @@ export class JsonQuestionnaireStore {
     QuestionnaireIdSchema.parse(id);
     try {
       const raw = await readFile(join(this.directory, `${id}.json`), 'utf8');
-      const parsed = QuestionnaireSchema.safeParse(JSON.parse(raw));
-      if (!parsed.success) throw new Error(`问卷文件格式错误: ${id}`);
+      let value: unknown;
+      try {
+        value = JSON.parse(raw);
+      } catch (error) {
+        throw new Error(`问卷文件不是有效 JSON: ${id}`, { cause: error });
+      }
+      const parsed = QuestionnaireSchema.safeParse(value);
+      if (!parsed.success) throw new Error(`问卷文件格式错误: ${id}（${parsed.error.issues[0]?.message ?? '未知错误'}）`);
       return parsed.data;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
@@ -96,34 +129,117 @@ export class JsonQuestionnaireStore {
     id: string,
     answers: Record<string, string | string[]>,
   ): Promise<{ questionnaire: Questionnaire; missingRequired: string[] }> {
-    const current = await this.get(id);
-    if (!current) throw new Error(`问卷不存在: ${id}`);
-
-    const merged = { ...(current.answers ?? {}), ...answers };
-    const missingRequired = current.questions
-      .filter((question) => question.required !== false)
-      .filter((question) => {
-        const value = merged[question.id];
-        return value == null
-          || (typeof value === 'string' ? value.trim().length === 0 : value.length === 0);
-      })
-      .map((question) => question.id);
-    const questionnaire: Questionnaire = {
-      ...current,
-      answers: merged,
-      status: missingRequired.length === 0 ? 'answered' : 'awaiting_answers',
-      updatedAt: new Date().toISOString(),
-    };
-    await this.save(questionnaire);
-    return { questionnaire, missingRequired };
+    return this.enqueueMutation(async () => {
+      const current = await this.get(id);
+      if (!current) throw new Error(`问卷不存在: ${id}`);
+      const normalized = normalizeAnswers(current, answers);
+      const merged = { ...(current.answers ?? {}), ...normalized };
+      const missingRequired = current.questions
+        .filter((question) => question.required !== false)
+        .filter((question) => {
+          const value = Object.hasOwn(merged, question.id) ? merged[question.id] : undefined;
+          return value == null
+            || (typeof value === 'string' ? value.trim().length === 0 : value.length === 0);
+        })
+        .map((question) => question.id);
+      const questionnaire = QuestionnaireSchema.parse({
+        ...current,
+        answers: merged,
+        status: missingRequired.length === 0 ? 'answered' : 'awaiting_answers',
+        updatedAt: new Date().toISOString(),
+      });
+      await this.write(questionnaire);
+      return { questionnaire, missingRequired };
+    });
   }
 
   async save(questionnaire: Questionnaire): Promise<void> {
     const parsed = QuestionnaireSchema.parse(questionnaire);
+    await this.enqueueMutation(() => this.write(parsed));
+  }
+
+  private async write(questionnaire: Questionnaire): Promise<void> {
     await mkdir(this.directory, { recursive: true });
-    const destination = join(this.directory, `${parsed.id}.json`);
+    const destination = join(this.directory, `${questionnaire.id}.json`);
     const temp = `${destination}.${process.pid}.${randomUUID()}.tmp`;
-    await writeFile(temp, `${JSON.stringify(parsed, null, 2)}\n`, 'utf8');
+    await writeFile(temp, `${JSON.stringify(questionnaire, null, 2)}\n`, 'utf8');
     await rename(temp, destination);
   }
+
+  private enqueueMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.mutationQueue.then(operation, operation);
+    this.mutationQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+}
+
+function normalizeAnswers(
+  questionnaire: Questionnaire,
+  answers: Record<string, string | string[]>,
+): Record<string, string | string[]> {
+  const questions = new Map(questionnaire.questions.map((question) => [question.id, question]));
+  for (const id of Object.keys(answers)) {
+    if (!questions.has(id)) throw new Error(`问卷不包含问题: ${id}`);
+  }
+
+  const normalized: Record<string, string | string[]> = {};
+  for (const [id, raw] of Object.entries(answers)) {
+    const question = questions.get(id)!;
+    if (question.kind === 'text') {
+      if (typeof raw !== 'string') throw new Error(`问题 ${id} 必须填写文本`);
+      if (raw.length > 4_000) throw new Error(`问题 ${id} 的回答不能超过 4000 字`);
+      normalized[id] = raw.trim();
+      continue;
+    }
+
+    if (question.kind === 'single_choice') {
+      if (Array.isArray(raw) && raw.length > 1) {
+        throw new Error(`问题 ${id} 只能选择一个选项`);
+      }
+      const value = typeof raw === 'string'
+        ? raw.trim()
+        : raw.length === 1 ? raw[0]?.trim() ?? '' : '';
+      if (!value) {
+        normalized[id] = '';
+        continue;
+      }
+      if (!question.options?.includes(value)) throw new Error(`问题 ${id} 的选项无效: ${value}`);
+      normalized[id] = value;
+      continue;
+    }
+
+    const values = (Array.isArray(raw) ? raw : raw ? [raw] : [])
+      .map((value) => value.trim())
+      .filter(Boolean);
+    if (new Set(values).size !== values.length) throw new Error(`问题 ${id} 的多选答案不能重复`);
+    const invalid = values.find((value) => !question.options?.includes(value));
+    if (invalid) throw new Error(`问题 ${id} 的选项无效: ${invalid}`);
+    normalized[id] = values;
+  }
+  return normalized;
+}
+
+export interface QuestionnaireAccessContext {
+  workflowId?: string;
+  ownerOpenId?: string;
+  chatId?: string;
+  topicId?: string;
+  botId?: string;
+  messageId?: string;
+}
+
+/** MCP 只能读取当前任务自身创建的问卷，不能凭 ID 跨话题访问。 */
+export function questionnaireMatchesContext(
+  questionnaire: Questionnaire,
+  context: QuestionnaireAccessContext,
+): boolean {
+  const scoped: Array<[string | undefined, string | undefined]> = [
+    [questionnaire.workflowId, context.workflowId],
+    [questionnaire.ownerOpenId, context.ownerOpenId],
+    [questionnaire.chatId, context.chatId],
+    [questionnaire.topicId, context.topicId],
+    [questionnaire.botId, context.botId],
+    [questionnaire.messageId, context.messageId],
+  ];
+  return scoped.every(([expected, actual]) => !expected || expected === actual);
 }

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { ApprovalRequest } from '../core/approval-store.js';
 import type { Questionnaire, Question } from '../core/questionnaire-store.js';
 import type { ProductSpec } from '../core/spec-store.js';
@@ -27,7 +28,7 @@ function questionElement(question: Question, answer?: string | string[]) {
   if (question.kind === 'text') {
     return {
       tag: 'input',
-      element_id: `input_${question.id}`.replace(/[^A-Za-z0-9_]/g, '_').slice(0, 20),
+      element_id: questionElementId('input', question.id),
       name: question.id,
       required: question.required !== false,
       label: { tag: 'plain_text', content: `${question.prompt}${required}` },
@@ -37,7 +38,7 @@ function questionElement(question: Question, answer?: string | string[]) {
   }
   return {
     tag: 'select_static',
-    element_id: `select_${question.id}`.replace(/[^A-Za-z0-9_]/g, '_').slice(0, 20),
+    element_id: questionElementId('select', question.id),
     name: question.id,
     required: question.required !== false,
     label: { tag: 'plain_text', content: `${question.prompt}${required}` },
@@ -51,6 +52,10 @@ function questionElement(question: Question, answer?: string | string[]) {
       ? { initial_option: answer }
       : Array.isArray(answer) ? { initial_options: answer } : {}),
   };
+}
+
+function questionElementId(prefix: 'input' | 'select', questionId: string): string {
+  return `${prefix}_${createHash('sha256').update(questionId).digest('hex').slice(0, 12)}`;
 }
 
 /** 第六章：把结构化问题渲染成飞书交互式表单。 */

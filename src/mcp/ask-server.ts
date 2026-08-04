@@ -11,6 +11,7 @@ import { z } from 'zod';
 import {
   JsonQuestionnaireStore,
   QuestionSchema,
+  questionnaireMatchesContext,
   type Question,
   type Questionnaire,
 } from '../core/questionnaire-store.js';
@@ -56,8 +57,7 @@ function buildFeishuPreview(doc: Questionnaire): string {
       }
     }
   });
-  lines.push('', '请按编号回复，例如：1=选项A；2=选项B,选项C；3=自由文本');
-  lines.push('Agent 收到回复后应调用 record_answers 写入结论。');
+  lines.push('', `请发送 /form ${doc.id} 打开飞书表单并提交。`);
   return lines.join('\n');
 }
 
@@ -67,11 +67,14 @@ function context(name: string): string | undefined {
 }
 
 function canAccess(doc: Questionnaire): boolean {
-  const workflowId = context('AGENT_OS_WORKFLOW_ID');
-  const ownerOpenId = context('AGENT_OS_OWNER_OPEN_ID');
-  if (doc.workflowId && workflowId !== doc.workflowId) return false;
-  if (doc.ownerOpenId && ownerOpenId !== doc.ownerOpenId) return false;
-  return true;
+  return questionnaireMatchesContext(doc, {
+    workflowId: context('AGENT_OS_WORKFLOW_ID'),
+    ownerOpenId: context('AGENT_OS_OWNER_OPEN_ID'),
+    chatId: context('AGENT_OS_CHAT_ID'),
+    topicId: context('AGENT_OS_TOPIC_ID'),
+    botId: context('AGENT_OS_BOT_ID'),
+    messageId: context('AGENT_OS_MESSAGE_ID'),
+  });
 }
 
 const server = new McpServer({
@@ -92,18 +95,6 @@ server.registerTool(
     },
   },
   async ({ title, goal, questions }) => {
-    for (const question of questions) {
-      if (
-        (question.kind === 'single_choice' || question.kind === 'multi_choice')
-        && (!question.options || question.options.length < 2)
-      ) {
-        return textResult({
-          ok: false,
-          error: `问题 ${question.id} 是选择题，至少需要 2 个 options`,
-        });
-      }
-    }
-
     const doc = await store.create({
       title,
       ...(goal ? { goal } : {}),
@@ -122,7 +113,7 @@ server.registerTool(
       status: doc.status,
       path: join('data', 'questionnaires', `${doc.id}.json`),
       feishuPreview: preview,
-      next: `把 feishuPreview 发给用户；也可让用户发送 /form ${doc.id} 点选提交；收到答案后调用 record_answers`,
+      next: `把 feishuPreview 发给用户，让用户发送 /form ${doc.id} 点选提交；现在停止并等待用户作答。`,
     });
   },
 );
@@ -131,7 +122,7 @@ server.registerTool(
   'record_answers',
   {
     title: '记录澄清答案',
-    description: '把用户对问卷的回答写入本地；全部必答题答完后 status 变为 answered。',
+    description: '仅把用户明确给出的问卷回答写入本地，不得猜测、补全或替用户选择；全部必答题答完后 status 变为 answered。',
     inputSchema: {
       questionnaireId: z.string().min(1).describe('propose_questions 返回的 ID'),
       answers: z

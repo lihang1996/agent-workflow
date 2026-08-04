@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { buildPipelineStepPrompt, DEFAULT_PIPELINE_STEPS } from '../src/core/pipeline.js';
-import { JsonQuestionnaireStore } from '../src/core/questionnaire-store.js';
+import { JsonQuestionnaireStore, questionnaireMatchesContext } from '../src/core/questionnaire-store.js';
 import { JsonApprovalStore } from '../src/core/approval-store.js';
 import { JsonSpecStore } from '../src/core/spec-store.js';
 import { JsonWorkflowStore } from '../src/core/workflow-store.js';
@@ -38,6 +38,87 @@ test('问卷带工作流作用域并可持久化答案', async () => {
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('问卷拒绝歧义结构与越界答案', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-questionnaire-validation-'));
+  try {
+    const store = new JsonQuestionnaireStore(root);
+    await assert.rejects(
+      store.create({
+        title: '重复问题',
+        questions: [
+          { id: 'scope', prompt: '范围', kind: 'text' },
+          { id: 'scope', prompt: '范围确认', kind: 'text' },
+        ],
+      }),
+      /问题 ID 重复/,
+    );
+    const questionnaire = await store.create({
+      title: '答案校验',
+      questions: [
+        { id: 'scope', prompt: '范围', kind: 'single_choice', options: ['A', 'B'] },
+        { id: 'targets', prompt: '目标', kind: 'multi_choice', options: ['Web', 'App'] },
+      ],
+    });
+    await assert.rejects(store.recordAnswers(questionnaire.id, { unknown: 'A' }), /问卷不包含问题/);
+    await assert.rejects(store.recordAnswers(questionnaire.id, { scope: 'C' }), /选项无效/);
+    await assert.rejects(store.recordAnswers(questionnaire.id, { scope: ['A', 'B'] }), /只能选择一个选项/);
+    await assert.rejects(store.recordAnswers(questionnaire.id, { targets: ['Web', 'Web'] }), /不能重复/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('并发提交问卷不会覆盖答案', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-questionnaire-concurrent-'));
+  try {
+    const store = new JsonQuestionnaireStore(root);
+    const questionnaire = await store.create({
+      title: '并发回答',
+      questions: [
+        { id: 'scope', prompt: '范围', kind: 'text' },
+        { id: 'deadline', prompt: '期限', kind: 'text' },
+      ],
+    });
+    await Promise.all([
+      store.recordAnswers(questionnaire.id, { scope: '后台' }),
+      store.recordAnswers(questionnaire.id, { deadline: '明天' }),
+    ]);
+    const saved = await store.get(questionnaire.id);
+    assert.deepEqual(saved?.answers, { scope: '后台', deadline: '明天' });
+    assert.equal(saved?.status, 'answered');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('问卷访问范围覆盖工作流与飞书会话', () => {
+  const questionnaire = {
+    id: '6b4ca8b5-b1f3-48e4-839f-9007ce250aa1',
+    title: '作用域',
+    questions: [{ id: 'scope', prompt: '范围', kind: 'text' as const }],
+    status: 'awaiting_answers' as const,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    workflowId: '3709353f-7ad1-4558-9075-8939b4ca4629',
+    ownerOpenId: 'ou_owner',
+    chatId: 'oc_chat',
+    topicId: 'omt_topic',
+    botId: 'pm',
+    messageId: 'om_message',
+  };
+  const exact = {
+    workflowId: questionnaire.workflowId,
+    ownerOpenId: questionnaire.ownerOpenId,
+    chatId: questionnaire.chatId,
+    topicId: questionnaire.topicId,
+    botId: questionnaire.botId,
+    messageId: questionnaire.messageId,
+  };
+  assert.equal(questionnaireMatchesContext(questionnaire, exact), true);
+  assert.equal(questionnaireMatchesContext(questionnaire, { ...exact, chatId: 'oc_other' }), false);
+  assert.equal(questionnaireMatchesContext(questionnaire, { ...exact, workflowId: undefined }), false);
 });
 
 test('交付工作流状态可在重启后恢复', async () => {
@@ -107,7 +188,10 @@ test('问卷、Spec 确认和产品评审均使用飞书 form_submit', () => {
   const questionnaire = {
     id: '6b4ca8b5-b1f3-48e4-839f-9007ce250aa1',
     title: '澄清',
-    questions: [{ id: 'scope', prompt: '范围', kind: 'text' as const }],
+    questions: [
+      { id: 'sharedQuestionPrefixAlpha', prompt: '范围', kind: 'text' as const },
+      { id: 'sharedQuestionPrefixBeta', prompt: '期限', kind: 'text' as const },
+    ],
     status: 'awaiting_answers' as const,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -130,6 +214,10 @@ test('问卷、Spec 确认和产品评审均使用飞书 form_submit', () => {
   const questionForm = questionCard.body.elements.find((item: any) => item.tag === 'form');
   assert.ok(questionForm);
   assert.equal(questionForm.elements.at(-1).action_type, 'form_submit');
+  const ids = questionForm.elements
+    .filter((item: any) => item.tag !== 'button')
+    .map((item: any) => item.element_id);
+  assert.equal(new Set(ids).size, ids.length);
   const confirmationCard = buildSpecConfirmationCard(spec) as any;
   const confirmationForm = confirmationCard.body.elements.find((item: any) => item.tag === 'form');
   assert.ok(confirmationForm);
