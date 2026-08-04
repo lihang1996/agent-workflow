@@ -63,7 +63,8 @@ export function buildPipelineStepPrompt(
       return [
         '【团队流水线 · 产品经理】',
         `用户目标：${goal}`,
-        '请输出简短 Spec：背景、范围、验收标准、非目标。控制在一页以内。',
+        '若目标含糊，请先调用 MCP 工具 propose_questions 发起结构化澄清，再用 record_answers 记录结论。',
+        '随后输出简短 Spec：背景、范围、验收标准、非目标。控制在一页以内。',
       ].join('\n');
     case 'architect':
       return [

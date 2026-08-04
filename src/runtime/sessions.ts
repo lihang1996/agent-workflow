@@ -1,0 +1,90 @@
+import { getAdapter } from '../cli/registry.js';
+import { resolveWorkdir } from '../core/workdir.js';
+import type { Session } from '../core/session-manager.js';
+import type { Bot, IncomingMessage } from '../im/lark.js';
+import type { AppContext } from './app-context.js';
+
+/** 话题 ID：thread > root > message。 */
+export function topicIdOf(msg: IncomingMessage): string {
+  return msg.threadId || msg.rootId || msg.messageId;
+}
+
+/** 按优先级解析本次任务工作目录。 */
+export function workdirFor(ctx: AppContext, session: Session, bot: Bot, msg: IncomingMessage): string {
+  return resolveWorkdir({
+    topicWorkdir: ctx.topics.getWorkdir(msg.chatId, topicIdOf(msg)),
+    botWorkdir: bot.workdir,
+    cliId: session.cliId,
+  });
+}
+
+/** 单行截断，供日志展示。 */
+export function truncate(text: string, max = 80): string {
+  const oneLine = text.replace(/\s+/g, ' ').trim();
+  return oneLine.length > max ? `${oneLine.slice(0, max)}…` : oneLine;
+}
+
+export const STATUS_LABELS: Record<Session['status'], string> = {
+  creating: '创建中',
+  active: '执行中',
+  idle: '空闲',
+  closed: '已关闭',
+};
+
+/** 拼 /status 回复文案。 */
+export function formatSessionStatus(
+  ctx: AppContext,
+  session: Session,
+  bot: Bot,
+  msg: IncomingMessage,
+): string {
+  const adapter = getAdapter(session.cliId);
+  const topicId = topicIdOf(msg);
+  const topicWorkdir = ctx.topics.getWorkdir(msg.chatId, topicId);
+  const effective = workdirFor(ctx, session, bot, msg);
+  const peers = ctx.sessions.listByTopic(msg.chatId, topicId);
+  const peerLine = peers.length
+    ? peers.map((s) => `${s.botId}:${STATUS_LABELS[s.status]}`).join('，')
+    : '(无)';
+  return [
+    `角色：${bot.name} (${bot.id})`,
+    `会话：${session.id}`,
+    `状态：${STATUS_LABELS[session.status]}`,
+    `执行引擎：${adapter.displayName} (${session.cliId})`,
+    `CLI 上下文：${session.cliSessionId ? `已建立 (${session.cliSessionId.slice(0, 8)}…)` : '空（下次任务将新建）'}`,
+    `话题项目目录：${topicWorkdir ?? '(未设置，可用 /workdir <路径>)'}`,
+    `Bot 默认目录：${bot.workdir ?? '(未配置)'}`,
+    `实际工作目录：${effective}`,
+    `本话题角色：${peerLine}`,
+    `话题：${session.threadId}`,
+    `创建：${session.createdAt}`,
+    `更新：${session.updatedAt}`,
+  ].join('\n');
+}
+
+/** active → idle（已是 idle 则忽略）。 */
+export async function markSessionIdle(ctx: AppContext, sessionId: string): Promise<void> {
+  if (ctx.sessions.get(sessionId)?.status !== 'active') return;
+  await ctx.sessions.transition(sessionId, 'idle');
+  console.log(`[会话] id=${sessionId} status=idle`);
+}
+
+/** 取可执行会话；忙则返回 undefined，已关闭则 reopen。 */
+export async function ensureRunnableSession(
+  ctx: AppContext,
+  bot: Bot,
+  msg: IncomingMessage,
+): Promise<Session | undefined> {
+  const { session } = await ctx.sessions.resolve({
+    messageId: msg.messageId,
+    chatId: msg.chatId,
+    threadId: msg.threadId,
+    rootId: msg.rootId,
+    botId: bot.id,
+  });
+  if (session.status === 'closed') {
+    return ctx.sessions.reopen(session.id);
+  }
+  if (session.status === 'active') return undefined;
+  return session;
+}

@@ -43,10 +43,12 @@ src/index.ts（路由、命令、任务编排）
 
 | 路径 | 作用 |
 | --- | --- |
-| `src/index.ts` | 应用入口、消息路由、命令处理和任务生命周期 |
+| `src/index.ts` | 应用启动与信号收尾（组合根） |
+| `src/runtime/` | 消息路由、CLI 任务、协作/流水线运行主线 |
 | `src/im/` | 飞书接入、消息解析、交互式任务卡片 |
 | `src/core/` | Bot 配置、会话、话题目录、命令和任务交接 |
 | `src/cli/` | Claude/Codex 适配器、事件解析和子进程运行器 |
+| `src/mcp/` | 结构化提问 MCP（propose_questions 等） |
 | `src/probe-cli.ts` | 手工检查 CLI `stream-json` 输出的探针 |
 | `data/` | 运行时生成的会话、话题目录和下载文件（不提交） |
 
@@ -137,6 +139,8 @@ pnpm probe:cli  # 手工查看 CLI 的 JSON 流事件
 | `DEFAULT_CLI` | 新会话默认引擎：`claude` 或 `codex` | `claude` |
 | `COLLAB_MAX_ROUNDS` | `/review` 评审↔开发的最大协作轮次（1–10；非法值回退为 2） | `2` |
 | `PIPELINE_STEPS` | CEO `/pipeline` 的步骤，逗号分隔：`pm`、`architect`、`dev`、`review`、`qa`、`summary` | `pm,architect,dev,review,qa,summary` |
+| `MCP_ENABLED` | 是否注入结构化提问 MCP | `true`（未设置即开启） |
+| `MCP_STRICT` | Claude 是否加 `--strict-mcp-config` | `false` |
 | `CLAUDE_WORKDIR` | Claude 全局回退目录 | 当前工作目录 |
 | `CODEX_WORKDIR` | Codex 全局回退目录；未设置时继续回退到 `CLAUDE_WORKDIR`、当前工作目录 | 未设置时按上述顺序回退 |
 | `CODEX_SANDBOX` | Codex 沙箱模式：`read-only`、`workspace-write` 或 `danger-full-access` | `workspace-write` |
@@ -155,7 +159,7 @@ pnpm probe:cli  # 手工查看 CLI 的 JSON 流事件
 | `/engine claude\|codex` | 切换当前会话引擎并清理旧 CLI 上下文 |
 | `/handoff <角色> <任务>` | 将任务交给同话题的其他 Bot |
 | `/review <任务>` | 评审→开发协作（意见自动回传，可多轮；需同时配置 reviewer 和 dev Bot） |
-| `/pipeline <目标>` | **仅 CEO**：启动团队交付流水线；未配置的步骤会跳过 |
+| `/pipeline <目标>` | **仅 CEO**：显式启动团队交付流水线；未配置的步骤会跳过。CEO 收到**非命令**自然语言目标时也会自动走流水线 |
 | `/reset` | 清理 CLI 上下文，但保留 Agent OS 会话 |
 | `/close` | 关闭当前会话 |
 | `/reopen` | 重新打开已关闭会话 |
@@ -164,6 +168,7 @@ pnpm probe:cli  # 手工查看 CLI 的 JSON 流事件
 示例：
 
 ```text
+@CEO助手 给 README 补一节快速开始说明
 /workdir /path/to/project
 /engine codex
 /handoff dev 根据当前仓库写一段 README 大纲

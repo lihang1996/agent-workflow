@@ -33,6 +33,7 @@ export interface CardAction {
   operatorOpenId: string;
   messageId: string;
   value: Record<string, unknown>;
+  formValue: Record<string, unknown>;
 }
 
 export interface CardActionResponse {
@@ -47,6 +48,9 @@ export function parseCardAction(data: any): CardAction {
     operatorOpenId: data?.operator?.open_id ?? data?.operator_id?.open_id ?? '',
     messageId: data?.context?.open_message_id ?? data?.open_message_id ?? '',
     value: value && typeof value === 'object' ? value as Record<string, unknown> : {},
+    formValue: data?.action?.form_value && typeof data.action.form_value === 'object'
+      ? data.action.form_value as Record<string, unknown>
+      : {},
   };
 }
 

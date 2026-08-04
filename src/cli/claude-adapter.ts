@@ -1,3 +1,4 @@
+import { claudeMcpFlags } from "../mcp/config.js";
 import type { CliAdapter, CliEvent, CliRunStats } from "./types.js";
 
 interface ClaudeEvent {
@@ -120,7 +121,14 @@ function parseStats(event: ClaudeEvent): CliRunStats | undefined {
 }
 
 function outputArgs(prompt: string): string[] {
-  return ["-p", prompt, "--output-format", "stream-json", "--verbose"];
+  return [
+    "-p",
+    prompt,
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    ...claudeMcpFlags(),
+  ];
 }
 
 export class ClaudeAdapter implements CliAdapter {

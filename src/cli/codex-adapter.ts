@@ -1,3 +1,4 @@
+import { codexMcpFlags } from '../mcp/config.js';
 import type { CliAdapter, CliEvent } from './types.js';
 
 interface CodexItem {
@@ -66,7 +67,14 @@ export class CodexAdapter implements CliAdapter {
 
   /** 新开 Codex 会话。 */
   buildArgs(prompt: string): string[] {
-    return ['exec', '--json', '--sandbox', this.sandbox, prompt];
+    return [
+      'exec',
+      '--json',
+      '--sandbox',
+      this.sandbox,
+      ...codexMcpFlags(),
+      prompt,
+    ];
   }
 
   /** 恢复会话；--sandbox 必须挂在 exec 上。 */
@@ -75,6 +83,7 @@ export class CodexAdapter implements CliAdapter {
       'exec',
       '--sandbox',
       this.sandbox,
+      ...codexMcpFlags(),
       'resume',
       '--json',
       sessionId,

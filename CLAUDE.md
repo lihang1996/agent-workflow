@@ -27,3 +27,6 @@ pnpm dev（tsx watch）/ pnpm start / pnpm build
 - `tsx watch` 热重启会掐断进行中的 CLI → 卡片停在「运行中」；需 SIGTERM 收尾 + `data/active-runs.json` 启动时把遗留卡片标失败。长任务可用 `pnpm start:once`。
 - 停机收尾：成功态不可被盖红；发卡后同步落盘；停机禁止 onSuccess 续跑；协作轮次落 `data/collab-rounds.json`；CLI 用进程组杀掉孙子进程。
 - CEO 团队流水线：`/pipeline <目标>` 仅 CEO 可启；默认 PM→架构→开发→评审→测试→汇总；可用 `PIPELINE_STEPS` 裁剪。
+- CEO 统一入口：`@CEO助手` 发自然语言目标（非斜杠命令）会直接启动流水线；专家 Bot 的 `/help` 引导先找 CEO。
+- 运行主线在 `src/runtime/`（消息路由 / CLI 任务 / 协作 / 流水线）；`src/index.ts` 只做启动与信号。
+- 结构化提问 MCP：`propose_questions` → `record_answers`；Claude 用 `--mcp-config`，Codex 用 `-c mcp_servers.*`；server 用绝对路径 `--import …/tsx/dist/loader.mjs` + `AGENT_OS_ROOT`。
