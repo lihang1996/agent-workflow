@@ -66,6 +66,7 @@ export interface Bot {
   reply: (messageId: string, text: string, replyInThread?: boolean) => Promise<string | undefined>;
   replyCard: (messageId: string, card: CardJson, replyInThread?: boolean) => Promise<string | undefined>;
   updateCard: (messageId: string, card: CardJson) => Promise<void>;
+  createDocument: (title: string, markdown: string) => Promise<{ documentId: string; url: string }>;
   downloadResource: (
     messageId: string,
     fileKey: string,
@@ -209,6 +210,41 @@ export async function startBot(opts: BotOptions): Promise<Bot> {
         path: { message_id: messageId },
         data: { content: JSON.stringify(card) },
       });
+    },
+
+    /** 创建飞书云文档，并把 Markdown 转换为文档块写入根节点。 */
+    async createDocument(title, markdown) {
+      const created = await client.request({
+        url: '/open-apis/docx/v1/documents',
+        method: 'POST',
+        data: { title },
+      }) as any;
+      const document = created?.data?.document ?? created?.document ?? created?.data ?? {};
+      const documentId = document.document_id ?? document.documentId;
+      if (typeof documentId !== 'string' || !documentId) {
+        throw new Error('飞书云文档创建成功但未返回 document_id');
+      }
+
+      if (markdown.trim()) {
+        const converted = await client.request({
+          url: '/open-apis/docx/v1/documents/blocks/convert',
+          method: 'POST',
+          data: { content_type: 'markdown', content: markdown },
+        }) as any;
+        const blocks = converted?.data?.blocks ?? converted?.blocks ?? [];
+        if (!Array.isArray(blocks) || blocks.length === 0) {
+          throw new Error('飞书云文档内容转换失败，未返回文档块');
+        }
+        await client.request({
+          url: `/open-apis/docx/v1/documents/${documentId}/blocks/${documentId}/children`,
+          method: 'POST',
+          data: { children: blocks },
+        });
+      }
+      const url = typeof document.url === 'string' && document.url
+        ? document.url
+        : `https://feishu.cn/docx/${documentId}`;
+      return { documentId, url };
     },
 
     /** 下载消息中的图片/文件到本地。 */

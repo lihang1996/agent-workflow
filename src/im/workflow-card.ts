@@ -79,7 +79,9 @@ export function buildSpecConfirmationCard(spec: ProductSpec): CardJson {
             button('confirm_spec', { specId: spec.id }, '确认方案', 'primary'),
             button('reject_spec', { specId: spec.id }, '退回修改', 'danger'),
           ]
-          : []),
+          : spec.status === 'confirmed'
+            ? [button('publish_spec', { specId: spec.id }, '发布到飞书云文档', 'primary')]
+            : []),
       ],
     },
   };

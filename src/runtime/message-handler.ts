@@ -13,7 +13,7 @@ import { requestTaskAbort } from '../core/task-abort.js';
 import { assertWorkdir } from '../core/workdir.js';
 import { resolveMentions } from '../im/message-parser.js';
 import { isAddressedToBot, type Bot, type IncomingMessage } from '../im/lark.js';
-import { buildQuestionnaireCard, buildSpecConfirmationCard } from '../im/workflow-card.js';
+import { buildQuestionnaireCard, buildSpecConfirmationCard, buildSpecReviewCard } from '../im/workflow-card.js';
 import type { AppContext } from './app-context.js';
 import {
   freezeRunCard,
@@ -195,7 +195,19 @@ export async function handleMessage(
       await bot.replyCard(msg.messageId, buildSpecConfirmationCard(spec), hasThread);
       return;
     }
-    await bot.reply(msg.messageId, '用法：/spec list 或 /spec show <specId>', hasThread);
+    if (subcommand === 'publish' && specId) {
+      try {
+        const spec = ctx.specs.get(specId);
+        if (!spec || spec.chatId !== msg.chatId || spec.topicId !== topicIdOf(msg)) throw new Error(`找不到本话题 Spec：${specId}`);
+        assertSpecOwner(spec.ownerOpenId, msg.senderOpenId);
+        const published = await publishSpecToDoc(ctx, spec.id);
+        await bot.replyCard(msg.messageId, buildSpecReviewCard(published), hasThread);
+      } catch (error) {
+        await bot.reply(msg.messageId, (error as Error).message, hasThread);
+      }
+      return;
+    }
+    await bot.reply(msg.messageId, '用法：/spec list、/spec show <specId> 或 /spec publish <specId>', hasThread);
     return;
   }
   if (command?.name === 'handoff') {
@@ -470,16 +482,28 @@ export async function handleCardAction(
     formValue: Record<string, unknown>;
   },
 ) {
+  if (action.value.action === 'publish_spec') {
+    const specId = typeof action.value.specId === 'string' ? action.value.specId : '';
+    try {
+      const spec = ctx.specs.get(specId);
+      if (!spec) throw new Error('Spec 不存在或已被删除。');
+      assertSpecOwner(spec.ownerOpenId, action.operatorOpenId);
+      const published = await publishSpecToDoc(ctx, spec.id);
+      return {
+        toast: { type: 'success' as const, content: '已发布到飞书云文档，进入产品评审。' },
+        card: { type: 'raw' as const, data: buildSpecReviewCard(published) },
+      };
+    } catch (error) {
+      return { toast: { type: 'error' as const, content: (error as Error).message } };
+    }
+  }
   if (action.value.action === 'confirm_spec' || action.value.action === 'reject_spec') {
     const specId = typeof action.value.specId === 'string' ? action.value.specId : '';
     if (!specId) return { toast: { type: 'error' as const, content: 'Spec ID 缺失。' } };
     try {
       const spec = ctx.specs.get(specId);
       if (!spec) throw new Error('Spec 不存在或已被删除。');
-      const owner = process.env.OWNER_OPEN_ID?.trim() || spec.ownerOpenId;
-      if (action.operatorOpenId !== owner) {
-        return { toast: { type: 'warning' as const, content: '只有需求发起人或指定负责人可以确认方案。' } };
-      }
+      assertSpecOwner(spec.ownerOpenId, action.operatorOpenId);
       if (spec.status !== 'pending_confirmation') {
         return { toast: { type: 'info' as const, content: `Spec 当前状态：${spec.status}` } };
       }
@@ -556,4 +580,29 @@ export async function handleCardAction(
     toast: { type: 'success' as const, content: '已发送停止指令。' },
     card: { type: 'raw' as const, data: interruptedCard(run, detail) },
   };
+}
+
+/** 指定负责人优先；未指定时由提出需求的人确认。 */
+function assertSpecOwner(specOwnerOpenId: string, operatorOpenId: string): void {
+  const owner = process.env.OWNER_OPEN_ID?.trim() || specOwnerOpenId;
+  if (operatorOpenId !== owner) {
+    throw new Error('只有需求发起人或指定负责人可以操作该 Spec。');
+  }
+}
+
+/** 发布到云文档后，Spec 本地状态切至评审中。 */
+async function publishSpecToDoc(ctx: AppContext, specId: string) {
+  const spec = ctx.specs.get(specId);
+  if (!spec) throw new Error(`Spec 不存在: ${specId}`);
+  if (spec.status !== 'confirmed') {
+    throw new Error(`当前 Spec 状态为 ${spec.status}，仅已确认方案可以发布。`);
+  }
+  const bot = ctx.botsById.get(spec.botId) ?? ctx.botsById.get('pm');
+  if (!bot) throw new Error('产品经理 Bot 未连接，无法发布云文档。');
+  const document = await bot.createDocument(`产品 Spec · ${spec.title}`, spec.content);
+  return ctx.specs.update(spec.id, {
+    status: 'in_review',
+    docId: document.documentId,
+    docUrl: document.url,
+  });
 }
