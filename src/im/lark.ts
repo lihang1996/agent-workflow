@@ -68,6 +68,7 @@ export interface Bot {
   replyCard: (messageId: string, card: CardJson, replyInThread?: boolean) => Promise<string | undefined>;
   updateCard: (messageId: string, card: CardJson) => Promise<void>;
   createDocument: (title: string, markdown: string) => Promise<{ documentId: string; url: string }>;
+  createDocumentComment: (documentId: string, content: string) => Promise<string | undefined>;
   downloadResource: (
     messageId: string,
     fileKey: string,
@@ -259,6 +260,24 @@ export async function startBot(opts: BotOptions): Promise<Bot> {
         ? document.url
         : `https://feishu.cn/docx/${documentId}`;
       return { documentId, url };
+    },
+
+    /** 在云文档中添加全文评论，供产品评审与后续追踪使用。 */
+    async createDocumentComment(documentId, content) {
+      const res = await client.drive.fileComment.create({
+        params: { file_type: 'docx', user_id_type: 'open_id' },
+        path: { file_token: documentId },
+        data: {
+          reply_list: {
+            replies: [{
+              content: {
+                elements: [{ type: 'text_run', text_run: { text: content } }],
+              },
+            }],
+          },
+        },
+      });
+      return res.data?.comment_id;
     },
 
     /** 下载消息中的图片/文件到本地。 */

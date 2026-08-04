@@ -720,9 +720,19 @@ export async function handleCardAction(
         ? action.formValue.reviewComment.trim()
         : '';
       if (!comment) return { toast: { type: 'warning' as const, content: '请先填写修改意见。' } };
-      const changed = await ctx.specs.addComment(spec.id, action.operatorOpenId, comment);
+      let changed = await ctx.specs.addComment(spec.id, action.operatorOpenId, comment);
       const pm = ctx.botsById.get('pm') ?? ctx.botsById.get(spec.botId);
       if (!pm) throw new Error('产品经理 Bot 未连接，无法处理评审意见。');
+      if (!changed.docId) throw new Error('Spec 尚未关联飞书云文档，无法发起云文档评审。');
+      const localComment = changed.comments.at(-1);
+      const docCommentId = await pm.createDocumentComment(changed.docId, comment);
+      if (localComment && docCommentId) {
+        changed = await ctx.specs.update(changed.id, {
+          comments: changed.comments.map((item) => item.id === localComment.id
+            ? { ...item, docCommentId }
+            : item),
+        });
+      }
       const msg = messageForSpec(changed);
       const session = await ensureRunnableSession(ctx, pm, msg);
       if (!session) throw new Error(`${pm.name} 正在执行其他任务，请稍后重试。`);

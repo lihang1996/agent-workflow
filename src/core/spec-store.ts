@@ -18,6 +18,7 @@ export const SpecCommentSchema = z.object({
   id: z.string().min(1),
   authorOpenId: z.string().min(1),
   content: z.string().min(1),
+  docCommentId: z.string().optional(),
   resolved: z.boolean().default(false),
   createdAt: z.string().min(1),
   resolvedAt: z.string().optional(),

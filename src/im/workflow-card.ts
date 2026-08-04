@@ -97,7 +97,7 @@ export function buildSpecReviewCard(spec: ProductSpec): CardJson {
     body: {
       direction: 'vertical',
       elements: [
-        { tag: 'markdown', content: `**${spec.title}**\n${spec.docUrl ? `[打开飞书云文档](${spec.docUrl})` : '云文档发布中或尚未发布。'}` },
+        { tag: 'markdown', content: `**${spec.title}**\n${spec.docUrl ? `[打开飞书云文档](${spec.docUrl})\n评审意见将同步为云文档全文评论。` : '云文档发布中或尚未发布。'}` },
         ...(comment ? [{ tag: 'markdown', content: `**待处理意见**\n${comment}` }] : []),
         ...(reviewing
           ? [
