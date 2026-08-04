@@ -4,6 +4,7 @@
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { mkdir } from 'node:fs/promises';
 import { extname, join } from 'node:path';
+import type { BotConfig } from '../core/bot-config.js';
 import { parseMentions, type Mention } from './message-parser.js';
 import type { CardJson } from './card.js';
 
@@ -16,17 +17,24 @@ export interface IncomingMessage {
   rootId: string;
   threadId: string;
   senderOpenId: string;
+  senderType: string;
   mentions: Mention[];
   rawContent: string;
 }
 
 export interface BotOptions {
-  appId: string;
-  appSecret: string;
+  config: BotConfig;
   onMessage: (msg: IncomingMessage, bot: Bot) => Promise<void>;
 }
 
 export interface Bot {
+  id: string;
+  role: string;
+  name: string;
+  appId: string;
+  openId: string;
+  /** Bot 默认工作目录（可选） */
+  workdir?: string;
   client: Lark.Client;
   reply: (messageId: string, text: string, replyInThread?: boolean) => Promise<string | undefined>;
   replyCard: (messageId: string, card: CardJson, replyInThread?: boolean) => Promise<string | undefined>;
@@ -49,6 +57,7 @@ const CONTENT_TYPE_EXTENSIONS: Record<string, string> = {
   'image/x-icon': 'ico',
 };
 
+/** 兼容 Headers / 普通对象取响应头。 */
 function getHeader(headers: any, name: string): string {
   const value = typeof headers?.get === 'function'
     ? headers.get(name)
@@ -56,6 +65,7 @@ function getHeader(headers: any, name: string): string {
   return Array.isArray(value) ? (value[0] ?? '') : (value ?? '');
 }
 
+/** 根据文件名或 Content-Type 推断扩展名。 */
 function resourceExtension(type: 'image' | 'file', fileName: string | undefined, contentType: string): string {
   const original = fileName ? extname(fileName).slice(1).toLowerCase() : '';
   if (/^[a-z0-9]{1,10}$/.test(original)) return original;
@@ -70,6 +80,7 @@ interface PostElement {
   user_id?: string;
 }
 
+/** 将富文本元素转成纯文本片段。 */
 function renderPostElement(element: PostElement): string {
   if (element.tag === 'at') return element.user_id ?? '';
   if (element.tag === 'br') return '\n';
@@ -79,6 +90,7 @@ function renderPostElement(element: PostElement): string {
   return '';
 }
 
+/** 从飞书消息 content 提取可读文本。 */
 export function extractMessageText(messageType: string, content: string): string {
   const parsed = JSON.parse(content);
   if (messageType === 'text') {
@@ -95,14 +107,50 @@ export function extractMessageText(messageType: string, content: string): string
   return '';
 }
 
-export function startBot(opts: BotOptions): Bot {
-  const { appId, appSecret, onMessage } = opts;
+/** 群聊需 @ 到自己；单聊直接受理。 */
+export function isAddressedToBot(msg: IncomingMessage, bot: Bot): boolean {
+  if (msg.chatType === 'p2p') return true;
+  if (bot.openId && msg.mentions.some((m) => m.openId === bot.openId)) return true;
+  // open_id 拉取失败时，退化为按显示名匹配
+  const name = bot.name.trim().toLowerCase();
+  if (!name) return false;
+  return msg.mentions.some((m) => m.name.trim().toLowerCase() === name);
+}
+
+/** 拉取本应用 open_id，用于群聊 @ 匹配。 */
+async function fetchBotOpenId(client: Lark.Client): Promise<string> {
+  try {
+    const res = await client.request({
+      url: '/open-apis/bot/v3/info',
+      method: 'GET',
+    }) as { bot?: { open_id?: string }; data?: { bot?: { open_id?: string } } };
+    return res.bot?.open_id
+      ?? res.data?.bot?.open_id
+      ?? '';
+  } catch (error) {
+    console.warn('[飞书] 获取 bot open_id 失败:', (error as Error).message);
+    return '';
+  }
+}
+
+/** 启动单个飞书 Bot（WS 收消息 + REST 回复）。 */
+export async function startBot(opts: BotOptions): Promise<Bot> {
+  const { config, onMessage } = opts;
+  const { appId, appSecret } = config;
 
   const client = new Lark.Client({ appId, appSecret });
+  const openId = await fetchBotOpenId(client);
 
   const bot: Bot = {
+    id: config.id,
+    role: config.role,
+    name: config.name,
+    appId,
+    openId,
+    ...(config.workdir ? { workdir: config.workdir } : {}),
     client,
 
+    /** 回复文本消息。 */
     async reply(messageId, text, replyInThread = false) {
       const res = await client.im.v1.message.reply({
         path: { message_id: messageId },
@@ -115,6 +163,7 @@ export function startBot(opts: BotOptions): Bot {
       return res.data?.message_id;
     },
 
+    /** 回复交互卡片，返回卡片 message_id。 */
     async replyCard(messageId, card, replyInThread = false) {
       const res = await client.im.v1.message.reply({
         path: { message_id: messageId },
@@ -127,6 +176,7 @@ export function startBot(opts: BotOptions): Bot {
       return res.data?.message_id;
     },
 
+    /** 原地更新已发出的卡片。 */
     async updateCard(messageId, card) {
       await client.im.v1.message.patch({
         path: { message_id: messageId },
@@ -134,6 +184,7 @@ export function startBot(opts: BotOptions): Bot {
       });
     },
 
+    /** 下载消息中的图片/文件到本地。 */
     async downloadResource(messageId, fileKey, type, saveDir, fileName) {
       const res = await client.im.v1.messageResource.get({
         path: { message_id: messageId, file_key: fileKey },
@@ -160,6 +211,7 @@ export function startBot(opts: BotOptions): Bot {
         rootId: m.root_id ?? '',
         threadId: m.thread_id ?? '',
         senderOpenId: data.sender.sender_id?.open_id ?? '',
+        senderType: data.sender.sender_type ?? '',
         mentions: parseMentions(m.mentions),
         rawContent: m.content,
       };

@@ -19,15 +19,18 @@ const STATUS_STYLE = {
   failed: { template: "red", label: "执行失败" },
 } as const;
 
+/** 将进度限制在 0–100。 */
 function clampProgress(progress: number): number {
   return Math.min(100, Math.max(0, Math.round(progress)));
 }
 
+/** 生成文本进度条。 */
 function buildProgressBar(progress: number): string {
   const filled = Math.round(progress / 10);
   return `${"█".repeat(filled)}${"░".repeat(10 - filled)}`;
 }
 
+/** 构建飞书任务卡片 JSON。 */
 export function buildTaskCard(options: TaskCardOptions): CardJson {
   const progress = clampProgress(options.progress);
   const style = STATUS_STYLE[options.status];
@@ -85,13 +88,14 @@ export class ThrottledCardUpdater {
     private readonly intervalMs = 2_000,
   ) {}
 
+  /** 节流推送进度卡；收尾后忽略迟到更新。 */
   push(card: CardJson): void {
-    // finish/cancel 之后忽略迟到的进度推送，避免流式收尾竞态抛错。
     if (this.closed) return;
     this.pendingCard = card;
     this.schedule();
   }
 
+  /** 立即最终态卡片并关闭更新器。 */
   async finish(finalCard: CardJson): Promise<void> {
     if (this.closed) return;
     this.closed = true;
@@ -101,6 +105,7 @@ export class ThrottledCardUpdater {
     await this.updateChain;
     await this.updateCard(finalCard);
   }
+  /** 关闭更新器，不再推送。 */
   async cancel(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
@@ -109,8 +114,8 @@ export class ThrottledCardUpdater {
     this.pendingCard = undefined;
     await this.updateChain;
   }
-  
 
+  /** 安排下一次刷卡。 */
   private schedule(): void {
     if (this.timer) return;
     this.timer = setTimeout(() => {
@@ -119,6 +124,7 @@ export class ThrottledCardUpdater {
     }, this.intervalMs);
   }
 
+  /** 提交窗口内最新一张待更新卡片。 */
   private flushPending(): void {
     const card = this.pendingCard;
     this.pendingCard = undefined;

@@ -8,6 +8,7 @@ const prototypes: Record<CliId, CliAdapter> = {
   codex: new CodexAdapter(),
 };
 
+/** 取只读原型（查展示名等）；真正执行请用 createAdapter。 */
 export function getAdapter(cliId: CliId): CliAdapter {
   return prototypes[cliId];
 }
@@ -18,6 +19,7 @@ export function createAdapter(cliId: CliId): CliAdapter {
   return new ClaudeAdapter();
 }
 
+/** 列出已注册引擎，供启动日志与 /help 使用。 */
 export function listEngines(): Array<{ id: CliId; displayName: string; command: string }> {
   return (Object.keys(prototypes) as CliId[]).map((id) => ({
     id,

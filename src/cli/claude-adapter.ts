@@ -18,6 +18,7 @@ interface ClaudeEvent {
   };
 }
 
+/** Claude Code 流式输出公共参数。 */
 function outputArgs(prompt: string): string[] {
   return [
     '-p',
@@ -28,6 +29,7 @@ function outputArgs(prompt: string): string[] {
   ];
 }
 
+/** 压缩工具入参，供进度卡展示。 */
 function summarizeInput(input: unknown): string | undefined {
   if (input == null) return undefined;
   if (typeof input === 'string') {
@@ -55,19 +57,23 @@ function summarizeInput(input: unknown): string | undefined {
   }
 }
 
+/** Claude Code CLI 适配器。 */
 export class ClaudeAdapter implements CliAdapter {
   readonly id = 'claude' as const;
   readonly command = 'claude';
   readonly displayName = 'Claude Code';
 
+  /** 新开会话参数。 */
   buildArgs(prompt: string): string[] {
     return outputArgs(prompt);
   }
 
+  /** 恢复已有会话参数。 */
   buildResumeArgs(prompt: string, sessionId: string): string[] {
     return ['--resume', sessionId, ...outputArgs(prompt)];
   }
 
+  /** 解析一行 stream-json。 */
   parseEvents(line: string): CliEvent[] {
     let event: ClaudeEvent;
     try {

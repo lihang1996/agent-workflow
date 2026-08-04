@@ -1,8 +1,9 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import type { CliAdapter, CliEvent, CliRunResult } from './types.js';
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
+const useProcessGroup = process.platform !== 'win32';
 
 export interface RunCliOptions {
   adapter: CliAdapter;
@@ -14,6 +15,26 @@ export interface RunCliOptions {
   onEvent?: (event: CliEvent) => void;
 }
 
+/** 杀掉 CLI 进程组（含孙子进程）。 */
+function killProcessTree(child: ChildProcess, sig: NodeJS.Signals = 'SIGTERM'): void {
+  const pid = child.pid;
+  if (!pid) return;
+  try {
+    if (useProcessGroup) {
+      process.kill(-pid, sig);
+      return;
+    }
+  } catch {
+    // 进程组不存在时回退杀自身
+  }
+  try {
+    child.kill(sig);
+  } catch {
+    // 已退出
+  }
+}
+
+/** 启动 CLI 子进程，解析 stream-json，支持取消/超时。 */
 export function runCli(options: RunCliOptions): Promise<CliRunResult> {
   const {
     adapter,
@@ -29,10 +50,11 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
     : adapter.buildArgs(prompt);
 
   return new Promise((resolve, reject) => {
+    // detached 让子进程成为新进程组组长，便于连带杀掉孙子进程。
     const child = spawn(adapter.command, args, {
       cwd,
-      signal,
       stdio: ['ignore', 'pipe', 'pipe'],
+      detached: useProcessGroup,
     });
     const lines = createInterface({ input: child.stdout });
     let observedSessionId = sessionId;
@@ -42,12 +64,32 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
     let settled = false;
     let timedOut = false;
 
+    const onAbort = () => {
+      killProcessTree(child, 'SIGTERM');
+      // 仍存活则升级 SIGKILL
+      setTimeout(() => {
+        if (!settled) killProcessTree(child, 'SIGKILL');
+      }, 2_000).unref();
+    };
+
+    if (signal?.aborted) {
+      onAbort();
+    } else {
+      signal?.addEventListener('abort', onAbort, { once: true });
+    }
+
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill('SIGTERM');
+      killProcessTree(child, 'SIGTERM');
+      setTimeout(() => {
+        if (!settled) killProcessTree(child, 'SIGKILL');
+      }, 2_000).unref();
     }, timeoutMs);
 
-    const finish = () => clearTimeout(timer);
+    const finish = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+    };
     const fail = (error: Error) => {
       if (settled) return;
       settled = true;
@@ -102,7 +144,6 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
           || `${adapter.displayName} 退出，状态码 ${code}`,
         ));
       }
-      // 进程正常退出时：有最终结果则成功；仅有中间 error、没有结果才失败。
       if (finalResult) {
         settled = true;
         finish();

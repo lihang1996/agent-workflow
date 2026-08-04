@@ -22,6 +22,7 @@ export interface CliRunResult {
   sessionId?: string;
 }
 
+/** 是否为受支持的 CLI 引擎 id。 */
 export function isCliId(value: string): value is CliId {
   return value === "claude" || value === "codex";
 }

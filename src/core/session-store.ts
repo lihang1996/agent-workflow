@@ -10,6 +10,7 @@ export interface SessionStore {
 
 const SessionSchema = z.object({
   id: z.string().min(1),
+  botId: z.string().min(1).default('dev'),
   threadId: z.string().min(1),
   chatId: z.string().min(1),
   cliId: z.enum(['claude', 'codex']),
@@ -19,6 +20,7 @@ const SessionSchema = z.object({
   updatedAt: z.iso.datetime(),
 });
 
+/** 启动时把中断残留的 creating/active 收成 idle。 */
 function recoverInterruptedSession(session: Session): Session {
   if (session.status !== 'creating' && session.status !== 'active') return session;
   return { ...session, status: 'idle' };
@@ -29,6 +31,7 @@ export class JsonSessionStore implements SessionStore {
 
   constructor(private readonly filePath: string) {}
 
+  /** 加载会话；顺带修复异常中断状态。 */
   async load(): Promise<Session[]> {
     let content: string;
     try {
@@ -60,6 +63,7 @@ export class JsonSessionStore implements SessionStore {
     return sessions;
   }
 
+  /** 串行原子写入 sessions.json。 */
   save(sessions: Session[]): Promise<void> {
     const snapshot = JSON.stringify(sessions, null, 2);
     const write = async () => {

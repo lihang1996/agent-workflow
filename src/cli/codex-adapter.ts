@@ -20,6 +20,7 @@ interface CodexEvent {
   item?: CodexItem;
 }
 
+/** 读取 Codex item 类型字段。 */
 function itemKind(item: CodexItem | undefined): string | undefined {
   if (!item) return undefined;
   if (typeof item.type === 'string') return item.type;
@@ -27,13 +28,14 @@ function itemKind(item: CodexItem | undefined): string | undefined {
   return undefined;
 }
 
+/** 截断过长文本。 */
 function truncate(text: string, max = 80): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
 /**
- * Codex 适配器按「单次 run」实例化：会缓存 thread_id / 最后一条 agent 消息，
- * 在 turn.completed 时再产出最终 result，避免中间旁白被当成答案。
+ * Codex 适配器：按单次 run 实例化，缓存 thread_id / 最后 agent 消息，
+ * 在 turn.completed 时再产出最终 result。
  */
 export class CodexAdapter implements CliAdapter {
   readonly id = 'codex' as const;
@@ -47,18 +49,26 @@ export class CodexAdapter implements CliAdapter {
     private readonly sandbox = process.env.CODEX_SANDBOX ?? 'workspace-write',
   ) {}
 
-  private commonFlags(): string[] {
-    return ['--json', '--sandbox', this.sandbox];
-  }
-
+  /** 新开 Codex 会话。 */
   buildArgs(prompt: string): string[] {
-    return ['exec', ...this.commonFlags(), prompt];
+    // codex exec [OPTIONS] <PROMPT>
+    return ['exec', '--json', '--sandbox', this.sandbox, prompt];
   }
 
+  /** 恢复会话；--sandbox 必须挂在 exec 上。 */
   buildResumeArgs(prompt: string, sessionId: string): string[] {
-    return ['exec', 'resume', sessionId, ...this.commonFlags(), prompt];
+    return [
+      'exec',
+      '--sandbox',
+      this.sandbox,
+      'resume',
+      '--json',
+      sessionId,
+      prompt,
+    ];
   }
 
+  /** 解析 Codex JSONL 事件行。 */
   parseEvents(line: string): CliEvent[] {
     let event: CodexEvent;
     try {
@@ -108,6 +118,7 @@ export class CodexAdapter implements CliAdapter {
     return [];
   }
 
+  /** item.started → 工具进度事件。 */
   private parseToolStart(item: CodexItem | undefined, sessionId?: string): CliEvent[] {
     const kind = itemKind(item);
     if (!kind) return [];
@@ -154,6 +165,7 @@ export class CodexAdapter implements CliAdapter {
     return [];
   }
 
+  /** item.completed → 缓存助手正文，供 turn.completed 产出 result。 */
   private parseItemCompleted(item: CodexItem | undefined, sessionId?: string): CliEvent[] {
     const kind = itemKind(item);
     if (kind !== 'agent_message' && kind !== 'assistant_message') return [];
