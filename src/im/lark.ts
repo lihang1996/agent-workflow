@@ -64,6 +64,7 @@ export interface Bot {
   workdir?: string;
   client: Lark.Client;
   reply: (messageId: string, text: string, replyInThread?: boolean) => Promise<string | undefined>;
+  sendText: (chatId: string, text: string) => Promise<string | undefined>;
   replyCard: (messageId: string, card: CardJson, replyInThread?: boolean) => Promise<string | undefined>;
   updateCard: (messageId: string, card: CardJson) => Promise<void>;
   createDocument: (title: string, markdown: string) => Promise<{ documentId: string; url: string }>;
@@ -186,6 +187,19 @@ export async function startBot(opts: BotOptions): Promise<Bot> {
           msg_type: 'text',
           content: JSON.stringify({ text }),
           ...(replyInThread ? { reply_in_thread: true } : {}),
+        },
+      });
+      return res.data?.message_id;
+    },
+
+    /** 主动往指定会话发送文本（供定时任务等没有新用户消息的场景）。 */
+    async sendText(chatId, text) {
+      const res = await client.im.v1.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
+          msg_type: 'text',
+          content: JSON.stringify({ text }),
         },
       });
       return res.data?.message_id;

@@ -11,6 +11,7 @@ import { collabTopicKey } from '../core/collab.js';
 import { filterRunnableSteps } from '../core/pipeline.js';
 import { requestTaskAbort } from '../core/task-abort.js';
 import { assertWorkdir } from '../core/workdir.js';
+import { formatScheduleInterval, parseScheduleInterval } from '../core/schedule-store.js';
 import { resolveMentions } from '../im/message-parser.js';
 import { isAddressedToBot, type Bot, type IncomingMessage } from '../im/lark.js';
 import { buildQuestionnaireCard, buildSpecConfirmationCard, buildSpecReviewCard } from '../im/workflow-card.js';
@@ -349,6 +350,83 @@ export async function handleMessage(
     }
     return;
   }
+  if (command?.name === 'schedule') {
+    const arg = command.arg?.trim();
+    const topicId = topicIdOf(msg);
+    if (!arg || arg === 'help') {
+      await bot.reply(
+        msg.messageId,
+        [
+          '定时任务：',
+          '/schedule every 1h <任务>',
+          '/schedule pipeline 1h <目标>（仅 CEO）',
+          '/schedule logs 1h </path/server.log>',
+          '/schedule list | pause <id> | resume <id> | remove <id>',
+        ].join('\n'),
+        hasThread,
+      );
+      return;
+    }
+    const [operation, second, ...rest] = arg.split(/\s+/);
+    if (operation === 'list') {
+      const jobs = ctx.schedules.listByTopic(msg.chatId, topicId);
+      await bot.reply(
+        msg.messageId,
+        jobs.length
+          ? jobs.map((job) => `${job.id} · ${job.enabled ? '运行中' : '已暂停'} · ${job.kind} · 每 ${formatScheduleInterval(job.intervalMs)} · 下次 ${job.nextRunAt}`).join('\n')
+          : '当前话题没有定时任务。',
+        hasThread,
+      );
+      return;
+    }
+    if ((operation === 'pause' || operation === 'resume' || operation === 'remove') && second) {
+      const job = ctx.schedules.get(second);
+      if (!job || job.message.chatId !== msg.chatId || (job.message.threadId || job.message.rootId || job.message.messageId) !== topicId) {
+        await bot.reply(msg.messageId, `找不到本话题定时任务：${second}`, hasThread);
+        return;
+      }
+      if (operation === 'remove') {
+        await ctx.schedules.remove(job.id);
+        await bot.reply(msg.messageId, `已删除定时任务 ${job.id}。`, hasThread);
+      } else {
+        const updated = await ctx.schedules.setEnabled(job.id, operation === 'resume');
+        await bot.reply(msg.messageId, `定时任务 ${updated.id} 已${updated.enabled ? '恢复' : '暂停'}。`, hasThread);
+      }
+      return;
+    }
+    if (operation !== 'every' && operation !== 'pipeline' && operation !== 'logs') {
+      await bot.reply(msg.messageId, '无法识别的 /schedule 命令，发送 /schedule help 查看用法。', hasThread);
+      return;
+    }
+    const intervalMs = second ? parseScheduleInterval(second) : undefined;
+    const prompt = rest.join(' ').trim();
+    if (!intervalMs || !prompt) {
+      await bot.reply(msg.messageId, '间隔使用 15m、1h、2d 等格式，且必须提供任务内容。', hasThread);
+      return;
+    }
+    if (operation === 'pipeline' && bot.id !== 'ceo') {
+      await bot.reply(msg.messageId, '定时团队流水线仅 CEO 可创建。', hasThread);
+      return;
+    }
+    const kind = operation === 'pipeline' ? 'pipeline' : operation === 'logs' ? 'log_inspection' : 'task';
+    const job = await ctx.schedules.create({
+      botId: bot.id,
+      ownerOpenId: process.env.OWNER_OPEN_ID?.trim() || msg.senderOpenId,
+      kind,
+      prompt,
+      intervalMs,
+      message: {
+        messageId: msg.messageId,
+        chatId: msg.chatId,
+        chatType: msg.chatType,
+        rootId: msg.rootId,
+        threadId: msg.threadId,
+        senderOpenId: msg.senderOpenId,
+      },
+    });
+    await bot.reply(msg.messageId, `已创建定时任务 ${job.id}：每 ${formatScheduleInterval(job.intervalMs)} 执行一次，下次 ${job.nextRunAt}。`, hasThread);
+    return;
+  }
   if (command?.name === 'reset') {
     try {
       await ctx.sessions.clearCliContext(session.id);
@@ -466,6 +544,7 @@ function buildHelpText(bot: Bot): string {
       '直接描述目标 → 启动交付流水线（PM→架构→开发→评审→测试→汇总）',
       '/pipeline <目标> 显式启动流水线',
       '/squad <目标> 启动开发内部交付小队',
+      '/schedule … 创建/管理定时任务',
       '/handoff <角色> <任务> 只交给某一个角色',
       '/status 查看当前会话',
       '/workdir [路径] 查看/设置本话题项目目录（clear 清除）',
@@ -485,6 +564,7 @@ function buildHelpText(bot: Bot): string {
     '/handoff <角色> <任务> 交接给同话题其他角色',
     '/review <任务> 评审→开发协作（意见自动回传，可多轮）',
     '/squad <目标> 架构→开发→评审→QA 内部交付小队',
+    '/schedule … 创建/管理定时任务',
     '/reset /reopen /close /clean 会话管理',
     '执行中可点任务卡片「停止任务」（仅发起人）',
   ].join('\n');

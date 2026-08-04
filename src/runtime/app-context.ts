@@ -3,6 +3,7 @@ import type { JsonActiveRunStore } from '../core/active-run-store.js';
 import type { JsonCollabStore } from '../core/collab-store.js';
 import type { JsonQuestionnaireStore } from '../core/questionnaire-store.js';
 import type { JsonSpecStore } from '../core/spec-store.js';
+import type { JsonScheduleStore } from '../core/schedule-store.js';
 import type { PipelineStep } from '../core/pipeline.js';
 import type { SessionManager } from '../core/session-manager.js';
 import type { JsonTopicStore } from '../core/topic-store.js';
@@ -28,8 +29,11 @@ export interface AppContext extends AppConfig {
   activeRunStore: JsonActiveRunStore;
   questionnaires: JsonQuestionnaireStore;
   specs: JsonSpecStore;
+  schedules: JsonScheduleStore;
   botsById: Map<string, Bot>;
   persistTimer?: ReturnType<typeof setTimeout>;
+  schedulerTimer?: ReturnType<typeof setInterval>;
+  schedulerRunning: boolean;
 }
 
 export interface CreateAppDeps {
@@ -39,6 +43,7 @@ export interface CreateAppDeps {
   activeRunStore: JsonActiveRunStore;
   questionnaires: JsonQuestionnaireStore;
   specs: JsonSpecStore;
+  schedules: JsonScheduleStore;
   config: AppConfig;
 }
 
@@ -55,6 +60,8 @@ export function createAppContext(deps: CreateAppDeps): AppContext {
     activeRunStore: deps.activeRunStore,
     questionnaires: deps.questionnaires,
     specs: deps.specs,
+    schedules: deps.schedules,
     botsById: new Map(),
+    schedulerRunning: false,
   };
 }

@@ -6,6 +6,7 @@ import {
 } from './app-context.js';
 import { reconcileOrphanedCards, shutdownActiveRuns } from './active-runs.js';
 import { handleCardAction, handleMessage } from './message-handler.js';
+import { startScheduler, stopScheduler } from './scheduler.js';
 
 export interface App {
   ctx: AppContext;
@@ -19,6 +20,8 @@ export interface App {
   }) => ReturnType<typeof handleCardAction>;
   reconcileOrphanedCards: () => Promise<void>;
   shutdownActiveRuns: (reason: string) => Promise<void>;
+  startScheduler: () => void;
+  stopScheduler: () => void;
 }
 
 /** 组装运行时上下文并绑定消息/卡片处理器。 */
@@ -32,6 +35,8 @@ export function createApp(deps: CreateAppDeps): App {
     handleCardAction: (action) => handleCardAction(ctx, action),
     reconcileOrphanedCards: () => reconcileOrphanedCards(ctx),
     shutdownActiveRuns: (reason) => shutdownActiveRuns(ctx, reason),
+    startScheduler: () => startScheduler(ctx),
+    stopScheduler: () => stopScheduler(ctx),
   };
 }
 
