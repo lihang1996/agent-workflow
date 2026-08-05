@@ -1,7 +1,8 @@
 /**
  * 话题协作轮次持久化，避免进程重启后轮次错乱。
  */
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { z } from 'zod';
 
@@ -13,7 +14,7 @@ const CollabRowSchema = z.object({
 
 export class JsonCollabStore {
   private readonly rounds = new Map<string, number>();
-  private writeQueue: Promise<void> = Promise.resolve();
+  private mutationQueue: Promise<void> = Promise.resolve();
 
   constructor(private readonly filePath: string) {}
 
@@ -35,31 +36,35 @@ export class JsonCollabStore {
 
   /** 写入/更新话题协作轮次。 */
   async setRound(topicKey: string, round: number): Promise<void> {
-    const parsed = CollabRowSchema.parse({ topicKey, round, updatedAt: new Date().toISOString() });
-    const previous = this.rounds.get(topicKey);
-    this.rounds.set(topicKey, parsed.round);
-    try {
-      await this.persist();
-    } catch (error) {
-      if (this.rounds.get(topicKey) === parsed.round) {
-        if (previous !== undefined) this.rounds.set(topicKey, previous);
-        else this.rounds.delete(topicKey);
+    return this.enqueueMutation(async () => {
+      const parsed = CollabRowSchema.parse({ topicKey, round, updatedAt: new Date().toISOString() });
+      const previous = this.rounds.get(topicKey);
+      this.rounds.set(topicKey, parsed.round);
+      try {
+        await this.persist();
+      } catch (error) {
+        if (this.rounds.get(topicKey) === parsed.round) {
+          if (previous !== undefined) this.rounds.set(topicKey, previous);
+          else this.rounds.delete(topicKey);
+        }
+        throw error;
       }
-      throw error;
-    }
+    });
   }
 
   /** 协作结束时清除该话题轮次。 */
   async clearRound(topicKey: string): Promise<void> {
-    const previous = this.rounds.get(topicKey);
-    if (previous === undefined) return;
-    this.rounds.delete(topicKey);
-    try {
-      await this.persist();
-    } catch (error) {
-      if (!this.rounds.has(topicKey)) this.rounds.set(topicKey, previous);
-      throw error;
-    }
+    return this.enqueueMutation(async () => {
+      const previous = this.rounds.get(topicKey);
+      if (previous === undefined) return;
+      this.rounds.delete(topicKey);
+      try {
+        await this.persist();
+      } catch (error) {
+        if (!this.rounds.has(topicKey)) this.rounds.set(topicKey, previous);
+        throw error;
+      }
+    });
   }
 
   /** 从磁盘恢复轮次表。 */
@@ -96,21 +101,28 @@ export class JsonCollabStore {
     }
   }
 
-  /** 串行落盘。 */
-  private persist(): Promise<void> {
+  /** 使用唯一临时文件原子落盘；状态变更本身由 mutationQueue 串行化。 */
+  private async persist(): Promise<void> {
     const payload = [...this.rounds.entries()].map(([topicKey, round]) => ({
       topicKey,
       round,
       updatedAt: new Date().toISOString(),
     }));
     const snapshot = JSON.stringify(payload, null, 2);
-    const write = async () => {
-      await mkdir(dirname(this.filePath), { recursive: true });
-      const tempPath = `${this.filePath}.tmp`;
+    await mkdir(dirname(this.filePath), { recursive: true });
+    const tempPath = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
+    try {
       await writeFile(tempPath, `${snapshot}\n`, 'utf8');
       await rename(tempPath, this.filePath);
-    };
-    this.writeQueue = this.writeQueue.then(write, write);
-    return this.writeQueue;
+    } catch (error) {
+      await unlink(tempPath).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private enqueueMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.mutationQueue.then(operation, operation);
+    this.mutationQueue = run.then(() => undefined, () => undefined);
+    return run;
   }
 }

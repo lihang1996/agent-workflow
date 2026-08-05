@@ -43,6 +43,49 @@ test('会话落盘失败时恢复被清理的关闭会话', async () => {
   assert.equal(manager.get('session-1')?.status, 'closed');
 });
 
+test('并发会话变更不会把失败状态带入后一份快照', async () => {
+  const saves: Session[][] = [];
+  let failNext = false;
+  const store: SessionStore = {
+    load: async () => [],
+    save: async (sessions) => {
+      const snapshot = structuredClone(sessions);
+      if (failNext) {
+        failNext = false;
+        throw new Error('模拟首笔写入失败');
+      }
+      saves.push(snapshot);
+    },
+  };
+  const manager = await SessionManager.open({
+    store,
+    createId: (() => {
+      let value = 0;
+      return () => `session-${++value}`;
+    })(),
+  });
+  const first = (await manager.resolve({
+    messageId: 'om-1', chatId: 'oc', threadId: 'omt-1', rootId: '', botId: 'dev',
+  })).session;
+  const second = (await manager.resolve({
+    messageId: 'om-2', chatId: 'oc', threadId: 'omt-2', rootId: '', botId: 'dev',
+  })).session;
+
+  failNext = true;
+  const [firstResult, secondResult] = await Promise.allSettled([
+    manager.transition(first.id, 'active'),
+    manager.transition(second.id, 'active'),
+  ]);
+
+  assert.equal(firstResult.status, 'rejected');
+  assert.equal(secondResult.status, 'fulfilled');
+  assert.equal(manager.get(first.id)?.status, 'creating');
+  assert.equal(manager.get(second.id)?.status, 'active');
+  const persisted = saves.at(-1);
+  assert.equal(persisted?.find((session) => session.id === first.id)?.status, 'creating');
+  assert.equal(persisted?.find((session) => session.id === second.id)?.status, 'active');
+});
+
 test('损坏会话记录会明确报错且不会被静默覆盖', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agent-os-session-invalid-'));
   const path = join(root, 'sessions.json');

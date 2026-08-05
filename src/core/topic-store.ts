@@ -1,4 +1,5 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { z } from 'zod';
 
@@ -30,7 +31,7 @@ function topicKey(chatId: string, threadId: string): string {
 /** 话题级项目目录：同一话题下所有 Bot 共享。 */
 export class JsonTopicStore implements TopicStore {
   private readonly topics = new Map<string, TopicProject>();
-  private writeQueue: Promise<void> = Promise.resolve();
+  private mutationQueue: Promise<void> = Promise.resolve();
 
   constructor(private readonly filePath: string) {}
 
@@ -52,39 +53,43 @@ export class JsonTopicStore implements TopicStore {
 
   /** 设置话题工作目录并落盘。 */
   async setWorkdir(chatId: string, threadId: string, workdir: string): Promise<TopicProject> {
-    const key = topicKey(chatId, threadId);
-    const previous = this.topics.get(key);
-    const project = TopicSchema.parse({
-      chatId,
-      threadId,
-      workdir,
-      updatedAt: new Date().toISOString(),
-    });
-    this.topics.set(key, project);
-    try {
-      await this.persist();
-    } catch (error) {
-      if (this.topics.get(key) === project) {
-        if (previous) this.topics.set(key, previous);
-        else this.topics.delete(key);
+    return this.enqueueMutation(async () => {
+      const key = topicKey(chatId, threadId);
+      const previous = this.topics.get(key);
+      const project = TopicSchema.parse({
+        chatId,
+        threadId,
+        workdir,
+        updatedAt: new Date().toISOString(),
+      });
+      this.topics.set(key, project);
+      try {
+        await this.persist();
+      } catch (error) {
+        if (this.topics.get(key) === project) {
+          if (previous) this.topics.set(key, previous);
+          else this.topics.delete(key);
+        }
+        throw error;
       }
-      throw error;
-    }
-    return project;
+      return project;
+    });
   }
 
   /** 清除话题工作目录。 */
   async clearWorkdir(chatId: string, threadId: string): Promise<void> {
-    const key = topicKey(chatId, threadId);
-    const previous = this.topics.get(key);
-    if (!previous) return;
-    this.topics.delete(key);
-    try {
-      await this.persist();
-    } catch (error) {
-      if (!this.topics.has(key)) this.topics.set(key, previous);
-      throw error;
-    }
+    return this.enqueueMutation(async () => {
+      const key = topicKey(chatId, threadId);
+      const previous = this.topics.get(key);
+      if (!previous) return;
+      this.topics.delete(key);
+      try {
+        await this.persist();
+      } catch (error) {
+        if (!this.topics.has(key)) this.topics.set(key, previous);
+        throw error;
+      }
+    });
   }
 
   /** 从磁盘恢复。 */
@@ -124,15 +129,22 @@ export class JsonTopicStore implements TopicStore {
   }
 
   /** 串行落盘。 */
-  private persist(): Promise<void> {
+  private async persist(): Promise<void> {
     const snapshot = JSON.stringify([...this.topics.values()], null, 2);
-    const write = async () => {
-      await mkdir(dirname(this.filePath), { recursive: true });
-      const tempPath = `${this.filePath}.tmp`;
+    await mkdir(dirname(this.filePath), { recursive: true });
+    const tempPath = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
+    try {
       await writeFile(tempPath, `${snapshot}\n`, 'utf8');
       await rename(tempPath, this.filePath);
-    };
-    this.writeQueue = this.writeQueue.then(write, write);
-    return this.writeQueue;
+    } catch (error) {
+      await unlink(tempPath).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private enqueueMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.mutationQueue.then(operation, operation);
+    this.mutationQueue = run.then(() => undefined, () => undefined);
+    return run;
   }
 }
