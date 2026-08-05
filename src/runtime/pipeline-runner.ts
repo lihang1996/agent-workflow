@@ -1,7 +1,9 @@
 import {
   DEFAULT_PIPELINE_STEPS,
+  DELIVERY_SQUAD_STEPS,
   buildPipelineStepPrompt,
   filterRunnableSteps,
+  missingBotIdsForSteps,
   type PipelineStep,
 } from '../core/pipeline.js';
 import type { DeliveryWorkflow } from '../core/workflow-store.js';
@@ -20,6 +22,11 @@ interface ApprovedWorkflowLaunch {
   approvalAttempt?: number;
   scheduleJobId?: string;
   scheduleRunCount?: number;
+}
+
+interface WorkflowStepExpectation {
+  stepIndex: number;
+  stepId: PipelineStep['id'];
 }
 
 /** CEO 团队交付流水线：按步骤串联各角色，关键人工节点会持久化暂停。 */
@@ -47,11 +54,13 @@ export async function runDeliverySquad(
   ctx: AppContext,
   options: { initiator: Bot; msg: IncomingMessage; goal: string } & ApprovedWorkflowLaunch,
 ): Promise<void> {
-  const requestedSteps = ctx.pipelineSteps.filter((step) =>
-    step.id === 'architect' || step.id === 'dev' || step.id === 'review' || step.id === 'qa');
+  const missingBotIds = missingBotIdsForSteps(DELIVERY_SQUAD_STEPS, new Set(ctx.botsById.keys()));
+  if (missingBotIds.length > 0) {
+    throw new Error(`内部交付小队缺少已连接角色：${missingBotIds.join('、')}`);
+  }
   return createAndStartWorkflow(ctx, {
     ...options,
-    requestedSteps,
+    requestedSteps: DELIVERY_SQUAD_STEPS,
     name: '开发内部交付小队',
     kind: 'squad',
   });
@@ -134,29 +143,30 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
   if (ctx.shuttingDown) return;
   const workflow = await ctx.workflows.claimReady(workflowId);
   if (!workflow) return;
-  const steps = stepsFor(workflow);
   const msg = messageForWorkflow(workflow);
   const initiator = ctx.botsById.get(workflow.initiatorBotId);
-  if (!initiator) {
-    await failWorkflow(ctx, workflow.id, `发起 Bot 未连接：${workflow.initiatorBotId}`);
-    return;
-  }
-  if (workflow.nextStepIndex >= steps.length) {
-    const completed = await ctx.workflows.update(workflow.id, { status: 'completed', error: undefined });
-    await settleWorkflowApproval(ctx, completed, 'succeeded');
-    await settleWorkflowSchedule(ctx, completed, 'succeeded');
-    await initiator.reply(msg.messageId, `${workflow.name}已全部完成。`, hasThread(msg)).catch((error) => {
-      console.error(`[${workflow.name}] 完成通知发送失败:`, (error as Error).message);
-    });
-    return;
-  }
+  try {
+    if (!initiator) throw new Error(`发起 Bot 未连接：${workflow.initiatorBotId}`);
+    const steps = stepsFor(workflow);
+    if (workflow.nextStepIndex >= steps.length) {
+      const completed = await ctx.workflows.updateIfStatus(workflow.id, 'executing', {
+        status: 'completed',
+        error: undefined,
+      });
+      if (!completed) return;
+      await settleWorkflowApproval(ctx, completed, 'succeeded');
+      await settleWorkflowSchedule(ctx, completed, 'succeeded');
+      await initiator.reply(msg.messageId, `${workflow.name}已全部完成。`, hasThread(msg)).catch((error) => {
+        console.error(`[${workflow.name}] 完成通知发送失败:`, (error as Error).message);
+      });
+      return;
+    }
 
-  const stepIndex = workflow.nextStepIndex;
-  const step = steps[stepIndex];
-  const stepLabel = `步骤 ${stepIndex + 1}/${steps.length} · ${step.title}`;
-  if (step.id === 'review') {
-    await initiator.reply(msg.messageId, `${stepLabel}：启动评审协作。`, hasThread(msg));
-    try {
+    const stepIndex = workflow.nextStepIndex;
+    const step = steps[stepIndex];
+    const stepLabel = `步骤 ${stepIndex + 1}/${steps.length} · ${step.title}`;
+    if (step.id === 'review') {
+      await initiator.reply(msg.messageId, `${stepLabel}：启动评审协作。`, hasThread(msg));
       await runCollabReview(ctx, {
         initiator,
         msg,
@@ -164,34 +174,35 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
         round: 1,
         executionPolicy: workflow.executionPolicy,
         approvedScope: workflow.executionPolicy === 'approved' ? workflow.goal : undefined,
+        stateKey: `workflow:${workflow.id}`,
         onComplete: async ({ approved, answer }) => {
           if (!approved) {
-            await failWorkflow(ctx, workflow.id, '代码评审未通过，流水线已停止，不能继续 QA。');
+            await failWorkflow(
+              ctx,
+              workflow.id,
+              '代码评审未通过，流水线已停止，不能继续 QA。',
+              { stepIndex, stepId: step.id },
+            );
             return;
           }
           await completeRegularStep(ctx, workflow.id, stepIndex, step.id, answer);
         },
-        onFailure: async (error) => failWorkflow(ctx, workflow.id, error.message),
+        onFailure: async (error) => failWorkflow(
+          ctx,
+          workflow.id,
+          error.message,
+          { stepIndex, stepId: step.id },
+        ),
       });
-    } catch (error) {
-      await failWorkflow(ctx, workflow.id, (error as Error).message);
+      return;
     }
-    return;
-  }
 
-  const actor = ctx.botsById.get(step.botId);
-  if (!actor) {
-    await failWorkflow(ctx, workflow.id, `角色 ${step.botId} 未连接`);
-    return;
-  }
-  const actorSession = await ensureRunnableSession(ctx, actor, msg);
-  if (!actorSession) {
-    await failWorkflow(ctx, workflow.id, `${actor.name} 正忙，请稍后重新发起。`);
-    return;
-  }
+    const actor = ctx.botsById.get(step.botId);
+    if (!actor) throw new Error(`角色 ${step.botId} 未连接`);
+    const actorSession = await ensureRunnableSession(ctx, actor, msg);
+    if (!actorSession) throw new Error(`${actor.name} 正忙，请稍后重新发起。`);
 
-  await initiator.reply(msg.messageId, `${stepLabel}：交给 ${actor.name}。`, hasThread(msg));
-  try {
+    await initiator.reply(msg.messageId, `${stepLabel}：交给 ${actor.name}。`, hasThread(msg));
     await startCliTask(ctx, {
       bot: actor,
       msg,
@@ -204,10 +215,21 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
         if (step.id === 'pm') await completeProductStep(ctx, workflow.id, stepIndex, actor, answer);
         else await completeRegularStep(ctx, workflow.id, stepIndex, step.id, answer);
       },
-      onFailure: async (error) => failWorkflow(ctx, workflow.id, error.message),
+      onFailure: async (error) => failWorkflow(
+        ctx,
+        workflow.id,
+        error.message,
+        { stepIndex, stepId: step.id },
+      ),
     });
   } catch (error) {
-    await failWorkflow(ctx, workflow.id, (error as Error).message);
+    const currentStepId = workflow.stepIds[workflow.nextStepIndex];
+    await failWorkflow(
+      ctx,
+      workflow.id,
+      (error as Error).message,
+      currentStepId ? { stepIndex: workflow.nextStepIndex, stepId: currentStepId } : undefined,
+    );
   }
 }
 
@@ -226,11 +248,13 @@ async function completeProductStep(
   workflow = requireWorkflow(ctx, workflowId);
   if (!isCurrentExecutingStep(workflow, stepIndex, 'pm')) return;
   if (questionnaire) {
-    workflow = await ctx.workflows.update(workflow.id, {
+    const paused = await ctx.workflows.updateIfCurrentStep(workflow.id, stepIndex, 'pm', {
       status: 'awaiting_questions',
       questionnaireId: questionnaire.id,
       error: undefined,
     });
+    if (!paused) return;
+    workflow = paused;
     await actor.replyCard(msg.messageId, buildQuestionnaireCard(questionnaire), hasThread(msg));
     await initiator.reply(
       msg.messageId,
@@ -292,13 +316,15 @@ async function completeProductStep(
   delete nextPriorOutputs.previous_spec;
   delete nextPriorOutputs.confirmation_feedback;
   delete nextPriorOutputs.review_comment_ids;
-  workflow = await ctx.workflows.update(workflow.id, {
+  const paused = await ctx.workflows.updateIfCurrentStep(workflow.id, stepIndex, 'pm', {
     status: 'awaiting_spec_confirmation',
     specId: spec.id,
     nextStepIndex: stepIndex + 1,
     priorOutputs: { ...nextPriorOutputs, pm: answer },
     error: undefined,
   });
+  if (!paused) throw new Error('产品步骤状态已变化，已停止发送过期的方案确认卡。');
+  workflow = paused;
   await actor.replyCard(msg.messageId, buildSpecConfirmationCard(spec), hasThread(msg));
   await initiator.reply(
     msg.messageId,
@@ -334,17 +360,12 @@ async function completeRegularStep(
   ctx: AppContext,
   workflowId: string,
   stepIndex: number,
-  stepId: string,
+  stepId: PipelineStep['id'],
   answer: string,
 ): Promise<void> {
-  const workflow = requireWorkflow(ctx, workflowId);
-  await ctx.workflows.update(workflow.id, {
-    status: 'ready',
-    nextStepIndex: stepIndex + 1,
-    priorOutputs: { ...workflow.priorOutputs, [stepId]: answer },
-    error: undefined,
-  });
-  await continueDeliveryWorkflow(ctx, workflow.id);
+  const advanced = await ctx.workflows.completeCurrentStep(workflowId, stepIndex, stepId, answer);
+  if (!advanced) return;
+  await continueDeliveryWorkflow(ctx, advanced.id);
 }
 
 /** 飞书表单完成后，用答案重新执行 PM 步骤。 */
@@ -357,13 +378,14 @@ export async function resumeWorkflowAfterQuestionnaire(ctx: AppContext, question
     const answer = questionnaire.answers?.[question.id];
     return `- ${question.prompt}：${Array.isArray(answer) ? answer.join('、') : answer ?? '(未答)'}`;
   }).join('\n');
-  await ctx.workflows.update(workflow.id, {
+  const transitioned = await ctx.workflows.updateIfStatus(workflow.id, 'awaiting_questions', {
     status: 'ready',
     questionnaireId: questionnaire.id,
     priorOutputs: { ...workflow.priorOutputs, clarification: answers },
     error: undefined,
   });
-  await continueDeliveryWorkflow(ctx, workflow.id);
+  if (!transitioned || transitioned.questionnaireId !== questionnaire.id) return;
+  await continueDeliveryWorkflow(ctx, transitioned.id);
 }
 
 /** 原子确认 Spec，并把交付工作流推进到云文档评审等待。 */
@@ -571,17 +593,33 @@ export async function reconcileWorkflowSpecStates(ctx: AppContext): Promise<void
   }
 }
 
-async function failWorkflow(ctx: AppContext, workflowId: string, error: string): Promise<void> {
-  const current = ctx.workflows.get(workflowId);
-  if (!current || current.status === 'failed' || current.status === 'completed') return;
-  const failed = await ctx.workflows.update(workflowId, { status: 'failed', error });
+async function failWorkflow(
+  ctx: AppContext,
+  workflowId: string,
+  error: string,
+  expectedStep?: WorkflowStepExpectation,
+): Promise<void> {
+  const normalizedError = error.trim().slice(-10_000) || '工作流执行失败';
+  const failed = expectedStep
+    ? await ctx.workflows.updateIfCurrentStep(
+      workflowId,
+      expectedStep.stepIndex,
+      expectedStep.stepId,
+      { status: 'failed', error: normalizedError },
+    )
+    : await ctx.workflows.updateIfStatus(
+      workflowId,
+      ['ready', 'executing', 'awaiting_questions', 'awaiting_spec_confirmation', 'awaiting_doc_review'],
+      { status: 'failed', error: normalizedError },
+    );
+  if (!failed) return;
   const initiator = ctx.botsById.get(failed.initiatorBotId);
   if (initiator) {
     const msg = messageForWorkflow(failed);
-    await initiator.reply(msg.messageId, `${failed.name}已停止：${error}`, hasThread(msg)).catch(() => undefined);
+    await initiator.reply(msg.messageId, `${failed.name}已停止：${normalizedError}`, hasThread(msg)).catch(() => undefined);
   }
-  await settleWorkflowApproval(ctx, failed, 'failed', error);
-  await settleWorkflowSchedule(ctx, failed, 'failed', error);
+  await settleWorkflowApproval(ctx, failed, 'failed', normalizedError);
+  await settleWorkflowSchedule(ctx, failed, 'failed', normalizedError);
 }
 
 async function settleWorkflowApproval(

@@ -257,6 +257,7 @@ test('定时团队流水线把运行轮次写入持久化工作流', async () =>
     },
     get: () => workflow,
     update: async () => ({ ...workflow, status: 'failed' as const }),
+    updateIfStatus: async () => ({ ...workflow, status: 'failed' as const }),
   };
   const ceo = {
     id: 'ceo',

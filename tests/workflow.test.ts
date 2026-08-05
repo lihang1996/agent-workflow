@@ -3,7 +3,12 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { buildPipelineStepPrompt, DEFAULT_PIPELINE_STEPS } from '../src/core/pipeline.js';
+import {
+  buildPipelineStepPrompt,
+  DEFAULT_PIPELINE_STEPS,
+  DELIVERY_SQUAD_STEPS,
+  parsePipelineSteps,
+} from '../src/core/pipeline.js';
 import { JsonQuestionnaireStore, questionnaireMatchesContext } from '../src/core/questionnaire-store.js';
 import { JsonApprovalStore } from '../src/core/approval-store.js';
 import { JsonSpecStore } from '../src/core/spec-store.js';
@@ -14,6 +19,7 @@ import {
   confirmSpecForReview,
   reconcileWorkflowSpecStates,
   rejectSpecConfirmation,
+  runDeliverySquad,
 } from '../src/runtime/pipeline-runner.js';
 import {
   approveSpecReview,
@@ -434,12 +440,91 @@ test('同一工作流步骤只能被一个并发执行者认领', async () => {
   try {
     const store = await JsonWorkflowStore.open(join(root, 'workflows.json'));
     const workflow = await store.create({
-      kind: 'squad', name: '内部交付小队', initiatorBotId: 'dev', goal: '修复问题', stepIds: ['dev'],
+      kind: 'team', name: '交付流水线', initiatorBotId: 'dev', goal: '修复问题', stepIds: ['dev'],
       message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: '', senderOpenId: 'ou' },
     });
     const claims = await Promise.all([store.claimReady(workflow.id), store.claimReady(workflow.id)]);
     assert.equal(claims.filter(Boolean).length, 1);
     assert.equal(store.get(workflow.id)?.status, 'executing');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('内部交付小队固定完整角色且不会被流水线配置裁剪', async () => {
+  assert.deepEqual(DELIVERY_SQUAD_STEPS.map((step) => step.id), ['architect', 'dev', 'review', 'qa']);
+  assert.deepEqual(parsePipelineSteps('dev,dev,unknown,review,qa').map((step) => step.id), ['dev', 'review', 'qa']);
+  const dev = { id: 'dev' } as any;
+  await assert.rejects(
+    () => runDeliverySquad({
+      shuttingDown: false,
+      pipelineSteps: [{ id: 'dev', botId: 'dev', title: '开发实现' }],
+      botsById: new Map([['dev', dev]]),
+    } as AppContext, {
+      initiator: dev,
+      msg: {} as any,
+      goal: '修复登录问题',
+    }),
+    /缺少已连接角色：architect、reviewer、qa/,
+  );
+});
+
+test('内部交付小队持久化时拒绝缺步骤或重复步骤', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-squad-schema-'));
+  try {
+    const store = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const base = {
+      name: '内部交付小队', initiatorBotId: 'dev', goal: '修复问题',
+      message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: '', senderOpenId: 'ou' },
+    };
+    const complete = await store.create({
+      ...base,
+      kind: 'squad',
+      stepIds: ['architect', 'dev', 'review', 'qa'],
+    });
+    assert.deepEqual(complete.stepIds, ['architect', 'dev', 'review', 'qa']);
+    await assert.rejects(
+      store.create({ ...base, kind: 'squad', stepIds: ['dev'] }),
+      /完整执行/,
+    );
+    await assert.rejects(
+      store.create({ ...base, kind: 'team', stepIds: ['dev', 'dev'] }),
+      /不能重复/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('迟到的步骤回调不能重复推进或覆盖下一步骤', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-workflow-stale-callback-'));
+  try {
+    const store = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const workflow = await store.create({
+      kind: 'team', name: '交付流水线', initiatorBotId: 'dev', goal: '修复问题',
+      stepIds: ['architect', 'dev'],
+      message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: '', senderOpenId: 'ou' },
+    });
+    await store.claimReady(workflow.id);
+    const completions = await Promise.all([
+      store.completeCurrentStep(workflow.id, 0, 'architect', '方案 A'),
+      store.completeCurrentStep(workflow.id, 0, 'architect', '重复方案'),
+    ]);
+    assert.equal(completions.filter(Boolean).length, 1);
+    assert.equal(store.get(workflow.id)?.nextStepIndex, 1);
+    assert.equal(store.get(workflow.id)?.priorOutputs.architect, '方案 A');
+    assert.equal(
+      await store.updateIfCurrentStep(workflow.id, 0, 'architect', { status: 'failed', error: '迟到失败' }),
+      undefined,
+    );
+    await store.claimReady(workflow.id);
+    assert.equal(await store.completeCurrentStep(workflow.id, 0, 'architect', '更迟的结果'), undefined);
+    const failed = await store.updateIfCurrentStep(workflow.id, 1, 'dev', {
+      status: 'failed',
+      error: '开发失败',
+    });
+    assert.equal(failed?.status, 'failed');
+    assert.equal(failed?.nextStepIndex, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

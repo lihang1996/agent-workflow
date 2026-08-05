@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { z } from 'zod';
+import { DELIVERY_SQUAD_STEPS } from './pipeline.js';
 
 const WorkflowMessageSchema = z.object({
   messageId: z.string().trim().min(1).max(200),
@@ -46,6 +47,19 @@ export const DeliveryWorkflowSchema = z.object({
   createdAt: z.iso.datetime(),
   updatedAt: z.iso.datetime(),
 }).superRefine((workflow, ctx) => {
+  if (new Set(workflow.stepIds).size !== workflow.stepIds.length) {
+    ctx.addIssue({ code: 'custom', path: ['stepIds'], message: '流水线步骤不能重复' });
+  }
+  if (
+    workflow.kind === 'squad'
+    && workflow.stepIds.join(',') !== DELIVERY_SQUAD_STEPS.map((step) => step.id).join(',')
+  ) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['stepIds'],
+      message: '内部交付小队必须按“架构、开发、评审、QA”完整执行',
+    });
+  }
   if (workflow.nextStepIndex > workflow.stepIds.length) {
     ctx.addIssue({ code: 'custom', path: ['nextStepIndex'], message: '下一步骤索引超出流水线长度' });
   }
@@ -57,6 +71,7 @@ export const DeliveryWorkflowSchema = z.object({
   }
 });
 export type DeliveryWorkflow = z.infer<typeof DeliveryWorkflowSchema>;
+type WorkflowStepId = DeliveryWorkflow['stepIds'][number];
 
 type WorkflowPatch = Partial<Omit<DeliveryWorkflow, 'id' | 'createdAt'>>;
 
@@ -143,6 +158,57 @@ export class JsonWorkflowStore {
       const next = DeliveryWorkflowSchema.parse({
         ...current,
         ...patch,
+        updatedAt: new Date().toISOString(),
+      });
+      await this.replaceAndPersist(id, next);
+      return next;
+    });
+  }
+
+  /** 仅当前执行步骤仍匹配时切换状态，隔离迟到的 CLI/协作回调。 */
+  async updateIfCurrentStep(
+    id: string,
+    stepIndex: number,
+    stepId: WorkflowStepId,
+    patch: WorkflowPatch,
+  ): Promise<DeliveryWorkflow | undefined> {
+    return this.enqueueMutation(async () => {
+      const current = this.require(id);
+      if (
+        current.status !== 'executing'
+        || current.nextStepIndex !== stepIndex
+        || current.stepIds[stepIndex] !== stepId
+      ) return undefined;
+      const next = DeliveryWorkflowSchema.parse({
+        ...current,
+        ...patch,
+        updatedAt: new Date().toISOString(),
+      });
+      await this.replaceAndPersist(id, next);
+      return next;
+    });
+  }
+
+  /** 原子记录当前步骤产出并推进一次，重复成功回调不会跨过后续步骤。 */
+  async completeCurrentStep(
+    id: string,
+    stepIndex: number,
+    stepId: WorkflowStepId,
+    answer: string,
+  ): Promise<DeliveryWorkflow | undefined> {
+    return this.enqueueMutation(async () => {
+      const current = this.require(id);
+      if (
+        current.status !== 'executing'
+        || current.nextStepIndex !== stepIndex
+        || current.stepIds[stepIndex] !== stepId
+      ) return undefined;
+      const next = DeliveryWorkflowSchema.parse({
+        ...current,
+        status: 'ready',
+        nextStepIndex: stepIndex + 1,
+        priorOutputs: { ...current.priorOutputs, [stepId]: answer },
+        error: undefined,
         updatedAt: new Date().toISOString(),
       });
       await this.replaceAndPersist(id, next);

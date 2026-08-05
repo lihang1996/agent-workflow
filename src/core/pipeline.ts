@@ -19,16 +19,37 @@ export const DEFAULT_PIPELINE_STEPS: PipelineStep[] = [
   { id: 'summary', botId: 'ceo', title: '交付汇总' },
 ];
 
+/** 开发内部交付小队固定包含完整的技术交付闭环，不受 CEO 流水线裁剪配置影响。 */
+export const DELIVERY_SQUAD_STEPS: PipelineStep[] = DEFAULT_PIPELINE_STEPS.filter((step) =>
+  step.id === 'architect' || step.id === 'dev' || step.id === 'review' || step.id === 'qa');
+
 /** 解析 PIPELINE_STEPS=pm,architect,dev,review,qa,summary */
 export function parsePipelineSteps(value: string | undefined): PipelineStep[] {
   if (!value?.trim()) return DEFAULT_PIPELINE_STEPS;
   const ids = value.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
   const steps: PipelineStep[] = [];
+  const seen = new Set<PipelineStepId>();
   for (const id of ids) {
     const found = DEFAULT_PIPELINE_STEPS.find((step) => step.id === id);
-    if (found) steps.push(found);
+    if (found && !seen.has(found.id)) {
+      steps.push(found);
+      seen.add(found.id);
+    }
   }
   return steps.length > 0 ? steps : DEFAULT_PIPELINE_STEPS;
+}
+
+/** 返回一组步骤实际运行所缺少的 Bot；评审步骤同时依赖 reviewer 与 dev。 */
+export function missingBotIdsForSteps(
+  steps: readonly PipelineStep[],
+  availableBotIds: ReadonlySet<string>,
+): string[] {
+  const required = new Set<string>();
+  for (const step of steps) {
+    required.add(step.botId);
+    if (step.id === 'review') required.add('dev');
+  }
+  return [...required].filter((botId) => !availableBotIds.has(botId));
 }
 
 /** 按已连接 Bot 过滤可执行步骤（summary 始终保留给 CEO）。 */

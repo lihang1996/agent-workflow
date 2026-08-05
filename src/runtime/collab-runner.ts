@@ -22,6 +22,8 @@ export async function runCollabReview(
     priorDevResult?: string;
     executionPolicy?: CliExecutionPolicy;
     approvedScope?: string;
+    /** 流水线使用工作流 ID 隔离轮次；独立 /review 默认仍按飞书话题隔离。 */
+    stateKey?: string;
     /** 协作自然结束时回调（通过 / 触顶）；供流水线续跑。 */
     onComplete?: (result: { approved: boolean; answer: string }) => Promise<void>;
     onFailure?: (error: Error) => Promise<void>;
@@ -35,6 +37,7 @@ export async function runCollabReview(
     priorDevResult,
     executionPolicy = 'standard',
     approvedScope,
+    stateKey,
     onComplete,
     onFailure,
   } = options;
@@ -49,7 +52,7 @@ export async function runCollabReview(
     throw new Error('服务正在停止，无法启动协作');
   }
 
-  const topicKey = collabTopicKey(msg.chatId, topicIdOf(msg));
+  const topicKey = stateKey ?? collabTopicKey(msg.chatId, topicIdOf(msg));
   const reviewerSession = await ensureRunnableSession(ctx, reviewer, msg);
   if (!reviewerSession) {
     throw new Error(`${reviewer.name} 正在执行任务，请稍后再发起评审`);
@@ -152,6 +155,7 @@ export async function runCollabReview(
               priorDevResult: devAnswer,
               executionPolicy,
               approvedScope,
+              stateKey,
               onComplete,
               onFailure,
             });
