@@ -227,6 +227,38 @@ test('损坏的工作流与 Spec 记录会阻止启动', async () => {
   }
 });
 
+test('同一交付工作流只能关联一份产品 Spec', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-workflow-spec-unique-'));
+  try {
+    const specs = await JsonSpecStore.open(join(root, 'specs.json'));
+    const workflowId = '6b4ca8b5-b1f3-48e4-839f-9007ce250aa1';
+    const first = await specs.create({
+      title: '登录',
+      content: '第一版',
+      chatId: 'oc',
+      topicId: 'omt',
+      messageId: 'om',
+      ownerOpenId: 'ou',
+      botId: 'pm',
+      workflowId,
+    });
+    assert.equal(specs.findByWorkflowId(workflowId)?.id, first.id);
+    await assert.rejects(() => specs.create({
+      title: '重复方案',
+      content: '不应创建',
+      chatId: 'oc',
+      topicId: 'omt',
+      messageId: 'om',
+      ownerOpenId: 'ou',
+      botId: 'pm',
+      workflowId,
+    }), /已经关联产品 Spec/);
+    assert.equal(specs.listByTopic('oc', 'omt').length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('重启可修复已落盘工作流与审批之间的关联窗口', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agent-os-workflow-approval-link-'));
   try {

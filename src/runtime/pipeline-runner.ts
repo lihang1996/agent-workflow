@@ -218,9 +218,12 @@ async function completeProductStep(
   answer: string,
 ): Promise<void> {
   let workflow = requireWorkflow(ctx, workflowId);
+  if (!isCurrentExecutingStep(workflow, stepIndex, 'pm')) return;
   const msg = messageForWorkflow(workflow);
   const initiator = ctx.botsById.get(workflow.initiatorBotId) ?? actor;
   const questionnaire = await ctx.questionnaires.latestAwaitingForWorkflow(workflow.id);
+  workflow = requireWorkflow(ctx, workflowId);
+  if (!isCurrentExecutingStep(workflow, stepIndex, 'pm')) return;
   if (questionnaire) {
     workflow = await ctx.workflows.update(workflow.id, {
       status: 'awaiting_questions',
@@ -236,7 +239,19 @@ async function completeProductStep(
     return;
   }
 
-  const existing = workflow.specId ? ctx.specs.get(workflow.specId) : undefined;
+  const linkedById = workflow.specId ? ctx.specs.get(workflow.specId) : undefined;
+  if (workflow.specId && !linkedById) {
+    throw new Error(`工作流关联的 Spec 不存在: ${workflow.specId}`);
+  }
+  if (linkedById?.workflowId && linkedById.workflowId !== workflow.id) {
+    throw new Error(`Spec ${linkedById.id} 不属于工作流 ${workflow.id}`);
+  }
+  const recovered = ctx.specs.findByWorkflowId(workflow.id);
+  if (linkedById && recovered && linkedById.id !== recovered.id) {
+    throw new Error(`工作流 ${workflow.id} 关联了多份产品 Spec`);
+  }
+  // 修复“Spec 已写入、工作流关联尚未写入”时的重启窗口，避免重复创建方案。
+  const existing = linkedById ?? recovered;
   const handledCommentIds = new Set(
     (workflow.priorOutputs.review_comment_ids ?? '').split(',').map((id) => id.trim()).filter(Boolean),
   );
@@ -285,6 +300,16 @@ async function completeProductStep(
     `产品 Spec 已生成（${spec.id}）。确认前架构和开发步骤不会启动。`,
     hasThread(msg),
   );
+}
+
+function isCurrentExecutingStep(
+  workflow: DeliveryWorkflow,
+  stepIndex: number,
+  stepId: PipelineStep['id'],
+): boolean {
+  return workflow.status === 'executing'
+    && workflow.nextStepIndex === stepIndex
+    && workflow.stepIds[stepIndex] === stepId;
 }
 
 async function completeRegularStep(
