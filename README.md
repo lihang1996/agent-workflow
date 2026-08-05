@@ -32,11 +32,13 @@
 im/lark + message-parser
         │
         ▼
-src/index.ts（路由、命令、任务编排）
-        ├── SessionManager + JsonSessionStore
-        ├── JsonTopicStore + workdir resolver
-        ├── Claude/Codex adapter + CLI runner
-        └── 飞书文本 / 任务卡片 / 资源下载
+runtime/message-handler（命令与统一入口）
+        ├── 会话 / 话题 / CLI 任务与流式卡片
+        ├── 团队流水线 / 问卷 / Spec / 云文档评审
+        ├── 定时任务 / 日志巡检 / 高风险审批
+        └── Claude/Codex adapter + CLI runner
+
+src/index.ts（启动、恢复、后台同步与信号收尾）
 ```
 
 ### 目录说明
@@ -50,7 +52,7 @@ src/index.ts（路由、命令、任务编排）
 | `src/cli/` | Claude/Codex 适配器、事件解析和子进程运行器 |
 | `src/mcp/` | 结构化提问 MCP（propose_questions 等） |
 | `src/probe-cli.ts` | 手工检查 CLI `stream-json` 输出的探针 |
-| `data/` | 运行时生成的会话、话题目录和下载文件（不提交） |
+| `data/` | 运行时生成的会话、工作流、审批、定时任务、Spec 和下载文件（不提交） |
 
 ## 环境要求
 
@@ -86,10 +88,11 @@ cp .env.example .env
 
 ### 4. 检查并启动
 
-先执行 TypeScript 构建检查，再启动本地服务：
+先执行 TypeScript 构建和自动化测试，再启动本地服务：
 
 ```bash
 pnpm build
+pnpm test
 pnpm start
 ```
 
@@ -102,6 +105,7 @@ pnpm start:once
 ### 5. 验证启动
 
 - `pnpm build` 无报错。
+- `pnpm test` 全部通过。
 - 终端出现 `Agent OS 启动` 和至少一个 `[Bot] 已连接` 日志。
 - 在飞书私聊已连接的 Bot 发送 `/help` 或 `/status`，确认收到回复。
 - 群聊中需要先 @ 对应 Bot；项目没有 HTTP 服务或固定端口，验证方式以启动日志和飞书消息回复为准。
@@ -234,12 +238,13 @@ CEO 统一入口 → MCP 结构化问题 → /form 点选澄清
 1. 在 `src/cli/` 实现新的 `CliAdapter`（参数构造和流式事件解析）。
 2. 在 `src/cli/registry.ts` 注册引擎。
 3. 如需新的飞书消息类型，在 `src/im/message-parser.ts` 和 `src/im/lark.ts` 扩展解析/下载逻辑。
-4. 修改命令时同步更新 `src/core/command-parser.ts`、`src/index.ts` 的帮助文本和本文档。
+4. 修改命令时同步更新 `src/core/command-parser.ts`、`src/runtime/message-handler.ts` 的帮助文本和本文档。
 
 提交前建议执行：
 
 ```bash
 pnpm build
+pnpm test
 ```
 
 ## 故障排查

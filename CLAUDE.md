@@ -5,7 +5,7 @@
 
 ## 运行
 
-pnpm dev（tsx watch）/ pnpm start / pnpm build
+pnpm dev（tsx watch）/ pnpm start / pnpm build / pnpm test
 
 ## 约定
 
@@ -25,8 +25,10 @@ pnpm dev（tsx watch）/ pnpm start / pnpm build
 - 同话题交接：`/handoff <角色> <任务>` 进程内交给目标 Bot 执行（不依赖飞书 bot 互 @），目标忙时拒绝。
 - 协作轮次：`/review <任务>` 走 reviewer→dev 自动回传；评审含 `[APPROVED]` 则结束；上限由 `COLLAB_MAX_ROUNDS`（默认 2）控制。
 - `tsx watch` 热重启会掐断进行中的 CLI → 卡片停在「运行中」；需 SIGTERM 收尾 + `data/active-runs.json` 启动时把遗留卡片标失败。长任务可用 `pnpm start:once`。
-- 停机收尾：成功态不可被盖红；发卡后同步落盘；停机禁止 onSuccess 续跑；协作轮次落 `data/collab-rounds.json`；CLI 用进程组杀掉孙子进程。
+- 停机收尾：成功态不可被盖红；发卡后同步落盘；停机前尚未启动的 onSuccess 不再启动，已经开始的工作流续跑纳入宽限等待；协作轮次落 `data/collab-rounds.json`；CLI 用进程组杀掉孙子进程。
 - CEO 团队流水线：`/pipeline <目标>` 仅 CEO 可启；默认 PM→架构→开发→评审→测试→汇总；可用 `PIPELINE_STEPS` 裁剪。
 - CEO 统一入口：`@CEO助手` 发自然语言目标（非斜杠命令）会直接启动流水线；专家 Bot 的 `/help` 引导先找 CEO。
 - 运行主线在 `src/runtime/`（消息路由 / CLI 任务 / 协作 / 流水线）；`src/index.ts` 只做启动与信号。
 - 结构化提问 MCP：`propose_questions` → `record_answers`；Claude 用 `--mcp-config`，Codex 用 `-c mcp_servers.*`；server 用绝对路径 `--import …/tsx/dist/loader.mjs` + `AGENT_OS_ROOT`。
+- 产品闭环：PM 提问卡 → Spec 确认 → 同一份飞书云文档评审/修订 → 架构、开发、代码评审、QA；人工等待节点和云文档评论均可跨重启恢复。
+- 主动式 Agent：`/schedule` 持久化普通任务、团队流水线和只读日志巡检；高风险动作必须通过绑定原卡片和负责人的审批门，真实终态再回写定时任务。
