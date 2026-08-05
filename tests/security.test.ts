@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { isAuthorizedOperator } from '../src/core/access.js';
 import { JsonApprovalStore, type ApprovalRequest } from '../src/core/approval-store.js';
+import { SessionManager } from '../src/core/session-manager.js';
 import {
   assertLogFile,
   buildLogInspectionPrompt,
@@ -23,7 +24,7 @@ import type { Bot, IncomingMessage } from '../src/im/lark.js';
 import type { AppContext } from '../src/runtime/app-context.js';
 import { requestHighRiskApproval } from '../src/runtime/approval-runner.js';
 import { createApp, type CreateAppDeps } from '../src/runtime/create-app.js';
-import { handleCardAction } from '../src/runtime/message-handler.js';
+import { handleCardAction, handleMessage } from '../src/runtime/message-handler.js';
 import { scheduleRequiresApproval } from '../src/runtime/scheduler.js';
 
 async function bindApprovalCard(
@@ -268,6 +269,34 @@ test('重复消息只发送一张审批卡，发卡失败后审批立即失效',
     }), /飞书不可用/);
     const failed = approvals.list().find((approval) => approval.message.messageId === failedMsg.messageId);
     assert.equal(failed?.status, 'expired');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('新话题等待高风险审批时不会卡在创建中', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-approval-session-'));
+  try {
+    const approvals = await JsonApprovalStore.open(join(root, 'approvals.json'));
+    const sessions = new SessionManager({ createId: () => 'approval-session' });
+    const senderOpenId = process.env.OWNER_OPEN_ID?.trim()
+      || process.env.AGENT_OS_ALLOWED_OPEN_IDS?.split(/[\s,]+/).find(Boolean)
+      || 'ou_owner';
+    const bot = {
+      id: 'dev', name: '开发工程师', openId: 'ou_bot',
+      replyCard: async () => 'om-approval-card',
+      reply: async () => 'om-reply',
+    } as unknown as Bot;
+    const msg = {
+      messageId: 'om-risk', topicId: 'omt-risk', chatId: 'oc-risk', chatType: 'p2p',
+      messageType: 'text', text: '删除生产数据库', rawContent: '{"text":"删除生产数据库"}',
+      rootId: '', threadId: '', senderOpenId, senderType: 'user', mentions: [],
+    } satisfies IncomingMessage;
+
+    await handleMessage({ approvals, sessions } as unknown as AppContext, msg, bot);
+
+    assert.equal(sessions.listByTopic(msg.chatId, msg.topicId)[0]?.status, 'idle');
+    assert.equal(approvals.list()[0]?.status, 'pending');
   } finally {
     await rm(root, { recursive: true, force: true });
   }

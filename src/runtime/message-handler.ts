@@ -91,7 +91,7 @@ export async function handleMessage(
   const command = parseCommand(resolved);
   // 新话题首条消息是命令时不会启动 CLI，先结束 creating 状态，避免后续任务永久被挡住。
   if (command && session.status === 'creating') {
-    session = await ctx.sessions.transition(session.id, 'idle');
+    session = await releaseCreatingSession(ctx, session);
   }
   if (command?.name === 'help') {
     await bot.reply(msg.messageId, buildHelpText(bot), hasThread);
@@ -653,6 +653,7 @@ export async function handleMessage(
 
   // CEO 统一入口：自然语言目标直接进团队流水线（仍可用 /pipeline 显式启动）。
   if (bot.id === 'ceo') {
+    session = await releaseCreatingSession(ctx, session);
     const goal = resolved.trim();
     if (!goal) {
       await bot.reply(
@@ -685,6 +686,7 @@ export async function handleMessage(
   }
 
   if (isHighRiskTask(resolved)) {
+    session = await releaseCreatingSession(ctx, session);
     try {
       await requestHighRiskApproval(ctx, {
         bot,
@@ -993,6 +995,16 @@ export async function handleCardAction(
 /** 指定负责人优先；未指定时由提出需求的人确认。 */
 function assertSpecOwner(specOwnerOpenId: string, operatorOpenId: string): void {
   assertOwnedBy(specOwnerOpenId, operatorOpenId);
+}
+
+async function releaseCreatingSession(
+  ctx: AppContext,
+  session: import('../core/session-manager.js').Session,
+): Promise<import('../core/session-manager.js').Session> {
+  const latest = ctx.sessions.get(session.id) ?? session;
+  return latest.status === 'creating'
+    ? ctx.sessions.transition(latest.id, 'idle')
+    : latest;
 }
 
 function assertCurrentSpecCard(
