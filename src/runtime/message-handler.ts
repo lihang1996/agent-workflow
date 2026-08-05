@@ -73,7 +73,7 @@ export async function handleMessage(
 
   const resolved = resolveMentions(msg.text, msg.mentions);
   const hasThread = !!msg.threadId || !!msg.rootId;
-  const { session, isNew } = await ctx.sessions.resolve({
+  let { session, isNew } = await ctx.sessions.resolve({
     messageId: msg.messageId,
     topicId: topicIdOf(msg),
     chatId: msg.chatId,
@@ -89,6 +89,10 @@ export async function handleMessage(
   console.log(`  [会话] ${isNew ? '新建' : '复用'} id=${session.id} status=${session.status} engine=${session.cliId}`);
 
   const command = parseCommand(resolved);
+  // 新话题首条消息是命令时不会启动 CLI，先结束 creating 状态，避免后续任务永久被挡住。
+  if (command && session.status === 'creating') {
+    session = await ctx.sessions.transition(session.id, 'idle');
+  }
   if (command?.name === 'help') {
     await bot.reply(msg.messageId, buildHelpText(bot), hasThread);
     return;

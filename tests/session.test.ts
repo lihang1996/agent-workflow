@@ -10,6 +10,7 @@ import { JsonTopicStore } from '../src/core/topic-store.js';
 import type { AppContext } from '../src/runtime/app-context.js';
 import { persistActiveRuns, reconcileOrphanedCards } from '../src/runtime/active-runs.js';
 import { ensureRunnableSession } from '../src/runtime/sessions.js';
+import { handleMessage } from '../src/runtime/message-handler.js';
 import type { Bot, IncomingMessage } from '../src/im/lark.js';
 
 function closedSession(): Session {
@@ -104,6 +105,28 @@ test('内部触发消息沿用原话题会话而不是触发消息 ID', async ()
   } satisfies IncomingMessage);
   assert.equal(first?.threadId, 'om-original-topic');
   assert.equal(second?.id, first?.id);
+});
+
+test('新话题首条帮助命令结束后会话可继续执行任务', async () => {
+  const sessions = new SessionManager({ createId: () => 'help-session' });
+  const senderOpenId = process.env.OWNER_OPEN_ID?.trim()
+    || process.env.AGENT_OS_ALLOWED_OPEN_IDS?.split(/[\s,]+/).find(Boolean)
+    || 'ou_owner';
+  const replies: string[] = [];
+  const bot = {
+    id: 'dev', name: '开发工程师', openId: 'ou_bot',
+    reply: async (_messageId: string, text: string) => { replies.push(text); },
+  } as unknown as Bot;
+  const msg = {
+    messageId: 'om-help', topicId: 'omt-help', chatId: 'oc-help', chatType: 'p2p',
+    messageType: 'text', text: '/help', rawContent: '{"text":"/help"}',
+    rootId: '', threadId: '', senderOpenId, senderType: 'user', mentions: [],
+  } satisfies IncomingMessage;
+
+  await handleMessage({ sessions } as unknown as AppContext, msg, bot);
+
+  assert.equal(sessions.listByTopic(msg.chatId, msg.topicId)[0]?.status, 'idle');
+  assert.match(replies[0] ?? '', /\/status/);
 });
 
 test('损坏会话记录会明确报错且不会被静默覆盖', async () => {

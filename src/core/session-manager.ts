@@ -38,7 +38,7 @@ export interface SessionManagerOptions {
 }
 
 const ALLOWED_TRANSITIONS: Record<SessionStatus, SessionStatus[]> = {
-  creating: ['active', 'closed'],
+  creating: ['active', 'idle', 'closed'],
   active: ['idle', 'closed'],
   idle: ['active', 'closed'],
   closed: [],
