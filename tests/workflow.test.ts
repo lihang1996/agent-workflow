@@ -8,7 +8,7 @@ import { JsonQuestionnaireStore, questionnaireMatchesContext } from '../src/core
 import { JsonApprovalStore } from '../src/core/approval-store.js';
 import { JsonSpecStore } from '../src/core/spec-store.js';
 import { JsonWorkflowStore } from '../src/core/workflow-store.js';
-import { normalizeDocumentMarkdown, partitionConvertedBlocks } from '../src/im/lark.js';
+import { CreatedDocumentWriteError, normalizeDocumentMarkdown, partitionConvertedBlocks } from '../src/im/lark.js';
 import { buildQuestionnaireCard, buildSpecConfirmationCard, buildSpecReviewCard } from '../src/im/workflow-card.js';
 import {
   confirmSpecForReview,
@@ -459,6 +459,11 @@ test('Spec 修订发布覆盖原云文档且不创建新链接', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agent-os-spec-update-'));
   try {
     const specs = await JsonSpecStore.open(join(root, 'specs.json'));
+    const workflows = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const workflow = await workflows.create({
+      kind: 'team', name: '团队交付流水线', initiatorBotId: 'ceo', goal: '登录', stepIds: ['pm'],
+      message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt', senderOpenId: 'ou' },
+    });
     const created = await specs.create({
       title: '登录',
       content: '新版 Spec',
@@ -469,8 +474,10 @@ test('Spec 修订发布覆盖原云文档且不创建新链接', async () => {
       botId: 'pm',
       docId: 'doc-existing',
       docUrl: 'https://feishu.cn/docx/doc-existing',
+      workflowId: workflow.id,
     });
     await specs.update(created.id, { status: 'confirmed' });
+    await workflows.update(workflow.id, { status: 'awaiting_doc_review', specId: created.id, nextStepIndex: 1 });
     const calls: string[] = [];
     const bot = {
       id: 'pm',
@@ -484,10 +491,90 @@ test('Spec 修订发布覆盖原云文档且不创建新链接', async () => {
     } as any;
     const published = await publishSpecToDoc({
       specs,
+      workflows,
       botsById: new Map([['pm', bot]]),
     } as AppContext, created.id);
     assert.deepEqual(calls, ['update:doc-existing:新版 Spec']);
     assert.equal(published.docId, 'doc-existing');
+    assert.equal(published.status, 'in_review');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('并发发布同一 Spec 只创建一份飞书云文档', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-spec-publish-race-'));
+  try {
+    const specs = await JsonSpecStore.open(join(root, 'specs.json'));
+    const workflows = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const workflow = await workflows.create({
+      kind: 'team', name: '团队交付流水线', initiatorBotId: 'ceo', goal: '登录', stepIds: ['pm'],
+      message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt', senderOpenId: 'ou' },
+    });
+    const spec = await specs.create({
+      title: '登录', content: '最终 Spec', chatId: 'oc', topicId: 'omt', messageId: 'om',
+      ownerOpenId: 'ou', botId: 'pm', workflowId: workflow.id,
+    });
+    await specs.update(spec.id, { status: 'confirmed' });
+    await workflows.update(workflow.id, { status: 'awaiting_doc_review', specId: spec.id, nextStepIndex: 1 });
+    let creates = 0;
+    const bot = {
+      id: 'pm',
+      createDocument: async () => {
+        creates += 1;
+        return { documentId: 'doc-once', url: 'https://feishu.cn/docx/doc-once' };
+      },
+    } as any;
+    const ctx = { specs, workflows, botsById: new Map([['pm', bot]]) } as AppContext;
+    const [first, second] = await Promise.all([
+      publishSpecToDoc(ctx, spec.id),
+      publishSpecToDoc(ctx, spec.id),
+    ]);
+    assert.equal(creates, 1);
+    assert.equal(first.docId, 'doc-once');
+    assert.equal(second.docId, 'doc-once');
+    assert.equal(specs.get(spec.id)?.status, 'in_review');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('云文档正文首次写入失败后重试复用原文档', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-spec-publish-recover-'));
+  try {
+    const specs = await JsonSpecStore.open(join(root, 'specs.json'));
+    const workflows = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const workflow = await workflows.create({
+      kind: 'team', name: '团队交付流水线', initiatorBotId: 'ceo', goal: '登录', stepIds: ['pm'],
+      message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt', senderOpenId: 'ou' },
+    });
+    const spec = await specs.create({
+      title: '登录', content: '最终 Spec', chatId: 'oc', topicId: 'omt', messageId: 'om',
+      ownerOpenId: 'ou', botId: 'pm', workflowId: workflow.id,
+    });
+    await specs.update(spec.id, { status: 'confirmed' });
+    await workflows.update(workflow.id, { status: 'awaiting_doc_review', specId: spec.id, nextStepIndex: 1 });
+    let creates = 0;
+    const updates: string[] = [];
+    const bot = {
+      id: 'pm',
+      createDocument: async () => {
+        creates += 1;
+        throw new CreatedDocumentWriteError(
+          'doc-recover',
+          'https://feishu.cn/docx/doc-recover',
+          new Error('写入失败'),
+        );
+      },
+      updateDocument: async (documentId: string) => { updates.push(documentId); },
+    } as any;
+    const ctx = { specs, workflows, botsById: new Map([['pm', bot]]) } as AppContext;
+    await assert.rejects(() => publishSpecToDoc(ctx, spec.id), /请重试/);
+    assert.equal(specs.get(spec.id)?.docId, 'doc-recover');
+    assert.equal(specs.get(spec.id)?.status, 'confirmed');
+    const published = await publishSpecToDoc(ctx, spec.id);
+    assert.equal(creates, 1);
+    assert.deepEqual(updates, ['doc-recover']);
     assert.equal(published.status, 'in_review');
   } finally {
     await rm(root, { recursive: true, force: true });

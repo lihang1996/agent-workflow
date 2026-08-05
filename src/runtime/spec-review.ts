@@ -1,5 +1,10 @@
 import type { ProductSpec } from '../core/spec-store.js';
-import type { Bot, DocumentComment, DocumentCommentEvent } from '../im/lark.js';
+import {
+  CreatedDocumentWriteError,
+  type Bot,
+  type DocumentComment,
+  type DocumentCommentEvent,
+} from '../im/lark.js';
 import { buildSpecReviewCard } from '../im/workflow-card.js';
 import type { AppContext } from './app-context.js';
 import {
@@ -9,6 +14,7 @@ import {
 
 export const CARD_REVIEW_COMMENT_PREFIX = '[Agent OS 卡片评审]';
 const DEFAULT_SYNC_INTERVAL_MS = 60_000;
+const specOperationTails = new Map<string, Promise<void>>();
 
 function syncIntervalMs(): number {
   const parsed = Number(process.env.SPEC_REVIEW_SYNC_INTERVAL_MS);
@@ -66,8 +72,18 @@ async function applyReviewComments(
 
 /** 已确认 Spec 首次创建云文档；修订后覆盖原文档，链接保持不变。 */
 export async function publishSpecToDoc(ctx: AppContext, specId: string): Promise<ProductSpec> {
+  return runSerialSpecOperation(specId, () => publishSpecToDocUnlocked(ctx, specId));
+}
+
+async function publishSpecToDocUnlocked(ctx: AppContext, specId: string): Promise<ProductSpec> {
   const spec = ctx.specs.get(specId);
   if (!spec) throw new Error(`Spec 不存在: ${specId}`);
+  if (!spec.workflowId) throw new Error(`Spec ${spec.id} 没有关联交付工作流。`);
+  const workflow = ctx.workflows.get(spec.workflowId);
+  if (!workflow || workflow.status !== 'awaiting_doc_review' || workflow.specId !== spec.id) {
+    throw new Error('交付工作流不在云文档评审节点，不能发布产品方案。');
+  }
+  if (spec.status === 'in_review' && spec.docId) return spec;
   if (spec.status !== 'confirmed') {
     throw new Error(`当前 Spec 状态为 ${spec.status}，仅已确认方案可以发布。`);
   }
@@ -79,18 +95,44 @@ export async function publishSpecToDoc(ctx: AppContext, specId: string): Promise
 
   if (spec.docId) {
     await bot.updateDocument(spec.docId, spec.content);
-    return ctx.specs.update(spec.id, {
+    const updated = await ctx.specs.updateIfStatus(spec.id, 'confirmed', {
       status: 'in_review',
       docUrl: spec.docUrl ?? `https://feishu.cn/docx/${spec.docId}`,
     });
+    if (!updated) throw new Error('Spec 状态已变化，云文档修订结果未写入。');
+    return updated;
   }
 
-  const document = await bot.createDocument(`产品 Spec · ${spec.title}`, spec.content);
-  return ctx.specs.update(spec.id, {
-    status: 'in_review',
-    docId: document.documentId,
-    docUrl: document.url,
+  try {
+    const document = await bot.createDocument(`产品 Spec · ${spec.title}`, spec.content);
+    const updated = await ctx.specs.updateIfStatus(spec.id, 'confirmed', {
+      status: 'in_review',
+      docId: document.documentId,
+      docUrl: document.url,
+    });
+    if (!updated) throw new Error('Spec 状态已变化，云文档发布结果未写入。');
+    return updated;
+  } catch (error) {
+    if (error instanceof CreatedDocumentWriteError) {
+      await ctx.specs.updateIfStatus(spec.id, 'confirmed', {
+        docId: error.documentId,
+        docUrl: error.url,
+      });
+      throw new Error('云文档已创建但正文写入失败；请重试，系统会继续写入同一份文档。', { cause: error });
+    }
+    throw error;
+  }
+}
+
+function runSerialSpecOperation<T>(specId: string, operation: () => Promise<T>): Promise<T> {
+  const previous = specOperationTails.get(specId) ?? Promise.resolve();
+  const run = previous.then(operation, operation);
+  const tail = run.then(() => undefined, () => undefined);
+  specOperationTails.set(specId, tail);
+  void tail.then(() => {
+    if (specOperationTails.get(specId) === tail) specOperationTails.delete(specId);
   });
+  return run;
 }
 
 /** 校验工作流后落产品评审结果；续跑失败时恢复为可重试的评审中状态。 */

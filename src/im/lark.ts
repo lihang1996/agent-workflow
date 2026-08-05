@@ -2,7 +2,7 @@
  * 飞书接入：WS 长连接收消息 + REST 回消息。
  */
 import * as Lark from '@larksuiteoapi/node-sdk';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { extname, join } from 'node:path';
 import type { BotConfig } from '../core/bot-config.js';
@@ -65,6 +65,18 @@ export interface DocumentComment {
   authorOpenId: string;
   content: string;
   resolved: boolean;
+}
+
+/** 文档实体已创建、但正文写入失败；调用方应保存 documentId 并在重试时覆盖该文档。 */
+export class CreatedDocumentWriteError extends Error {
+  constructor(
+    readonly documentId: string,
+    readonly url: string,
+    cause: unknown,
+  ) {
+    super(`飞书云文档 ${documentId} 已创建，但正文写入失败`, { cause });
+    this.name = 'CreatedDocumentWriteError';
+  }
 }
 
 /** 解析飞书 card.action.trigger 事件。 */
@@ -315,11 +327,13 @@ async function insertDocumentBatches(
   documentId: string,
   batches: ConvertedBatch[],
   startIndex: number,
+  operationToken: string,
 ): Promise<void> {
   let index = startIndex;
-  for (const batch of batches) {
+  for (const [batchIndex, batch] of batches.entries()) {
     await withFeishuRetry('写入飞书云文档内容', () => client.docx.v1.documentBlockDescendant.create({
       path: { document_id: documentId, block_id: documentId },
+      params: { client_token: documentClientToken(operationToken, `insert:${batchIndex}`) },
       data: {
         children_id: batch.childrenIds,
         descendants: batch.blocks as any,
@@ -333,15 +347,21 @@ async function insertDocumentBatches(
 /** 先追加新内容再删除旧内容，写入失败时不会把原文档清空。 */
 async function replaceDocumentMarkdown(client: Lark.Client, documentId: string, markdown: string): Promise<void> {
   if (!markdown.trim()) throw new Error('飞书云文档内容不能为空');
+  const operationToken = randomUUID();
   const batches = await convertDocumentMarkdown(client, markdown);
   const oldChildCount = await documentRootChildCount(client, documentId);
-  await insertDocumentBatches(client, documentId, batches, oldChildCount);
+  await insertDocumentBatches(client, documentId, batches, oldChildCount, operationToken);
   if (oldChildCount > 0) {
     await withFeishuRetry('移除飞书云文档旧版本', () => client.docx.v1.documentBlockChildren.batchDelete({
       path: { document_id: documentId, block_id: documentId },
+      params: { client_token: documentClientToken(operationToken, 'delete-old') },
       data: { start_index: 0, end_index: oldChildCount },
     }));
   }
+}
+
+function documentClientToken(operationToken: string, step: string): string {
+  return createHash('sha256').update(`${operationToken}\0${step}`).digest('hex');
 }
 
 /** 兼容 Headers / 普通对象取响应头。 */
@@ -478,8 +498,13 @@ export async function startBot(opts: BotOptions): Promise<Bot> {
       if (typeof documentId !== 'string' || !documentId) {
         throw new Error('飞书云文档创建成功但未返回 document_id');
       }
-      await insertDocumentBatches(client, documentId, batches, 0);
-      return { documentId, url: `https://feishu.cn/docx/${documentId}` };
+      const url = `https://feishu.cn/docx/${documentId}`;
+      try {
+        await insertDocumentBatches(client, documentId, batches, 0, `${documentId}:initial`);
+      } catch (error) {
+        throw new CreatedDocumentWriteError(documentId, url, error);
+      }
+      return { documentId, url };
     },
 
     /** 修订时覆盖同一份云文档，保持评审链接不变。 */
