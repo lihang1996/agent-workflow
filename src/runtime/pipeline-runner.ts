@@ -5,6 +5,7 @@ import {
   type PipelineStep,
 } from '../core/pipeline.js';
 import type { DeliveryWorkflow } from '../core/workflow-store.js';
+import type { ProductSpec } from '../core/spec-store.js';
 import { buildQuestionnaireCard, buildSpecConfirmationCard } from '../im/workflow-card.js';
 import type { Bot, IncomingMessage } from '../im/lark.js';
 import type { AppContext } from './app-context.js';
@@ -268,6 +269,7 @@ async function completeProductStep(
       content: answer,
       status: 'pending_confirmation',
       questionnaireId: workflow.questionnaireId,
+      confirmationFeedback: undefined,
     })
     : await ctx.specs.create({
       title: workflow.goal.slice(0, 80),
@@ -348,13 +350,72 @@ export async function resumeWorkflowAfterQuestionnaire(ctx: AppContext, question
   await continueDeliveryWorkflow(ctx, workflow.id);
 }
 
-/** Spec 确认后进入云文档评审等待；评审通过前不启动开发步骤。 */
-export async function resumeWorkflowAfterSpecConfirmation(ctx: AppContext, specId: string): Promise<void> {
+/** 原子确认 Spec，并把交付工作流推进到云文档评审等待。 */
+export async function confirmSpecForReview(ctx: AppContext, specId: string) {
   const spec = ctx.specs.get(specId);
-  if (!spec?.workflowId || spec.status !== 'confirmed') return;
+  if (!spec) throw new Error(`Spec 不存在: ${specId}`);
+  if (!spec.workflowId) throw new Error(`Spec ${spec.id} 没有关联交付工作流。`);
   const workflow = requireWorkflow(ctx, spec.workflowId);
-  if (workflow.status !== 'awaiting_spec_confirmation' || workflow.specId !== spec.id) return;
-  await ctx.workflows.update(workflow.id, { status: 'awaiting_doc_review', error: undefined });
+  if (workflow.status !== 'awaiting_spec_confirmation' || workflow.specId !== spec.id) {
+    throw new Error('交付工作流不在方案确认节点。');
+  }
+  const confirmed = await ctx.specs.updateIfStatus(spec.id, 'pending_confirmation', {
+    status: 'confirmed',
+    confirmationFeedback: undefined,
+  });
+  if (!confirmed) throw new Error(`Spec 当前状态为 ${ctx.specs.get(spec.id)?.status ?? 'unknown'}，无法重复确认。`);
+  try {
+    const transitioned = await ctx.workflows.updateIfStatus(workflow.id, 'awaiting_spec_confirmation', {
+      status: 'awaiting_doc_review',
+      error: undefined,
+    });
+    if (!transitioned || transitioned.specId !== confirmed.id) {
+      throw new Error('交付工作流状态已变化，方案确认未生效。');
+    }
+    return confirmed;
+  } catch (error) {
+    await ctx.specs.updateIfStatus(confirmed.id, 'confirmed', { status: 'pending_confirmation' })
+      .catch((rollbackError) => {
+        console.error(`[工作流] 回滚 Spec ${confirmed.id} 确认状态失败:`, (rollbackError as Error).message);
+      });
+    throw error;
+  }
+}
+
+/** 记录退回意见并把工作流安全地放回 PM 步骤；调用方再异步启动该步骤。 */
+export async function rejectSpecConfirmation(
+  ctx: AppContext,
+  specId: string,
+  feedback: string,
+): Promise<{ spec: ProductSpec; workflowId: string }> {
+  const normalized = feedback.trim();
+  if (!normalized) throw new Error('退回修改时请填写具体意见。');
+  if (normalized.length > 4_000) throw new Error('退回意见不能超过 4000 字。');
+  const spec = ctx.specs.get(specId);
+  if (!spec) throw new Error(`Spec 不存在: ${specId}`);
+  if (!spec.workflowId) throw new Error(`Spec ${spec.id} 没有关联交付工作流。`);
+  const workflow = requireWorkflow(ctx, spec.workflowId);
+  if (workflow.status !== 'awaiting_spec_confirmation' || workflow.specId !== spec.id) {
+    throw new Error('交付工作流不在方案确认节点。');
+  }
+  const changed = await ctx.specs.updateIfStatus(spec.id, 'pending_confirmation', {
+    status: 'changes_requested',
+    confirmationFeedback: normalized,
+  });
+  if (!changed) throw new Error(`Spec 当前状态为 ${ctx.specs.get(spec.id)?.status ?? 'unknown'}，无法重复退回。`);
+  try {
+    const transitioned = await prepareWorkflowForSpecRevision(ctx, changed, normalized, [], 'awaiting_spec_confirmation');
+    if (!transitioned) throw new Error('交付工作流状态已变化，方案退回未生效。');
+    return { spec: changed, workflowId: workflow.id };
+  } catch (error) {
+    await ctx.specs.updateIfStatus(changed.id, 'changes_requested', {
+      status: 'pending_confirmation',
+      confirmationFeedback: undefined,
+    }).catch((rollbackError) => {
+      console.error(`[工作流] 回滚 Spec ${changed.id} 退回状态失败:`, (rollbackError as Error).message);
+    });
+    throw error;
+  }
 }
 
 /** Spec 被退回时回到 PM 步骤，根据确认意见生成同一份 Spec 的修订版。 */
@@ -367,9 +428,30 @@ export async function resumeWorkflowForSpecRevision(
   const spec = ctx.specs.get(specId);
   if (!spec?.workflowId) return;
   const workflow = requireWorkflow(ctx, spec.workflowId);
+  const transitioned = await prepareWorkflowForSpecRevision(
+    ctx,
+    spec,
+    feedback,
+    commentIds,
+    ['awaiting_spec_confirmation', 'awaiting_doc_review'],
+  );
+  if (!transitioned) return;
+  await continueDeliveryWorkflow(ctx, workflow.id);
+}
+
+async function prepareWorkflowForSpecRevision(
+  ctx: AppContext,
+  spec: ProductSpec,
+  feedback: string,
+  commentIds: string[],
+  expectedStatus: DeliveryWorkflow['status'] | readonly DeliveryWorkflow['status'][],
+): Promise<DeliveryWorkflow | undefined> {
+  if (!spec.workflowId) return undefined;
+  const workflow = requireWorkflow(ctx, spec.workflowId);
+  if (workflow.specId !== spec.id) throw new Error('Spec 与交付工作流关联不一致。');
   const pmIndex = workflow.stepIds.indexOf('pm');
   if (pmIndex < 0) throw new Error('当前工作流没有产品经理步骤。');
-  await ctx.workflows.update(workflow.id, {
+  return ctx.workflows.updateIfStatus(workflow.id, expectedStatus, {
     status: 'ready',
     nextStepIndex: pmIndex,
     priorOutputs: {
@@ -380,7 +462,6 @@ export async function resumeWorkflowForSpecRevision(
     },
     error: undefined,
   });
-  await continueDeliveryWorkflow(ctx, workflow.id);
 }
 
 /** 产品评审通过后，启动架构、开发、评审和 QA 内部交付步骤。 */
@@ -404,6 +485,7 @@ export async function resumeWorkflowAfterProductReview(ctx: AppContext, specId: 
 /** 服务重启后恢复尚未进入人工等待节点的流水线。 */
 export async function resumeRecoverableWorkflows(ctx: AppContext): Promise<void> {
   await reconcileWorkflowSchedules(ctx);
+  await reconcileWorkflowSpecStates(ctx);
   for (const workflow of ctx.workflows.listRecoverable()) {
     try {
       if (workflow.status === 'executing') {
@@ -417,6 +499,33 @@ export async function resumeRecoverableWorkflows(ctx: AppContext): Promise<void>
       await failWorkflow(ctx, workflow.id, `恢复失败：${(error as Error).message}`).catch((failError) => {
         console.error(`[工作流] ${workflow.id} 保存恢复失败状态异常:`, (failError as Error).message);
       });
+    }
+  }
+}
+
+/** 修复 Spec 与工作流分文件写入之间的进程中断窗口。 */
+export async function reconcileWorkflowSpecStates(ctx: AppContext): Promise<void> {
+  for (const workflow of ctx.workflows.list()) {
+    if (workflow.status !== 'awaiting_spec_confirmation' || !workflow.specId) continue;
+    const spec = ctx.specs.get(workflow.specId);
+    if (!spec || spec.workflowId !== workflow.id) {
+      throw new Error(`工作流 ${workflow.id} 的 Spec 关联损坏。`);
+    }
+    if (spec.status === 'confirmed' || spec.status === 'published' || spec.status === 'in_review' || spec.status === 'approved') {
+      await ctx.workflows.updateIfStatus(workflow.id, 'awaiting_spec_confirmation', {
+        status: 'awaiting_doc_review',
+        error: undefined,
+      });
+      continue;
+    }
+    if (spec.status === 'changes_requested' && spec.confirmationFeedback) {
+      await prepareWorkflowForSpecRevision(
+        ctx,
+        spec,
+        spec.confirmationFeedback,
+        [],
+        'awaiting_spec_confirmation',
+      );
     }
   }
 }

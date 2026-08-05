@@ -28,9 +28,10 @@ import { runCollabReview } from './collab-runner.js';
 import {
   runDeliverySquad,
   runTeamPipeline,
+  confirmSpecForReview,
+  continueDeliveryWorkflow,
+  rejectSpecConfirmation,
   resumeWorkflowAfterQuestionnaire,
-  resumeWorkflowAfterSpecConfirmation,
-  resumeWorkflowForSpecRevision,
 } from './pipeline-runner.js';
 import { approveSpecReview, publishSpecToDoc, requestSpecChangesFromCard } from './spec-review.js';
 import { executeApprovedAction, requestHighRiskApproval } from './approval-runner.js';
@@ -871,17 +872,14 @@ export async function handleCardAction(
       if (!confirmed && !feedback) {
         return { toast: { type: 'warning' as const, content: '退回修改时请填写具体意见。' } };
       }
-      const updated = await ctx.specs.update(spec.id, {
-        status: confirmed ? 'confirmed' : 'changes_requested',
-      });
-      if (confirmed) {
+      const updated = confirmed
+        ? await confirmSpecForReview(ctx, spec.id)
+        : (await rejectSpecConfirmation(ctx, spec.id, feedback)).spec;
+      if (!confirmed) {
+        const workflowId = updated.workflowId;
+        if (!workflowId) throw new Error(`Spec ${updated.id} 没有关联交付工作流。`);
         runWorkflowContinuation(
-          resumeWorkflowAfterSpecConfirmation(ctx, updated.id),
-          `恢复 Spec ${updated.id} 后续步骤`,
-        );
-      } else {
-        runWorkflowContinuation(
-          resumeWorkflowForSpecRevision(ctx, updated.id, feedback),
+          continueDeliveryWorkflow(ctx, workflowId),
           `退回 Spec ${updated.id} 给产品经理`,
         );
       }

@@ -10,7 +10,12 @@ import { JsonSpecStore } from '../src/core/spec-store.js';
 import { JsonWorkflowStore } from '../src/core/workflow-store.js';
 import { normalizeDocumentMarkdown, partitionConvertedBlocks } from '../src/im/lark.js';
 import { buildQuestionnaireCard, buildSpecConfirmationCard, buildSpecReviewCard } from '../src/im/workflow-card.js';
-import { resumeWorkflowAfterProductReview } from '../src/runtime/pipeline-runner.js';
+import {
+  confirmSpecForReview,
+  reconcileWorkflowSpecStates,
+  rejectSpecConfirmation,
+  resumeWorkflowAfterProductReview,
+} from '../src/runtime/pipeline-runner.js';
 import { publishSpecToDoc } from '../src/runtime/spec-review.js';
 import { reconcileApprovalExecutions } from '../src/runtime/approval-status.js';
 import type { AppContext } from '../src/runtime/app-context.js';
@@ -353,6 +358,67 @@ test('工作流支持在云文档评审节点暂停', async () => {
     const waiting = await store.update(workflow.id, { status: 'awaiting_doc_review', nextStepIndex: 1 });
     assert.equal(waiting.status, 'awaiting_doc_review');
     assert.equal(store.listRecoverable().length, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('方案确认与退回并发时只能有一个状态生效', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-spec-confirm-race-'));
+  try {
+    const workflows = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const specs = await JsonSpecStore.open(join(root, 'specs.json'));
+    const workflow = await workflows.create({
+      kind: 'team', name: '团队交付流水线', initiatorBotId: 'ceo', goal: '登录', stepIds: ['pm', 'dev'],
+      message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt', senderOpenId: 'ou' },
+    });
+    const spec = await specs.create({
+      title: '登录', content: '可执行 Spec', chatId: 'oc', topicId: 'omt', messageId: 'om',
+      ownerOpenId: 'ou', botId: 'pm', workflowId: workflow.id,
+    });
+    await workflows.update(workflow.id, {
+      status: 'awaiting_spec_confirmation', nextStepIndex: 1, specId: spec.id,
+    });
+    const ctx = { workflows, specs } as AppContext;
+    const results = await Promise.allSettled([
+      confirmSpecForReview(ctx, spec.id),
+      rejectSpecConfirmation(ctx, spec.id, '补充异常流程'),
+    ]);
+    assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
+    assert.equal(results.filter((result) => result.status === 'rejected').length, 1);
+    assert.equal(specs.get(spec.id)?.status, 'confirmed');
+    assert.equal(workflows.get(workflow.id)?.status, 'awaiting_doc_review');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('方案退回意见持久化并可在中断后恢复工作流', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-spec-confirm-recover-'));
+  try {
+    const workflows = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const specs = await JsonSpecStore.open(join(root, 'specs.json'));
+    const workflow = await workflows.create({
+      kind: 'team', name: '团队交付流水线', initiatorBotId: 'ceo', goal: '登录', stepIds: ['pm', 'dev'],
+      message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt', senderOpenId: 'ou' },
+    });
+    const spec = await specs.create({
+      title: '登录', content: '上一版', chatId: 'oc', topicId: 'omt', messageId: 'om',
+      ownerOpenId: 'ou', botId: 'pm', workflowId: workflow.id,
+    });
+    await workflows.update(workflow.id, {
+      status: 'awaiting_spec_confirmation', nextStepIndex: 1, specId: spec.id,
+    });
+    const ctx = { workflows, specs } as AppContext;
+    const rejected = await rejectSpecConfirmation(ctx, spec.id, '补充异常流程');
+    assert.equal(rejected.spec.confirmationFeedback, '补充异常流程');
+    assert.equal(workflows.get(workflow.id)?.status, 'ready');
+    assert.equal(workflows.get(workflow.id)?.priorOutputs.confirmation_feedback, '补充异常流程');
+
+    await workflows.update(workflow.id, { status: 'awaiting_spec_confirmation' });
+    await specs.update(spec.id, { status: 'confirmed', confirmationFeedback: undefined });
+    await reconcileWorkflowSpecStates(ctx);
+    assert.equal(workflows.get(workflow.id)?.status, 'awaiting_doc_review');
   } finally {
     await rm(root, { recursive: true, force: true });
   }

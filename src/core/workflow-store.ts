@@ -130,6 +130,26 @@ export class JsonWorkflowStore {
     });
   }
 
+  /** 仅当状态仍符合预期时更新，避免确认、评审和异步回调互相覆盖。 */
+  async updateIfStatus(
+    id: string,
+    expected: WorkflowStatus | readonly WorkflowStatus[],
+    patch: WorkflowPatch,
+  ): Promise<DeliveryWorkflow | undefined> {
+    return this.enqueueMutation(async () => {
+      const current = this.require(id);
+      const allowed = Array.isArray(expected) ? expected : [expected];
+      if (!allowed.includes(current.status)) return undefined;
+      const next = DeliveryWorkflowSchema.parse({
+        ...current,
+        ...patch,
+        updatedAt: new Date().toISOString(),
+      });
+      await this.replaceAndPersist(id, next);
+      return next;
+    });
+  }
+
   /** 原子认领一个 ready 工作流，避免按钮重放/异步回调并发启动同一步骤。 */
   async claimReady(id: string): Promise<DeliveryWorkflow | undefined> {
     return this.enqueueMutation(async () => {

@@ -37,6 +37,7 @@ export const ProductSpecSchema = z.object({
   botId: z.string().trim().min(1).max(100),
   questionnaireId: z.string().trim().min(1).max(100).optional(),
   workflowId: z.string().uuid().optional(),
+  confirmationFeedback: z.string().trim().min(1).max(4_000).optional(),
   status: SpecStatusSchema,
   docId: z.string().trim().min(1).max(500).optional(),
   docUrl: z.url().refine((value) => value.startsWith('https://'), '云文档地址必须使用 HTTPS').optional(),

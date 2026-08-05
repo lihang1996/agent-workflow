@@ -98,7 +98,14 @@ export function buildSpecConfirmationCard(spec: ProductSpec): CardJson {
       direction: 'vertical',
       elements: [
         { tag: 'markdown', content: `**${spec.title}**\n\n${spec.content.slice(0, 5_500)}` },
-        { tag: 'markdown', content: confirmed ? '✅ 需求已确认。下一步可发布到飞书云文档。' : spec.status === 'changes_requested' ? '⛔ 已退回产品经理修改。' : '确认后会进入飞书云文档发布流程。' },
+        {
+          tag: 'markdown',
+          content: confirmed
+            ? '✅ 需求已确认。下一步可发布到飞书云文档。'
+            : spec.status === 'changes_requested'
+              ? `⛔ 已退回产品经理修改。${spec.confirmationFeedback ? `\n\n**退回意见**：${escapeCardMarkdown(spec.confirmationFeedback, 2_000)}` : ''}`
+              : '确认后会进入飞书云文档发布流程。',
+        },
         ...(spec.status === 'pending_confirmation'
           ? [{
             tag: 'form',
@@ -111,6 +118,7 @@ export function buildSpecConfirmationCard(spec: ProductSpec): CardJson {
                 required: false,
                 input_type: 'multiline_text',
                 rows: 3,
+                max_length: 4_000,
                 label: { tag: 'plain_text', content: '退回意见（退回修改时必填）' },
                 placeholder: { tag: 'plain_text', content: '请输入需要产品经理修改的内容' },
               },
@@ -182,10 +190,10 @@ export function buildApprovalCard(approval: ApprovalRequest): CardJson {
       template: 'red',
       label: '执行失败',
       detail: approval.scheduleJobId
-        ? `❌ 执行失败：${escapeApprovalMarkdown(approval.executionError ?? '未知错误')}\n\n定时任务会按补偿策略重新触发并生成新审批。`
+        ? `❌ 执行失败：${escapeCardMarkdown(approval.executionError ?? '未知错误')}\n\n定时任务会按补偿策略重新触发并生成新审批。`
         : authorizationExpired
-          ? `❌ 执行失败：${escapeApprovalMarkdown(approval.executionError ?? '未知错误')}\n\n本次批准已过期，如需重试请重新发起审批。`
-          : `❌ 执行失败：${escapeApprovalMarkdown(approval.executionError ?? '未知错误')}`,
+          ? `❌ 执行失败：${escapeCardMarkdown(approval.executionError ?? '未知错误')}\n\n本次批准已过期，如需重试请重新发起审批。`
+          : `❌ 执行失败：${escapeCardMarkdown(approval.executionError ?? '未知错误')}`,
     },
     rejected: { template: 'grey', label: '已拒绝', detail: '⛔ 已拒绝，任务没有执行。' },
     expired: { template: 'grey', label: '已过期', detail: '⌛ 审批已失效，任务没有执行；如仍需执行请重新发起。' },
@@ -206,10 +214,10 @@ export function buildApprovalCard(approval: ApprovalRequest): CardJson {
         {
           tag: 'markdown',
           content: [
-            `**风险原因**：${escapeApprovalMarkdown(redactSecrets(approval.reason), 300)}`,
+            `**风险原因**：${escapeCardMarkdown(redactSecrets(approval.reason), 300)}`,
             `**审批编号**：${approval.id}`,
             `**有效期至**：${expiresAt}`,
-            `**拟执行任务**\n${escapeApprovalMarkdown(redactSecrets(approval.prompt), 2_000)}`,
+            `**拟执行任务**\n${escapeCardMarkdown(redactSecrets(approval.prompt), 2_000)}`,
             appearance.detail,
           ].join('\n\n'),
         },
@@ -226,7 +234,7 @@ export function buildApprovalCard(approval: ApprovalRequest): CardJson {
   };
 }
 
-function escapeApprovalMarkdown(value: string, maxLength = 800): string {
+function escapeCardMarkdown(value: string, maxLength = 800): string {
   const text = value.trim().slice(0, maxLength);
   const suffix = value.trim().length > maxLength ? '…' : '';
   return `${text.replace(/[\\`*_~\[\]<>#]/g, '\\$&')}${suffix}`;
