@@ -1,5 +1,6 @@
 import { buildTaskCard } from '../im/card.js';
 import type { PersistedActiveRun } from '../core/active-run-store.js';
+import { sanitizeForLog } from '../core/log-inspection.js';
 import type { AppContext } from './app-context.js';
 import type { ActiveRun } from './types.js';
 import { markSessionIdle } from './sessions.js';
@@ -26,13 +27,9 @@ export function snapshotActiveRuns(ctx: AppContext): PersistedActiveRun[] {
 
 /** 立即写入 active-runs.json。 */
 export async function persistActiveRuns(ctx: AppContext): Promise<void> {
-  try {
-    const runs = snapshotActiveRuns(ctx);
-    if (runs.length === 0) await ctx.activeRunStore.clear();
-    else await ctx.activeRunStore.save(runs);
-  } catch (error) {
-    console.error('[任务] 持久化进行中卡片失败:', (error as Error).message);
-  }
+  const runs = snapshotActiveRuns(ctx);
+  if (runs.length === 0) await ctx.activeRunStore.clear();
+  else await ctx.activeRunStore.save(runs);
 }
 
 /** 防抖落盘，避免每个工具事件都写磁盘。 */
@@ -40,7 +37,7 @@ export function schedulePersistActiveRuns(ctx: AppContext): void {
   if (ctx.persistTimer) return;
   ctx.persistTimer = setTimeout(() => {
     ctx.persistTimer = undefined;
-    void persistActiveRuns(ctx);
+    void persistActiveRuns(ctx).catch(logPersistError);
   }, ctx.activeRunPersistDebounceMs);
   ctx.persistTimer.unref?.();
 }
@@ -121,7 +118,7 @@ export async function shutdownActiveRuns(ctx: AppContext, reason: string): Promi
   ctx.shuttingDown = true;
   const entries = [...ctx.activeRuns.entries()];
   if (entries.length === 0) {
-    await flushPersistActiveRuns(ctx).catch(() => undefined);
+    await flushPersistActiveRuns(ctx).catch(logPersistError);
     return;
   }
 
@@ -152,7 +149,7 @@ export async function shutdownActiveRuns(ctx: AppContext, reason: string): Promi
     }
     run.resolveDone();
   }
-  await flushPersistActiveRuns(ctx).catch(() => undefined);
+  await flushPersistActiveRuns(ctx).catch(logPersistError);
 }
 
 /** 立刻停掉进度刷新，避免与卡片回调响应抢 patch。 */
@@ -162,4 +159,9 @@ export function freezeRunCard(run: ActiveRun): void {
     run.heartbeat = undefined;
   }
   void run.cardUpdater.cancel();
+}
+
+function logPersistError(error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error('[任务] 持久化进行中卡片失败:', sanitizeForLog(message, 2_000));
 }

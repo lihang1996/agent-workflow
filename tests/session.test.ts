@@ -8,7 +8,7 @@ import { SessionManager, type Session } from '../src/core/session-manager.js';
 import { JsonSessionStore, type SessionStore } from '../src/core/session-store.js';
 import { JsonTopicStore } from '../src/core/topic-store.js';
 import type { AppContext } from '../src/runtime/app-context.js';
-import { reconcileOrphanedCards } from '../src/runtime/active-runs.js';
+import { persistActiveRuns, reconcileOrphanedCards } from '../src/runtime/active-runs.js';
 
 function closedSession(): Session {
   return {
@@ -94,6 +94,45 @@ test('损坏会话记录会明确报错且不会被静默覆盖', async () => {
     await writeFile(path, original);
     await assert.rejects(() => new JsonSessionStore(path).load(), /第 2 条记录格式错误/);
     assert.equal(await readFile(path, 'utf8'), original);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('重复会话记录会在恢复前拒绝且保留原文件', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-session-duplicate-'));
+  const path = join(root, 'sessions.json');
+  const duplicate = { ...closedSession(), status: 'active' as const };
+  const original = JSON.stringify([duplicate, { ...duplicate, threadId: 'omt-2' }], null, 2);
+  try {
+    await writeFile(path, original);
+    await assert.rejects(() => new JsonSessionStore(path).load(), /重复 ID/);
+    assert.equal(await readFile(path, 'utf8'), original);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('进行中任务快照写入失败会向启动方报告', async () => {
+  await assert.rejects(
+    () => persistActiveRuns({
+      activeRuns: new Map(),
+      activeRunStore: { clear: async () => { throw new Error('快照目录只读'); } },
+    } as unknown as AppContext),
+    /快照目录只读/,
+  );
+});
+
+test('重复进行中任务快照会阻止恢复', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-active-run-duplicate-'));
+  const path = join(root, 'active-runs.json');
+  const run = {
+    sessionId: 'session-1', botId: 'dev', cardId: 'om-card', cardTitle: '开发任务',
+    progress: 30, detail: '执行中', activities: [], updatedAt: '2026-08-04T00:00:00.000Z',
+  };
+  try {
+    await writeFile(path, JSON.stringify([run, { ...run, cardId: 'om-card-2' }]));
+    await assert.rejects(() => new JsonActiveRunStore(path).load(), /重复会话/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

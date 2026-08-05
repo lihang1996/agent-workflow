@@ -1,25 +1,26 @@
 /**
  * 进行中任务卡片快照：进程被热重启 / 强杀后，下次启动可把飞书卡片收成「已中断」。
  */
+import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { z } from 'zod';
 
 const ActiveRunSchema = z.object({
-  sessionId: z.string().min(1),
-  botId: z.string().min(1),
-  cardId: z.string().min(1),
-  cardTitle: z.string().min(1),
+  sessionId: z.string().trim().min(1).max(200),
+  botId: z.string().trim().min(1).max(100),
+  cardId: z.string().trim().min(1).max(200),
+  cardTitle: z.string().trim().min(1).max(200),
   progress: z.number().min(0).max(100),
-  detail: z.string(),
-  activities: z.array(z.string()).default([]),
+  detail: z.string().max(2_000),
+  activities: z.array(z.string().max(500)).max(20).default([]),
   updatedAt: z.iso.datetime(),
 });
 
 export type PersistedActiveRun = z.infer<typeof ActiveRunSchema>;
 
 export class JsonActiveRunStore {
-  private writeQueue: Promise<void> = Promise.resolve();
+  private operationQueue: Promise<void> = Promise.resolve();
 
   constructor(private readonly filePath: string) {}
 
@@ -42,6 +43,8 @@ export class JsonActiveRunStore {
     if (!Array.isArray(rows)) throw new Error(`进行中任务文件格式错误: ${this.filePath}`);
 
     const runs: PersistedActiveRun[] = [];
+    const sessionIds = new Set<string>();
+    const cardIds = new Set<string>();
     for (const [index, row] of rows.entries()) {
       const result = ActiveRunSchema.safeParse(row);
       if (!result.success) {
@@ -50,6 +53,14 @@ export class JsonActiveRunStore {
           `进行中任务文件第 ${index + 1} 条记录格式错误: ${issue?.path.join('.') || '(根)'} ${issue?.message ?? ''}`.trim(),
         );
       }
+      if (sessionIds.has(result.data.sessionId)) {
+        throw new Error(`进行中任务文件包含重复会话: ${result.data.sessionId}`);
+      }
+      if (cardIds.has(result.data.cardId)) {
+        throw new Error(`进行中任务文件包含重复卡片: ${result.data.cardId}`);
+      }
+      sessionIds.add(result.data.sessionId);
+      cardIds.add(result.data.cardId);
       runs.push(result.data);
     }
     return runs;
@@ -57,24 +68,48 @@ export class JsonActiveRunStore {
 
   /** 串行写入当前进行中任务快照。 */
   save(runs: PersistedActiveRun[]): Promise<void> {
-    const snapshot = JSON.stringify(runs, null, 2);
+    const parsed = runs.map((run) => ActiveRunSchema.parse(run));
+    assertUniqueRuns(parsed);
+    const snapshot = JSON.stringify(parsed, null, 2);
     const write = async () => {
       await mkdir(dirname(this.filePath), { recursive: true });
-      const tempPath = `${this.filePath}.tmp`;
-      await writeFile(tempPath, `${snapshot}\n`, 'utf8');
-      await rename(tempPath, this.filePath);
+      const tempPath = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
+      try {
+        await writeFile(tempPath, `${snapshot}\n`, 'utf8');
+        await rename(tempPath, this.filePath);
+      } catch (error) {
+        await unlink(tempPath).catch(() => undefined);
+        throw error;
+      }
     };
-    this.writeQueue = this.writeQueue.then(write, write);
-    return this.writeQueue;
+    return this.enqueueOperation(write);
   }
 
   /** 清空快照文件（无进行中任务时）。 */
-  async clear(): Promise<void> {
-    await this.save([]);
-    try {
-      await unlink(this.filePath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
+  clear(): Promise<void> {
+    return this.enqueueOperation(async () => {
+      try {
+        await unlink(this.filePath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    });
+  }
+
+  private enqueueOperation(operation: () => Promise<void>): Promise<void> {
+    const run = this.operationQueue.then(operation, operation);
+    this.operationQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+}
+
+function assertUniqueRuns(runs: PersistedActiveRun[]): void {
+  const sessionIds = new Set<string>();
+  const cardIds = new Set<string>();
+  for (const run of runs) {
+    if (sessionIds.has(run.sessionId)) throw new Error(`进行中任务包含重复会话: ${run.sessionId}`);
+    if (cardIds.has(run.cardId)) throw new Error(`进行中任务包含重复卡片: ${run.cardId}`);
+    sessionIds.add(run.sessionId);
+    cardIds.add(run.cardId);
   }
 }

@@ -140,7 +140,28 @@ export async function startCliTask(
     resolveDone,
   };
   ctx.activeRuns.set(session.id, activeRun);
-  await flushPersistActiveRuns(ctx);
+  try {
+    await flushPersistActiveRuns(ctx);
+  } catch (error) {
+    const launchError = new Error(`无法保存任务恢复快照，任务未启动：${safeErrorMessage(error)}`);
+    activeRun.terminalStatus = 'failed';
+    ctx.activeRuns.delete(session.id);
+    await cardUpdater.finish(buildTaskCard({
+      title: cardTitle,
+      status: 'failed',
+      detail: '任务恢复快照保存失败，CLI 没有启动。请检查 data 目录后重试。',
+      technicalDetail: launchError.message,
+      progress: tracker.snapshot(),
+    })).catch((cardError) => {
+      console.error(`[卡片] bot=${bot.id} 写入启动失败状态异常:`, safeErrorMessage(cardError));
+    });
+    await markSessionIdle(ctx, session.id).catch((stateError) => {
+      console.error('[会话] 恢复启动失败状态异常:', safeErrorMessage(stateError));
+    });
+    resolveDone();
+    await reportFailure(launchError);
+    throw launchError;
+  }
 
   if (downloadResources) {
     const resources = extractResourceKeys(msg.messageType, msg.rawContent);
@@ -177,7 +198,7 @@ export async function startCliTask(
   if (ctx.shuttingDown) {
     await finishInterruptedRun(activeRun, '服务已停止，任务中断');
     ctx.activeRuns.delete(session.id);
-    await flushPersistActiveRuns(ctx);
+    await flushPersistActiveRunsSafely(ctx);
     await markSessionIdle(ctx, session.id);
     resolveDone();
     return;
@@ -329,7 +350,7 @@ export async function startCliTask(
       }
       console.log(`[CLI:${bot.id}/${adapter.id}] 完成 session_id=${result.sessionId ?? '(无)'}`);
       if (ctx.activeRuns.get(session.id) === activeRun) ctx.activeRuns.delete(session.id);
-      await flushPersistActiveRuns(ctx);
+      await flushPersistActiveRunsSafely(ctx);
       try {
         await markSessionIdle(ctx, session.id);
       } catch (error) {
@@ -383,7 +404,7 @@ export async function startCliTask(
     .finally(async () => {
       if (activeRun.heartbeat) clearInterval(activeRun.heartbeat);
       if (ctx.activeRuns.get(session.id) === activeRun) ctx.activeRuns.delete(session.id);
-      await flushPersistActiveRuns(ctx);
+      await flushPersistActiveRunsSafely(ctx);
       try {
         await markSessionIdle(ctx, session.id);
       } catch (error) {
@@ -399,4 +420,10 @@ export async function startCliTask(
 function safeErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   return redactSecrets(message.trim() || '未知错误').slice(-2_000);
+}
+
+async function flushPersistActiveRunsSafely(ctx: AppContext): Promise<void> {
+  await flushPersistActiveRuns(ctx).catch((error) => {
+    console.error('[任务] 持久化任务终态失败:', safeErrorMessage(error));
+  });
 }

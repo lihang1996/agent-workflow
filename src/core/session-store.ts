@@ -1,4 +1,5 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { z } from 'zod';
 import type { Session } from './session-manager.js';
@@ -9,12 +10,12 @@ export interface SessionStore {
 }
 
 const SessionSchema = z.object({
-  id: z.string().min(1),
-  botId: z.string().min(1).default('dev'),
-  threadId: z.string().min(1),
-  chatId: z.string().min(1),
+  id: z.string().trim().min(1).max(200),
+  botId: z.string().trim().min(1).max(100).default('dev'),
+  threadId: z.string().trim().min(1).max(200),
+  chatId: z.string().trim().min(1).max(200),
   cliId: z.enum(['claude', 'codex']),
-  cliSessionId: z.string().min(1).optional(),
+  cliSessionId: z.string().trim().min(1).max(500).optional(),
   status: z.enum(['creating', 'active', 'idle', 'closed']),
   createdAt: z.iso.datetime(),
   updatedAt: z.iso.datetime(),
@@ -51,7 +52,9 @@ export class JsonSessionStore implements SessionStore {
       throw new Error(`会话文件格式错误: ${this.filePath}`);
     }
 
-    const sessions: Session[] = [];
+    const parsedSessions: Session[] = [];
+    const ids = new Set<string>();
+    const topicRoles = new Set<string>();
     let needsCleanup = false;
     for (const [index, row] of rows.entries()) {
       const result = SessionSchema.safeParse(row);
@@ -62,25 +65,56 @@ export class JsonSessionStore implements SessionStore {
         );
       }
 
-      const recovered = recoverInterruptedSession(result.data);
-      if (recovered.status !== result.data.status) needsCleanup = true;
-      sessions.push(recovered);
+      if (ids.has(result.data.id)) throw new Error(`会话文件包含重复 ID: ${result.data.id}`);
+      const topicRole = JSON.stringify([result.data.chatId, result.data.threadId, result.data.botId]);
+      if (topicRoles.has(topicRole)) {
+        throw new Error(`会话文件包含重复话题角色: ${result.data.chatId}/${result.data.threadId}/${result.data.botId}`);
+      }
+      ids.add(result.data.id);
+      topicRoles.add(topicRole);
+      parsedSessions.push(result.data);
     }
+    const sessions = parsedSessions.map((session) => {
+      const recovered = recoverInterruptedSession(session);
+      if (recovered.status !== session.status) needsCleanup = true;
+      return recovered;
+    });
     if (needsCleanup) await this.save(sessions);
     return sessions;
   }
 
   /** 串行原子写入 sessions.json。 */
   save(sessions: Session[]): Promise<void> {
-    const snapshot = JSON.stringify(sessions, null, 2);
+    const parsed = sessions.map((session) => SessionSchema.parse(session));
+    assertUniqueSessions(parsed);
+    const snapshot = JSON.stringify(parsed, null, 2);
     const write = async () => {
       await mkdir(dirname(this.filePath), { recursive: true });
-      const tempPath = `${this.filePath}.tmp`;
-      await writeFile(tempPath, `${snapshot}\n`, 'utf8');
-      await rename(tempPath, this.filePath);
+      const tempPath = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
+      try {
+        await writeFile(tempPath, `${snapshot}\n`, 'utf8');
+        await rename(tempPath, this.filePath);
+      } catch (error) {
+        await unlink(tempPath).catch(() => undefined);
+        throw error;
+      }
     };
 
     this.writeQueue = this.writeQueue.then(write, write);
     return this.writeQueue;
+  }
+}
+
+function assertUniqueSessions(sessions: Session[]): void {
+  const ids = new Set<string>();
+  const topicRoles = new Set<string>();
+  for (const session of sessions) {
+    if (ids.has(session.id)) throw new Error(`会话包含重复 ID: ${session.id}`);
+    const topicRole = JSON.stringify([session.chatId, session.threadId, session.botId]);
+    if (topicRoles.has(topicRole)) {
+      throw new Error(`会话包含重复话题角色: ${session.chatId}/${session.threadId}/${session.botId}`);
+    }
+    ids.add(session.id);
+    topicRoles.add(topicRole);
   }
 }
