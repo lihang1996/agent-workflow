@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -155,6 +155,53 @@ test('交付工作流状态可在重启后恢复', async () => {
     assert.equal(reopened.get(workflow.id)?.nextStepIndex, 1);
     assert.equal(reopened.get(workflow.id)?.executionPolicy, 'approved');
     assert.equal(reopened.get(workflow.id)?.approvalAttempt, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('工作流与 Spec 落盘失败时回滚内存状态', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-core-store-rollback-'));
+  try {
+    const workflowBlocker = join(root, 'workflow-blocker');
+    const specBlocker = join(root, 'spec-blocker');
+    await writeFile(workflowBlocker, 'not-a-directory');
+    await writeFile(specBlocker, 'not-a-directory');
+    const workflows = new JsonWorkflowStore(join(workflowBlocker, 'workflows.json'));
+    const specs = new JsonSpecStore(join(specBlocker, 'specs.json'));
+    await assert.rejects(() => workflows.create({
+      kind: 'team',
+      name: '失败流水线',
+      initiatorBotId: 'ceo',
+      goal: '验证回滚',
+      stepIds: ['pm'],
+      message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: '', senderOpenId: 'ou' },
+    }));
+    await assert.rejects(() => specs.create({
+      title: '失败 Spec',
+      content: '不会留在内存',
+      chatId: 'oc',
+      topicId: 'omt',
+      messageId: 'om',
+      ownerOpenId: 'ou',
+      botId: 'pm',
+    }));
+    assert.equal(workflows.list().length, 0);
+    assert.equal(specs.listByTopic('oc', 'omt').length, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('损坏的工作流与 Spec 记录会阻止启动', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-core-store-invalid-'));
+  try {
+    const workflowPath = join(root, 'workflows.json');
+    const specPath = join(root, 'specs.json');
+    await writeFile(workflowPath, JSON.stringify([{ id: 'broken' }]));
+    await writeFile(specPath, JSON.stringify([{ id: 'broken' }]));
+    await assert.rejects(() => JsonWorkflowStore.open(workflowPath), /第 1 条记录格式错误/);
+    await assert.rejects(() => JsonSpecStore.open(specPath), /第 1 条记录格式错误/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -4,12 +4,12 @@ import { dirname } from 'node:path';
 import { z } from 'zod';
 
 const WorkflowMessageSchema = z.object({
-  messageId: z.string().min(1),
-  chatId: z.string().min(1),
-  chatType: z.string(),
-  rootId: z.string(),
-  threadId: z.string(),
-  senderOpenId: z.string().min(1),
+  messageId: z.string().trim().min(1).max(200),
+  chatId: z.string().trim().min(1).max(200),
+  chatType: z.string().max(50),
+  rootId: z.string().max(200),
+  threadId: z.string().max(200),
+  senderOpenId: z.string().trim().min(1).max(200),
 });
 
 export const WorkflowStatusSchema = z.enum([
@@ -26,31 +26,43 @@ export type WorkflowStatus = z.infer<typeof WorkflowStatusSchema>;
 export const DeliveryWorkflowSchema = z.object({
   id: z.string().uuid(),
   kind: z.enum(['team', 'squad']),
-  name: z.string().min(1),
-  initiatorBotId: z.string().min(1),
-  goal: z.string().min(1),
-  stepIds: z.array(z.enum(['pm', 'architect', 'dev', 'review', 'qa', 'summary'])).min(1),
+  name: z.string().trim().min(1).max(100),
+  initiatorBotId: z.string().trim().min(1).max(100),
+  goal: z.string().trim().min(1).max(100_000),
+  stepIds: z.array(z.enum(['pm', 'architect', 'dev', 'review', 'qa', 'summary'])).min(1).max(20),
   nextStepIndex: z.number().int().min(0),
   priorOutputs: z.record(z.string(), z.string()),
   status: WorkflowStatusSchema,
   executionPolicy: z.enum(['standard', 'approved']).default('standard'),
   message: WorkflowMessageSchema,
   // 兼容升级前的 8 位审批编号；新审批本身使用完整 UUID。
-  approvalId: z.string().min(1).optional(),
+  approvalId: z.string().trim().min(1).max(100).optional(),
   approvalAttempt: z.number().int().min(1).optional(),
-  scheduleJobId: z.string().min(1).optional(),
+  scheduleJobId: z.string().trim().min(1).max(100).optional(),
   scheduleRunCount: z.number().int().min(1).optional(),
-  questionnaireId: z.string().optional(),
-  specId: z.string().optional(),
-  error: z.string().optional(),
-  createdAt: z.string().min(1),
-  updatedAt: z.string().min(1),
+  questionnaireId: z.string().trim().min(1).max(100).optional(),
+  specId: z.string().trim().min(1).max(100).optional(),
+  error: z.string().max(10_000).optional(),
+  createdAt: z.iso.datetime(),
+  updatedAt: z.iso.datetime(),
+}).superRefine((workflow, ctx) => {
+  if (workflow.nextStepIndex > workflow.stepIds.length) {
+    ctx.addIssue({ code: 'custom', path: ['nextStepIndex'], message: '下一步骤索引超出流水线长度' });
+  }
+  if (!!workflow.approvalId !== !!workflow.approvalAttempt) {
+    ctx.addIssue({ code: 'custom', path: ['approvalId'], message: '审批编号与执行轮次必须同时存在' });
+  }
+  if (!!workflow.scheduleJobId !== !!workflow.scheduleRunCount) {
+    ctx.addIssue({ code: 'custom', path: ['scheduleJobId'], message: '定时任务编号与运行轮次必须同时存在' });
+  }
 });
 export type DeliveryWorkflow = z.infer<typeof DeliveryWorkflowSchema>;
 
+type WorkflowPatch = Partial<Omit<DeliveryWorkflow, 'id' | 'createdAt'>>;
+
 export class JsonWorkflowStore {
   private readonly workflows = new Map<string, DeliveryWorkflow>();
-  private writeQueue: Promise<void> = Promise.resolve();
+  private mutationQueue: Promise<void> = Promise.resolve();
 
   constructor(private readonly filePath: string) {}
 
@@ -88,52 +100,68 @@ export class JsonWorkflowStore {
     | 'updatedAt'
     | 'executionPolicy'
   > & { executionPolicy?: DeliveryWorkflow['executionPolicy'] }): Promise<DeliveryWorkflow> {
-    const now = new Date().toISOString();
-    const workflow = DeliveryWorkflowSchema.parse({
-      ...input,
-      id: randomUUID(),
-      status: 'ready',
-      executionPolicy: input.executionPolicy ?? 'standard',
-      nextStepIndex: 0,
-      priorOutputs: {},
-      createdAt: now,
-      updatedAt: now,
+    return this.enqueueMutation(async () => {
+      const now = new Date().toISOString();
+      const workflow = DeliveryWorkflowSchema.parse({
+        ...input,
+        id: randomUUID(),
+        status: 'ready',
+        executionPolicy: input.executionPolicy ?? 'standard',
+        nextStepIndex: 0,
+        priorOutputs: {},
+        createdAt: now,
+        updatedAt: now,
+      });
+      await this.replaceAndPersist(workflow.id, workflow);
+      return workflow;
     });
-    this.workflows.set(workflow.id, workflow);
-    await this.persist();
-    return workflow;
   }
 
-  async update(
-    id: string,
-    patch: Partial<Omit<DeliveryWorkflow, 'id' | 'createdAt'>>,
-  ): Promise<DeliveryWorkflow> {
-    const current = this.get(id);
-    if (!current) throw new Error(`工作流不存在: ${id}`);
-    const next = DeliveryWorkflowSchema.parse({
-      ...current,
-      ...patch,
-      updatedAt: new Date().toISOString(),
+  async update(id: string, patch: WorkflowPatch): Promise<DeliveryWorkflow> {
+    return this.enqueueMutation(async () => {
+      const current = this.require(id);
+      const next = DeliveryWorkflowSchema.parse({
+        ...current,
+        ...patch,
+        updatedAt: new Date().toISOString(),
+      });
+      await this.replaceAndPersist(id, next);
+      return next;
     });
-    this.workflows.set(id, next);
-    await this.persist();
-    return next;
   }
 
   /** 原子认领一个 ready 工作流，避免按钮重放/异步回调并发启动同一步骤。 */
   async claimReady(id: string): Promise<DeliveryWorkflow | undefined> {
-    const current = this.get(id);
-    if (!current) throw new Error(`工作流不存在: ${id}`);
-    if (current.status !== 'ready') return undefined;
-    const next = DeliveryWorkflowSchema.parse({
-      ...current,
-      status: 'executing',
-      error: undefined,
-      updatedAt: new Date().toISOString(),
+    return this.enqueueMutation(async () => {
+      const current = this.require(id);
+      if (current.status !== 'ready') return undefined;
+      const next = DeliveryWorkflowSchema.parse({
+        ...current,
+        status: 'executing',
+        error: undefined,
+        updatedAt: new Date().toISOString(),
+      });
+      await this.replaceAndPersist(id, next);
+      return next;
     });
+  }
+
+  private require(id: string): DeliveryWorkflow {
+    const workflow = this.workflows.get(id);
+    if (!workflow) throw new Error(`工作流不存在: ${id}`);
+    return workflow;
+  }
+
+  private async replaceAndPersist(id: string, next: DeliveryWorkflow): Promise<void> {
+    const previous = this.workflows.get(id);
     this.workflows.set(id, next);
-    await this.persist();
-    return next;
+    try {
+      await this.persist();
+    } catch (error) {
+      if (previous) this.workflows.set(id, previous);
+      else this.workflows.delete(id);
+      throw error;
+    }
   }
 
   private async load(): Promise<void> {
@@ -144,23 +172,37 @@ export class JsonWorkflowStore {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
       throw error;
     }
-    const rows: unknown = JSON.parse(raw);
+    let rows: unknown;
+    try {
+      rows = JSON.parse(raw);
+    } catch (error) {
+      throw new Error(`工作流文件不是有效 JSON: ${this.filePath}`, { cause: error });
+    }
     if (!Array.isArray(rows)) throw new Error(`工作流文件格式错误: ${this.filePath}`);
-    for (const row of rows) {
+    for (const [index, row] of rows.entries()) {
       const parsed = DeliveryWorkflowSchema.safeParse(row);
-      if (parsed.success) this.workflows.set(parsed.data.id, parsed.data);
+      if (!parsed.success) {
+        const issue = parsed.error.issues[0];
+        throw new Error(
+          `工作流文件第 ${index + 1} 条记录格式错误: ${issue?.path.join('.') || '(根)'} ${issue?.message ?? ''}`.trim(),
+        );
+      }
+      if (this.workflows.has(parsed.data.id)) throw new Error(`工作流文件包含重复 ID: ${parsed.data.id}`);
+      this.workflows.set(parsed.data.id, parsed.data);
     }
   }
 
-  private persist(): Promise<void> {
+  private async persist(): Promise<void> {
     const payload = JSON.stringify([...this.workflows.values()], null, 2);
-    const write = async () => {
-      await mkdir(dirname(this.filePath), { recursive: true });
-      const temp = `${this.filePath}.tmp`;
-      await writeFile(temp, `${payload}\n`, 'utf8');
-      await rename(temp, this.filePath);
-    };
-    this.writeQueue = this.writeQueue.then(write, write);
-    return this.writeQueue;
+    await mkdir(dirname(this.filePath), { recursive: true });
+    const temp = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(temp, `${payload}\n`, 'utf8');
+    await rename(temp, this.filePath);
+  }
+
+  private enqueueMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.mutationQueue.then(operation, operation);
+    this.mutationQueue = run.then(() => undefined, () => undefined);
+    return run;
   }
 }
