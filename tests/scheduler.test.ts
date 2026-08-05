@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -32,6 +32,85 @@ function message() {
     senderOpenId: 'ou_owner',
   };
 }
+
+test('定时任务创建幂等且并发只认领一个运行轮次', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-schedule-concurrency-'));
+  try {
+    const store = await JsonScheduleStore.open(join(root, 'schedules.json'));
+    const input = {
+      botId: 'dev', ownerOpenId: 'ou_owner', kind: 'task' as const,
+      prompt: '检查项目', intervalMs: 60_000, message: message(),
+    };
+    const [first, duplicate] = await Promise.all([store.create(input), store.create(input)]);
+    assert.equal(duplicate.id, first.id);
+    assert.equal(store.listByTopic('oc_chat', 'om_root').length, 1);
+    const dueAt = new Date(first.nextRunAt);
+    const claims = await Promise.allSettled([
+      store.claimRun(first.id, dueAt),
+      store.claimRun(first.id, dueAt),
+    ]);
+    assert.equal(claims.filter((result) => result.status === 'fulfilled').length, 1);
+    assert.equal(store.get(first.id)?.runCount, 1);
+    assert.equal(store.get(first.id)?.lastStatus, 'running');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('定时任务忽略旧轮次结果且执行中不能删除', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-schedule-stale-result-'));
+  try {
+    const store = await JsonScheduleStore.open(join(root, 'schedules.json'));
+    const job = await store.create({
+      botId: 'dev', ownerOpenId: 'ou_owner', kind: 'task', prompt: '检查项目', intervalMs: 60_000,
+      message: { ...message(), messageId: 'om_stale' },
+    });
+    const first = await store.claimRun(job.id, new Date(job.nextRunAt));
+    const failed = await store.finishRun(first.id, 'failed', '首次失败', new Date(), first.runCount);
+    const second = await store.claimRun(failed.id, new Date(failed.nextRunAt));
+    await assert.rejects(
+      store.finishRun(second.id, 'succeeded', undefined, new Date(), first.runCount),
+      /运行轮次已变化/,
+    );
+    await assert.rejects(store.remove(second.id), /执行，不能删除/);
+    assert.equal(store.get(second.id)?.lastStatus, 'running');
+    await store.finishRun(second.id, 'succeeded', undefined, new Date(), second.runCount);
+    assert.equal(await store.remove(second.id), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('定时任务落盘失败回滚，损坏或重复记录阻止启动', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-schedule-validation-'));
+  try {
+    const unwritableTarget = join(root, 'target-directory');
+    await mkdir(unwritableTarget);
+    const brokenStore = new JsonScheduleStore(unwritableTarget);
+    await assert.rejects(brokenStore.create({
+      botId: 'dev', ownerOpenId: 'ou_owner', kind: 'task', prompt: '检查项目', intervalMs: 60_000,
+      message: { ...message(), messageId: 'om_rollback' },
+    }));
+    assert.equal(brokenStore.listByTopic('oc_chat', 'om_root').length, 0);
+
+    const path = join(root, 'schedules.json');
+    await writeFile(path, '{bad json');
+    await assert.rejects(JsonScheduleStore.open(path), /不是有效 JSON/);
+
+    const validStore = await JsonScheduleStore.open(join(root, 'valid.json'));
+    const job = await validStore.create({
+      botId: 'dev', ownerOpenId: 'ou_owner', kind: 'task', prompt: '检查项目', intervalMs: 60_000,
+      message: { ...message(), messageId: 'om_duplicate' },
+    });
+    const rows = JSON.parse(await readFile(join(root, 'valid.json'), 'utf8'));
+    await writeFile(path, JSON.stringify([job, ...rows]));
+    await assert.rejects(JsonScheduleStore.open(path), /重复 ID/);
+    await writeFile(path, JSON.stringify([{ ...job, intervalMs: 1 }]));
+    await assert.rejects(JsonScheduleStore.open(path), /第 1 条记录格式错误/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test('定时任务持久化运行状态、失败原因和补偿时间', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agent-os-schedule-state-'));

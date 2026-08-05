@@ -475,7 +475,8 @@ export async function handleMessage(
       );
       return;
     }
-    const [operation, second, ...rest] = arg.split(/\s+/);
+    const [operationToken, second, ...rest] = arg.split(/\s+/);
+    const operation = operationToken.toLowerCase();
     if (operation === 'list') {
       const jobs = ctx.schedules.listByTopic(msg.chatId, topicId);
       await bot.reply(
@@ -535,22 +536,26 @@ export async function handleMessage(
       }
     }
     const kind = operation === 'pipeline' ? 'pipeline' : operation === 'logs' ? 'log_inspection' : 'task';
-    const job = await ctx.schedules.create({
-      botId: bot.id,
-      ownerOpenId: process.env.OWNER_OPEN_ID?.trim() || msg.senderOpenId,
-      kind,
-      prompt,
-      intervalMs,
-      message: {
-        messageId: msg.messageId,
-        chatId: msg.chatId,
-        chatType: msg.chatType,
-        rootId: msg.rootId,
-        threadId: msg.threadId,
-        senderOpenId: msg.senderOpenId,
-      },
-    });
-    await bot.reply(msg.messageId, `已创建定时任务 ${job.id}：每 ${formatScheduleInterval(job.intervalMs)} 执行一次，下次 ${job.nextRunAt}。`, hasThread);
+    try {
+      const job = await ctx.schedules.create({
+        botId: bot.id,
+        ownerOpenId: process.env.OWNER_OPEN_ID?.trim() || msg.senderOpenId,
+        kind,
+        prompt,
+        intervalMs,
+        message: {
+          messageId: msg.messageId,
+          chatId: msg.chatId,
+          chatType: msg.chatType,
+          rootId: msg.rootId,
+          threadId: msg.threadId,
+          senderOpenId: msg.senderOpenId,
+        },
+      });
+      await bot.reply(msg.messageId, `已创建定时任务 ${job.id}：每 ${formatScheduleInterval(job.intervalMs)} 执行一次，下次 ${job.nextRunAt}。`, hasThread);
+    } catch (error) {
+      await bot.reply(msg.messageId, `创建定时任务失败：${(error as Error).message}`, hasThread);
+    }
     return;
   }
   if (command?.name === 'reset') {

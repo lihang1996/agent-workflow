@@ -653,6 +653,8 @@ async function settleWorkflowSchedule(
     job.id,
     outcome,
     outcome === 'failed' ? (error?.trim() || '交付工作流执行失败') : undefined,
+    new Date(),
+    workflow.scheduleRunCount,
   ).catch((settleError) => {
     console.error(`[定时任务] 工作流 ${workflow.id} 结算失败:`, (settleError as Error).message);
   });

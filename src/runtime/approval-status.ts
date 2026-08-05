@@ -56,6 +56,8 @@ export async function settleApprovalSchedule(
     job.id,
     outcome,
     outcome === 'succeeded' ? undefined : (error?.trim() || approval.executionError || '审批未执行'),
+    new Date(),
+    approval.scheduleRunCount,
   );
 }
 

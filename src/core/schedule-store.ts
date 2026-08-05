@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
@@ -11,32 +11,36 @@ export type ScheduleRunStatus = z.infer<typeof ScheduleRunStatusSchema>;
 export type ScheduleRunOutcome = Exclude<ScheduleRunStatus, 'idle' | 'running'>;
 
 const StoredMessageSchema = z.object({
-  messageId: z.string().min(1),
-  chatId: z.string().min(1),
-  chatType: z.string(),
-  rootId: z.string(),
-  threadId: z.string(),
-  senderOpenId: z.string(),
+  messageId: z.string().trim().min(1).max(200),
+  chatId: z.string().trim().min(1).max(200),
+  chatType: z.string().max(50),
+  rootId: z.string().max(200),
+  threadId: z.string().max(200),
+  senderOpenId: z.string().trim().min(1).max(200),
 });
 
 export const ScheduleSchema = z.object({
-  id: z.string().min(1),
-  botId: z.string().min(1),
-  ownerOpenId: z.string().min(1),
+  id: z.string().trim().min(1).max(100),
+  botId: z.string().trim().min(1).max(100),
+  ownerOpenId: z.string().trim().min(1).max(200),
   kind: ScheduleKindSchema,
-  prompt: z.string().min(1),
-  intervalMs: z.number().int().min(60_000),
-  nextRunAt: z.string().datetime(),
-  lastRunAt: z.string().datetime().optional(),
-  lastFinishedAt: z.string().datetime().optional(),
+  prompt: z.string().trim().min(1).max(100_000),
+  intervalMs: z.number().int().min(60_000).max(365 * 86_400_000),
+  nextRunAt: z.iso.datetime(),
+  lastRunAt: z.iso.datetime().optional(),
+  lastFinishedAt: z.iso.datetime().optional(),
   lastStatus: ScheduleRunStatusSchema.default('idle'),
-  lastError: z.string().optional(),
+  lastError: z.string().trim().min(1).max(10_000).optional(),
   runCount: z.number().int().min(0).default(0),
   consecutiveFailures: z.number().int().min(0).default(0),
   enabled: z.boolean(),
   message: StoredMessageSchema,
-  createdAt: z.string().datetime(),
-  updatedAt: z.string().datetime(),
+  createdAt: z.iso.datetime(),
+  updatedAt: z.iso.datetime(),
+}).superRefine((job, ctx) => {
+  if (job.lastStatus === 'running' && (!job.lastRunAt || job.runCount < 1)) {
+    ctx.addIssue({ code: 'custom', path: ['lastStatus'], message: '执行中任务必须包含有效运行轮次' });
+  }
 });
 export type ScheduledJob = z.infer<typeof ScheduleSchema>;
 
@@ -70,7 +74,7 @@ export function formatScheduleRunStatus(status: ScheduleRunStatus): string {
 
 export class JsonScheduleStore {
   private readonly jobs = new Map<string, ScheduledJob>();
-  private writeQueue: Promise<void> = Promise.resolve();
+  private mutationQueue: Promise<void> = Promise.resolve();
 
   constructor(private readonly filePath: string) {}
 
@@ -106,42 +110,48 @@ export class JsonScheduleStore {
     intervalMs: number;
     message: StoredMessage;
   }): Promise<ScheduledJob> {
-    const now = new Date();
-    const job: ScheduledJob = {
-      ...input,
-      id: randomUUID(),
-      nextRunAt: new Date(now.getTime() + input.intervalMs).toISOString(),
-      lastStatus: 'idle',
-      runCount: 0,
-      consecutiveFailures: 0,
-      enabled: true,
-      createdAt: now.toISOString(),
-      updatedAt: now.toISOString(),
-    };
-    this.jobs.set(job.id, job);
-    await this.persist();
-    return job;
+    return this.enqueueMutation(async () => {
+      // 飞书在处理超时后可能重投同一消息，复用原任务避免重复创建。
+      const existing = [...this.jobs.values()].find((job) =>
+        job.botId === input.botId && job.message.messageId === input.message.messageId);
+      if (existing) return existing;
+      const now = new Date();
+      const job = ScheduleSchema.parse({
+        ...input,
+        id: randomUUID(),
+        nextRunAt: new Date(now.getTime() + input.intervalMs).toISOString(),
+        lastStatus: 'idle',
+        runCount: 0,
+        consecutiveFailures: 0,
+        enabled: true,
+        createdAt: now.toISOString(),
+        updatedAt: now.toISOString(),
+      });
+      await this.replaceAndPersist(job.id, job);
+      return job;
+    });
   }
 
   /** 原子认领一次到期任务并提前推进 nextRunAt，防止调度 tick 重复启动。 */
   async claimRun(id: string, now = new Date()): Promise<ScheduledJob> {
-    const current = this.get(id);
-    if (!current) throw new Error(`定时任务不存在: ${id}`);
-    if (!current.enabled) throw new Error(`定时任务已暂停: ${id}`);
-    if (current.lastStatus === 'running') throw new Error(`定时任务正在执行: ${id}`);
-    if (current.nextRunAt > now.toISOString()) throw new Error(`定时任务尚未到期: ${id}`);
-    const next: ScheduledJob = {
-      ...current,
-      lastRunAt: now.toISOString(),
-      lastStatus: 'running',
-      lastError: undefined,
-      runCount: current.runCount + 1,
-      nextRunAt: new Date(now.getTime() + current.intervalMs).toISOString(),
-      updatedAt: now.toISOString(),
-    };
-    this.jobs.set(id, next);
-    await this.persist();
-    return next;
+    return this.enqueueMutation(async () => {
+      const current = this.require(id);
+      if (!current.enabled) throw new Error(`定时任务已暂停: ${id}`);
+      if (current.lastStatus === 'running') throw new Error(`定时任务正在执行: ${id}`);
+      if (current.nextRunAt > now.toISOString()) throw new Error(`定时任务尚未到期: ${id}`);
+      const next = ScheduleSchema.parse({
+        ...current,
+        lastRunAt: now.toISOString(),
+        lastFinishedAt: undefined,
+        lastStatus: 'running',
+        lastError: undefined,
+        runCount: current.runCount + 1,
+        nextRunAt: new Date(now.getTime() + current.intervalMs).toISOString(),
+        updatedAt: now.toISOString(),
+      });
+      await this.replaceAndPersist(id, next);
+      return next;
+    });
   }
 
   /** 记录本次触发结果；失败/跳过会在不超过 5 分钟后补偿重试。 */
@@ -150,28 +160,32 @@ export class JsonScheduleStore {
     outcome: ScheduleRunOutcome,
     error?: string,
     now = new Date(),
+    expectedRunCount?: number,
   ): Promise<ScheduledJob> {
-    const current = this.get(id);
-    if (!current) throw new Error(`定时任务不存在: ${id}`);
-    if (current.lastStatus !== 'running') throw new Error(`定时任务当前未在执行: ${id}`);
-    const failed = outcome !== 'succeeded';
-    const failures = failed ? current.consecutiveFailures + 1 : 0;
-    const regularNext = new Date(current.nextRunAt).getTime();
-    const nextRunAt = failed
-      ? new Date(now.getTime() + Math.min(current.intervalMs, 5 * 60_000)).toISOString()
-      : new Date(Math.max(regularNext, now.getTime() + current.intervalMs)).toISOString();
-    const next = ScheduleSchema.parse({
-      ...current,
-      lastStatus: outcome,
-      lastFinishedAt: now.toISOString(),
-      lastError: error?.trim() || undefined,
-      consecutiveFailures: failures,
-      nextRunAt,
-      updatedAt: now.toISOString(),
+    return this.enqueueMutation(async () => {
+      const current = this.require(id);
+      if (expectedRunCount !== undefined && current.runCount !== expectedRunCount) {
+        throw new Error(`定时任务 ${id} 运行轮次已变化，忽略第 ${expectedRunCount} 轮的迟到结果`);
+      }
+      if (current.lastStatus !== 'running') throw new Error(`定时任务当前未在执行: ${id}`);
+      const failed = outcome !== 'succeeded';
+      const failures = failed ? current.consecutiveFailures + 1 : 0;
+      const regularNext = new Date(current.nextRunAt).getTime();
+      const nextRunAt = failed
+        ? new Date(now.getTime() + Math.min(current.intervalMs, 5 * 60_000)).toISOString()
+        : new Date(Math.max(regularNext, now.getTime() + current.intervalMs)).toISOString();
+      const next = ScheduleSchema.parse({
+        ...current,
+        lastStatus: outcome,
+        lastFinishedAt: now.toISOString(),
+        lastError: error?.trim().slice(-10_000) || undefined,
+        consecutiveFailures: failures,
+        nextRunAt,
+        updatedAt: now.toISOString(),
+      });
+      await this.replaceAndPersist(id, next);
+      return next;
     });
-    this.jobs.set(id, next);
-    await this.persist();
-    return next;
   }
 
   /**
@@ -179,64 +193,83 @@ export class JsonScheduleStore {
    * 恢复原 runCount 和常规 nextRunAt，避免 scheduler 重复发起同一高风险任务。
    */
   async restoreInterruptedRun(id: string, runCount: number): Promise<ScheduledJob | undefined> {
-    const current = this.get(id);
-    if (!current || current.runCount !== runCount) return undefined;
-    if (current.lastStatus === 'running') return current;
-    if (
-      current.lastStatus !== 'failed'
-      || !current.lastError?.startsWith('上次执行被服务重启中断')
-      || !current.lastRunAt
-    ) return undefined;
-    const regularNext = new Date(new Date(current.lastRunAt).getTime() + current.intervalMs).toISOString();
-    const next = ScheduleSchema.parse({
-      ...current,
-      lastStatus: 'running',
-      lastFinishedAt: undefined,
-      lastError: undefined,
-      consecutiveFailures: Math.max(0, current.consecutiveFailures - 1),
-      nextRunAt: regularNext,
-      updatedAt: new Date().toISOString(),
+    return this.enqueueMutation(async () => {
+      const current = this.jobs.get(id);
+      if (!current || current.runCount !== runCount) return undefined;
+      if (current.lastStatus === 'running') return current;
+      if (
+        current.lastStatus !== 'failed'
+        || !current.lastError?.startsWith('上次执行被服务重启中断')
+        || !current.lastRunAt
+      ) return undefined;
+      const regularNext = new Date(new Date(current.lastRunAt).getTime() + current.intervalMs).toISOString();
+      const next = ScheduleSchema.parse({
+        ...current,
+        lastStatus: 'running',
+        lastFinishedAt: undefined,
+        lastError: undefined,
+        consecutiveFailures: Math.max(0, current.consecutiveFailures - 1),
+        nextRunAt: regularNext,
+        updatedAt: new Date().toISOString(),
+      });
+      await this.replaceAndPersist(id, next);
+      return next;
     });
-    this.jobs.set(id, next);
-    await this.persist();
-    return next;
   }
 
   async setEnabled(id: string, enabled: boolean): Promise<ScheduledJob> {
-    const current = this.get(id);
-    if (!current) throw new Error(`定时任务不存在: ${id}`);
-    const next: ScheduledJob = {
-      ...current,
-      enabled,
-      nextRunAt: enabled ? new Date(Date.now() + current.intervalMs).toISOString() : current.nextRunAt,
-      updatedAt: new Date().toISOString(),
-    };
-    this.jobs.set(id, next);
-    await this.persist();
-    return next;
+    return this.enqueueMutation(async () => {
+      const current = this.require(id);
+      if (current.enabled === enabled) return current;
+      const next = ScheduleSchema.parse({
+        ...current,
+        enabled,
+        nextRunAt: enabled ? new Date(Date.now() + current.intervalMs).toISOString() : current.nextRunAt,
+        updatedAt: new Date().toISOString(),
+      });
+      await this.replaceAndPersist(id, next);
+      return next;
+    });
   }
 
   async remove(id: string): Promise<boolean> {
-    const removed = this.jobs.delete(id);
-    if (removed) await this.persist();
-    return removed;
+    return this.enqueueMutation(async () => {
+      const current = this.jobs.get(id);
+      if (!current) return false;
+      if (current.lastStatus === 'running') throw new Error('定时任务正在执行，不能删除。');
+      this.jobs.delete(id);
+      try {
+        await this.persist();
+      } catch (error) {
+        this.jobs.set(id, current);
+        throw error;
+      }
+      return true;
+    });
   }
 
   private async recoverInterruptedRuns(now = new Date()): Promise<void> {
-    const interrupted = [...this.jobs.values()].filter((job) => job.lastStatus === 'running');
-    if (interrupted.length === 0) return;
-    for (const job of interrupted) {
-      this.jobs.set(job.id, ScheduleSchema.parse({
-        ...job,
-        lastStatus: 'failed',
-        lastFinishedAt: now.toISOString(),
-        lastError: '上次执行被服务重启中断，已安排补偿重试。',
-        consecutiveFailures: job.consecutiveFailures + 1,
-        nextRunAt: now.toISOString(),
-        updatedAt: now.toISOString(),
-      }));
-    }
-    await this.persist();
+    return this.enqueueMutation(async () => {
+      const interrupted = [...this.jobs.values()].filter((job) => job.lastStatus === 'running');
+      if (interrupted.length === 0) return;
+      for (const job of interrupted) {
+        this.jobs.set(job.id, ScheduleSchema.parse({
+          ...job,
+          lastStatus: 'failed',
+          lastFinishedAt: now.toISOString(),
+          lastError: '上次执行被服务重启中断，已安排补偿重试。',
+          consecutiveFailures: job.consecutiveFailures + 1,
+          nextRunAt: now.toISOString(),
+          updatedAt: now.toISOString(),
+        }));
+      }
+      try {
+        await this.persist();
+      } catch (error) {
+        for (const job of interrupted) this.jobs.set(job.id, job);
+        throw error;
+      }
+    });
   }
 
   private async load(): Promise<void> {
@@ -247,23 +280,60 @@ export class JsonScheduleStore {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
       throw error;
     }
-    const rows: unknown = JSON.parse(raw);
+    let rows: unknown;
+    try {
+      rows = JSON.parse(raw);
+    } catch (error) {
+      throw new Error(`定时任务文件不是有效 JSON: ${this.filePath}`, { cause: error });
+    }
     if (!Array.isArray(rows)) throw new Error(`定时任务文件格式错误: ${this.filePath}`);
-    for (const row of rows) {
+    for (const [index, row] of rows.entries()) {
       const parsed = ScheduleSchema.safeParse(row);
-      if (parsed.success) this.jobs.set(parsed.data.id, parsed.data);
+      if (!parsed.success) {
+        const issue = parsed.error.issues[0];
+        throw new Error(
+          `定时任务文件第 ${index + 1} 条记录格式错误: ${issue?.path.join('.') || '(根)'} ${issue?.message ?? ''}`.trim(),
+        );
+      }
+      if (this.jobs.has(parsed.data.id)) throw new Error(`定时任务文件包含重复 ID: ${parsed.data.id}`);
+      this.jobs.set(parsed.data.id, parsed.data);
     }
   }
 
-  private persist(): Promise<void> {
+  private require(id: string): ScheduledJob {
+    const job = this.jobs.get(id);
+    if (!job) throw new Error(`定时任务不存在: ${id}`);
+    return job;
+  }
+
+  private async replaceAndPersist(id: string, next: ScheduledJob): Promise<void> {
+    const previous = this.jobs.get(id);
+    this.jobs.set(id, next);
+    try {
+      await this.persist();
+    } catch (error) {
+      if (previous) this.jobs.set(id, previous);
+      else this.jobs.delete(id);
+      throw error;
+    }
+  }
+
+  private async persist(): Promise<void> {
     const payload = JSON.stringify([...this.jobs.values()], null, 2);
-    const write = async () => {
-      await mkdir(dirname(this.filePath), { recursive: true });
-      const temp = `${this.filePath}.tmp`;
+    await mkdir(dirname(this.filePath), { recursive: true });
+    const temp = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
+    try {
       await writeFile(temp, `${payload}\n`, 'utf8');
       await rename(temp, this.filePath);
-    };
-    this.writeQueue = this.writeQueue.then(write, write);
-    return this.writeQueue;
+    } catch (error) {
+      await unlink(temp).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private enqueueMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.mutationQueue.then(operation, operation);
+    this.mutationQueue = run.then(() => undefined, () => undefined);
+    return run;
   }
 }

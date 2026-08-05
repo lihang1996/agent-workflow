@@ -1,5 +1,5 @@
 import type { ScheduledJob } from '../core/schedule-store.js';
-import { buildLogInspectionPrompt, readLogTail } from '../core/log-inspection.js';
+import { buildLogInspectionPrompt, readLogTail, redactSecrets } from '../core/log-inspection.js';
 import { highRiskReason, isHighRiskTask } from '../core/risk.js';
 import type { IncomingMessage } from '../im/lark.js';
 import type { AppContext } from './app-context.js';
@@ -7,7 +7,7 @@ import { startCliTask } from './cli-task.js';
 import { reconcileWorkflowSchedules, runTeamPipeline } from './pipeline-runner.js';
 import { requestHighRiskApproval } from './approval-runner.js';
 import { expireStaleApprovals } from './approval-status.js';
-import { ensureRunnableSession } from './sessions.js';
+import { ensureRunnableSession, truncate } from './sessions.js';
 
 const TICK_MS = 15_000;
 
@@ -29,9 +29,12 @@ export function scheduleRequiresApproval(job: ScheduledJob): boolean {
 /** 启动后立即检查一次；之后按固定 tick 检查持久化任务。 */
 export function startScheduler(ctx: AppContext): void {
   if (ctx.schedulerTimer) return;
-  ctx.schedulerTimer = setInterval(() => void runDueSchedules(ctx), TICK_MS);
+  const tick = () => void runDueSchedules(ctx).catch((error) => {
+    console.error('[定时任务] scheduler tick 异常:', safeScheduleError(error));
+  });
+  ctx.schedulerTimer = setInterval(tick, TICK_MS);
   ctx.schedulerTimer.unref?.();
-  void runDueSchedules(ctx);
+  tick();
   console.log('[定时任务] scheduler 已启动');
 }
 
@@ -56,23 +59,38 @@ export async function runDueSchedules(
       console.error('[定时任务] 修复工作流结算失败:', (error as Error).message);
     });
     for (const job of ctx.schedules.listDue()) {
-      let claimed: ScheduledJob | undefined;
+      if (ctx.shuttingDown) break;
+      let claimed: ScheduledJob;
       try {
         // 先认领并推进下次时间，避免相邻 tick 重复触发同一任务。
         claimed = await ctx.schedules.claimRun(job.id);
+      } catch (error) {
+        console.warn(`[定时任务] ${job.id} 未能认领，可能已被暂停、删除或其它 tick 处理:`, safeScheduleError(error));
+        continue;
+      }
+      try {
         const result = await executeJob(ctx, claimed);
         if (result.outcome === 'deferred') continue;
         await ctx.schedules.finishRun(
           claimed.id,
           result.outcome,
           result.outcome === 'skipped' ? result.reason : undefined,
+          new Date(),
+          claimed.runCount,
         );
       } catch (error) {
-        const message = (error as Error).message;
+        const message = safeScheduleError(error);
         console.error(`[定时任务] ${job.id} 执行失败:`, message);
-        if (claimed && ctx.schedules.get(claimed.id)?.lastStatus === 'running') {
-          await ctx.schedules.finishRun(claimed.id, 'failed', message).catch((persistError) => {
-            console.error(`[定时任务] ${claimed!.id} 保存失败状态异常:`, (persistError as Error).message);
+        const latest = ctx.schedules.get(claimed.id);
+        if (latest?.lastStatus === 'running' && latest.runCount === claimed.runCount) {
+          await ctx.schedules.finishRun(
+            claimed.id,
+            'failed',
+            message,
+            new Date(),
+            claimed.runCount,
+          ).catch((persistError) => {
+            console.error(`[定时任务] ${claimed.id} 保存失败状态异常:`, safeScheduleError(persistError));
           });
         }
         const bot = ctx.botsById.get(job.botId);
@@ -93,15 +111,16 @@ export async function runDueSchedules(
 async function settleDeferredRun(
   ctx: AppContext,
   jobId: string,
+  runCount: number,
   outcome: 'succeeded' | 'failed',
   error?: string,
 ): Promise<void> {
   const current = ctx.schedules.get(jobId);
-  if (!current || current.lastStatus !== 'running') return;
+  if (!current || current.lastStatus !== 'running' || current.runCount !== runCount) return;
   try {
-    await ctx.schedules.finishRun(jobId, outcome, error);
+    await ctx.schedules.finishRun(jobId, outcome, error, new Date(), runCount);
   } catch (persistError) {
-    console.error(`[定时任务] ${jobId} 保存异步结果失败:`, (persistError as Error).message);
+    console.error(`[定时任务] ${jobId} 保存异步结果失败:`, safeScheduleError(persistError));
   }
 }
 
@@ -115,7 +134,7 @@ async function runJob(ctx: AppContext, job: ScheduledJob): Promise<ScheduleExecu
   const label = job.kind === 'log_inspection' ? '服务端日志巡检' : job.kind === 'pipeline' ? '团队交付流水线' : '定时任务';
   const kickoffId = await bot.reply(
     job.message.messageId,
-    `⏰ ${label}已触发：${job.prompt}`,
+    `⏰ ${label}已触发：${truncate(redactSecrets(job.prompt), 200)}`,
     !!job.message.threadId || !!job.message.rootId,
   );
   if (!kickoffId) throw new Error('飞书未返回定时任务启动消息 ID');
@@ -179,8 +198,13 @@ async function runJob(ctx: AppContext, job: ScheduledJob): Promise<ScheduleExecu
     session,
     prompt,
     executionPolicy: job.kind === 'log_inspection' ? 'read-only' : 'standard',
-    onSuccess: async () => settleDeferredRun(ctx, job.id, 'succeeded'),
-    onFailure: async (error) => settleDeferredRun(ctx, job.id, 'failed', error.message),
+    onSuccess: async () => settleDeferredRun(ctx, job.id, job.runCount, 'succeeded'),
+    onFailure: async (error) => settleDeferredRun(ctx, job.id, job.runCount, 'failed', error.message),
   });
   return { outcome: 'deferred' };
+}
+
+function safeScheduleError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return redactSecrets(message.trim() || '未知错误').slice(-2_000);
 }
