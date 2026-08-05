@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import {
   JsonScheduleStore,
+  scheduleMatchesTopic,
   type ScheduledJob,
   type ScheduleRunOutcome,
 } from '../src/core/schedule-store.js';
@@ -65,13 +66,16 @@ test('私聊定时任务持久化原话题标识', async () => {
     const created = await store.create({
       botId: 'dev', ownerOpenId: 'ou_owner', kind: 'task', prompt: '检查项目', intervalMs: 60_000,
       message: {
-        messageId: 'om-original-topic', topicId: 'om-original-topic', chatId: 'oc_chat',
+        messageId: 'om-trigger-message', topicId: 'om-original-topic', chatId: 'oc_chat',
         chatType: 'p2p', rootId: '', threadId: '', senderOpenId: 'ou_owner',
       },
     });
     const reopened = await JsonScheduleStore.open(path);
-    assert.equal(reopened.get(created.id)?.message.topicId, 'om-original-topic');
+    const restored = reopened.get(created.id)!;
+    assert.equal(restored.message.topicId, 'om-original-topic');
     assert.equal(reopened.listByTopic('oc_chat', 'om-original-topic').length, 1);
+    assert.equal(scheduleMatchesTopic(restored, 'oc_chat', 'om-original-topic'), true);
+    assert.equal(scheduleMatchesTopic(restored, 'oc_chat', restored.message.messageId), false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -92,7 +92,7 @@ export class JsonScheduleStore {
 
   listByTopic(chatId: string, topicId: string): ScheduledJob[] {
     return [...this.jobs.values()]
-      .filter((job) => job.message.chatId === chatId && messageTopicId(job.message) === topicId)
+      .filter((job) => scheduleMatchesTopic(job, chatId, topicId))
       .sort((a, b) => a.nextRunAt.localeCompare(b.nextRunAt));
   }
 
@@ -341,4 +341,9 @@ export class JsonScheduleStore {
 
 function messageTopicId(message: StoredMessage): string {
   return message.topicId || message.threadId || message.rootId || message.messageId;
+}
+
+/** 列表与暂停/恢复/删除必须使用同一套话题判定，优先采用持久化 topicId。 */
+export function scheduleMatchesTopic(job: ScheduledJob, chatId: string, topicId: string): boolean {
+  return job.message.chatId === chatId && messageTopicId(job.message) === topicId;
 }

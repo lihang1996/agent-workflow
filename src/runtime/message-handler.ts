@@ -11,7 +11,12 @@ import { collabTopicKey } from '../core/collab.js';
 import { filterRunnableSteps } from '../core/pipeline.js';
 import { requestTaskAbort } from '../core/task-abort.js';
 import { assertWorkdir } from '../core/workdir.js';
-import { formatScheduleInterval, formatScheduleRunStatus, parseScheduleInterval } from '../core/schedule-store.js';
+import {
+  formatScheduleInterval,
+  formatScheduleRunStatus,
+  parseScheduleInterval,
+  scheduleMatchesTopic,
+} from '../core/schedule-store.js';
 import {
   assertLogFile,
   redactSecrets,
@@ -510,7 +515,7 @@ export async function handleMessage(
     }
     if ((operation === 'pause' || operation === 'resume' || operation === 'remove') && second) {
       const job = ctx.schedules.get(second);
-      if (!job || job.message.chatId !== msg.chatId || (job.message.threadId || job.message.rootId || job.message.messageId) !== topicId) {
+      if (!job || !scheduleMatchesTopic(job, msg.chatId, topicId)) {
         await bot.reply(msg.messageId, `找不到本话题定时任务：${second}`, hasThread);
         return;
       }
