@@ -14,7 +14,12 @@ import { JsonApprovalStore } from '../src/core/approval-store.js';
 import { JsonSpecStore } from '../src/core/spec-store.js';
 import { JsonWorkflowStore } from '../src/core/workflow-store.js';
 import { CreatedDocumentWriteError, normalizeDocumentMarkdown, partitionConvertedBlocks } from '../src/im/lark.js';
-import { buildQuestionnaireCard, buildSpecConfirmationCard, buildSpecReviewCard } from '../src/im/workflow-card.js';
+import {
+  buildQuestionnaireCard,
+  buildSpecConfirmationCard,
+  buildSpecReviewCard,
+  buildSpecStatusCard,
+} from '../src/im/workflow-card.js';
 import {
   confirmSpecForReview,
   reconcileWorkflowSpecStates,
@@ -30,6 +35,7 @@ import {
 } from '../src/runtime/spec-review.js';
 import { reconcileApprovalExecutions } from '../src/runtime/approval-status.js';
 import type { AppContext } from '../src/runtime/app-context.js';
+import { handleCardAction } from '../src/runtime/message-handler.js';
 
 test('问卷带工作流作用域并可持久化答案', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agent-os-questionnaire-'));
@@ -384,9 +390,40 @@ test('问卷、Spec 确认和产品评审均使用飞书 form_submit', () => {
   const confirmationCard = buildSpecConfirmationCard(spec) as any;
   const confirmationForm = confirmationCard.body.elements.find((item: any) => item.tag === 'form');
   assert.ok(confirmationForm);
-  assert.equal(confirmationForm.elements.filter((item: any) => item.tag === 'button').every((item: any) => item.action_type === 'form_submit'), true);
+  const confirmationButtons = confirmationForm.elements.filter((item: any) => item.tag === 'button');
+  assert.equal(confirmationButtons.every((item: any) => item.action_type === 'form_submit'), true);
+  assert.equal(confirmationButtons.every((item: any) =>
+    item.behaviors[0].value.specVersion === spec.updatedAt), true);
   const reviewCard = buildSpecReviewCard({ ...spec, status: 'in_review', docId: 'doc', docUrl: 'https://feishu.cn/docx/doc' }) as any;
-  assert.ok(reviewCard.body.elements.find((item: any) => item.tag === 'form'));
+  const reviewForm = reviewCard.body.elements.find((item: any) => item.tag === 'form');
+  assert.ok(reviewForm);
+  assert.equal(reviewForm.elements.filter((item: any) => item.tag === 'button').every((item: any) =>
+    item.behaviors[0].value.specVersion === spec.updatedAt), true);
+  assert.ok((buildSpecStatusCard({
+    ...spec, status: 'in_review', docId: 'doc', docUrl: 'https://feishu.cn/docx/doc',
+  }) as any).body.elements.find((item: any) => item.tag === 'form'));
+});
+
+test('旧版 Spec 卡片不能确认最新版方案', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-spec-stale-card-'));
+  try {
+    const specs = await JsonSpecStore.open(join(root, 'specs.json'));
+    const ownerOpenId = process.env.OWNER_OPEN_ID?.trim() || 'ou_owner';
+    const spec = await specs.create({
+      title: '登录', content: '最新版', chatId: 'oc', topicId: 'omt', messageId: 'om',
+      ownerOpenId, botId: 'pm',
+    });
+    const response = await handleCardAction({ specs } as unknown as AppContext, {
+      operatorOpenId: ownerOpenId,
+      messageId: 'om_old_card',
+      value: { action: 'confirm_spec', specId: spec.id, specVersion: '2026-01-01T00:00:00.000Z' },
+      formValue: {},
+    });
+    assert.match(response.toast?.content ?? '', /卡片已过期/);
+    assert.equal(specs.get(spec.id)?.status, 'pending_confirmation');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('PM 在澄清完成后输出可执行 Spec，退回后输出修订版', () => {

@@ -17,7 +17,13 @@ import { highRiskReason, isHighRiskTask } from '../core/risk.js';
 import { assertOwnedBy, isAuthorizedOperator } from '../core/access.js';
 import { resolveMentions } from '../im/message-parser.js';
 import { isAddressedToBot, type Bot, type IncomingMessage } from '../im/lark.js';
-import { buildApprovalCard, buildQuestionnaireCard, buildSpecConfirmationCard, buildSpecReviewCard } from '../im/workflow-card.js';
+import {
+  buildApprovalCard,
+  buildQuestionnaireCard,
+  buildSpecConfirmationCard,
+  buildSpecReviewCard,
+  buildSpecStatusCard,
+} from '../im/workflow-card.js';
 import type { AppContext } from './app-context.js';
 import {
   freezeRunCard,
@@ -227,7 +233,7 @@ export async function handleMessage(
         await bot.reply(msg.messageId, `找不到本话题 Spec：${specId}`, hasThread);
         return;
       }
-      await bot.replyCard(msg.messageId, buildSpecConfirmationCard(spec), hasThread);
+      await bot.replyCard(msg.messageId, buildSpecStatusCard(spec), hasThread);
       return;
     }
     if (subcommand === 'publish' && specId) {
@@ -823,6 +829,7 @@ export async function handleCardAction(
       const spec = ctx.specs.get(specId);
       if (!spec) throw new Error('Spec 不存在或已被删除。');
       assertSpecOwner(spec.ownerOpenId, action.operatorOpenId);
+      assertCurrentSpecCard(spec, action.value);
       if (spec.status !== 'in_review') throw new Error(`当前 Spec 状态为 ${spec.status}，无法处理评审。`);
 
       if (action.value.action === 'approve_spec_review') {
@@ -857,6 +864,7 @@ export async function handleCardAction(
       const spec = ctx.specs.get(specId);
       if (!spec) throw new Error('Spec 不存在或已被删除。');
       assertSpecOwner(spec.ownerOpenId, action.operatorOpenId);
+      assertCurrentSpecCard(spec, action.value);
       const published = await publishSpecToDoc(ctx, spec.id);
       return {
         toast: { type: 'success' as const, content: '已发布到飞书云文档，进入产品评审。' },
@@ -873,6 +881,7 @@ export async function handleCardAction(
       const spec = ctx.specs.get(specId);
       if (!spec) throw new Error('Spec 不存在或已被删除。');
       assertSpecOwner(spec.ownerOpenId, action.operatorOpenId);
+      assertCurrentSpecCard(spec, action.value);
       if (spec.status !== 'pending_confirmation') {
         return { toast: { type: 'info' as const, content: `Spec 当前状态：${spec.status}` } };
       }
@@ -975,6 +984,16 @@ export async function handleCardAction(
 /** 指定负责人优先；未指定时由提出需求的人确认。 */
 function assertSpecOwner(specOwnerOpenId: string, operatorOpenId: string): void {
   assertOwnedBy(specOwnerOpenId, operatorOpenId);
+}
+
+function assertCurrentSpecCard(
+  spec: import('../core/spec-store.js').ProductSpec,
+  value: Record<string, unknown>,
+): void {
+  const version = typeof value.specVersion === 'string' ? value.specVersion.trim() : '';
+  if (!version || version !== spec.updatedAt) {
+    throw new Error(`这张 Spec 卡片已过期，请发送 /spec show ${spec.id} 获取最新版。`);
+  }
 }
 
 function assertQuestionnaireAccess(

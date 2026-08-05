@@ -122,12 +122,12 @@ export function buildSpecConfirmationCard(spec: ProductSpec): CardJson {
                 label: { tag: 'plain_text', content: '退回意见（退回修改时必填）' },
                 placeholder: { tag: 'plain_text', content: '请输入需要产品经理修改的内容' },
               },
-              button('confirm_spec', { specId: spec.id }, '确认方案', 'primary', true),
-              button('reject_spec', { specId: spec.id }, '退回修改', 'danger', true),
+              button('confirm_spec', { specId: spec.id, specVersion: spec.updatedAt }, '确认方案', 'primary', true),
+              button('reject_spec', { specId: spec.id, specVersion: spec.updatedAt }, '退回修改', 'danger', true),
             ],
           }]
           : spec.status === 'confirmed'
-            ? [button('publish_spec', { specId: spec.id }, '发布到飞书云文档', 'primary')]
+            ? [button('publish_spec', { specId: spec.id, specVersion: spec.updatedAt }, '发布到飞书云文档', 'primary')]
             : []),
       ],
     },
@@ -169,8 +169,8 @@ export function buildSpecReviewCard(spec: ProductSpec): CardJson {
                   label: { tag: 'plain_text', content: '修改意见（要求修改时必填）' },
                   placeholder: { tag: 'plain_text', content: '请输入需要产品经理处理的意见' },
                 },
-                button('approve_spec_review', { specId: spec.id }, '评审通过', 'primary', true),
-                button('request_spec_changes', { specId: spec.id }, '要求修改', 'danger', true),
+                button('approve_spec_review', { specId: spec.id, specVersion: spec.updatedAt }, '评审通过', 'primary', true),
+                button('request_spec_changes', { specId: spec.id, specVersion: spec.updatedAt }, '要求修改', 'danger', true),
               ],
             },
           ]
@@ -178,6 +178,16 @@ export function buildSpecReviewCard(spec: ProductSpec): CardJson {
       ],
     },
   };
+}
+
+/** `/spec show` 根据当前阶段返回可操作的最新卡片。 */
+export function buildSpecStatusCard(spec: ProductSpec): CardJson {
+  const reviewStage = !!spec.docId
+    && (spec.status === 'published'
+      || spec.status === 'in_review'
+      || spec.status === 'changes_requested'
+      || spec.status === 'approved');
+  return reviewStage ? buildSpecReviewCard(spec) : buildSpecConfirmationCard(spec);
 }
 
 export function buildApprovalCard(approval: ApprovalRequest): CardJson {
