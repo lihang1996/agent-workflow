@@ -1,5 +1,5 @@
 export type CliId = "claude" | "codex";
-export type CliExecutionPolicy = 'standard' | 'read-only' | 'approved';
+export type CliExecutionPolicy = 'standard' | 'read-only' | 'input-only' | 'approved';
 
 export interface CliBuildOptions {
   executionPolicy?: CliExecutionPolicy;

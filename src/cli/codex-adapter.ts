@@ -281,7 +281,11 @@ export class CodexAdapter implements CliAdapter {
 }
 
 function mcpFlagsFor(policy: CliExecutionPolicy): string[] {
-  return policy === 'read-only'
-    ? ['--ignore-user-config', '-c', 'mcp_servers={}']
-    : codexMcpFlags();
+  if (policy === 'input-only') {
+    return ['--ignore-user-config', '--ignore-rules', '--ephemeral', '-c', 'mcp_servers={}'];
+  }
+  if (policy === 'read-only') {
+    return ['--ignore-user-config', '-c', 'mcp_servers={}'];
+  }
+  return codexMcpFlags();
 }

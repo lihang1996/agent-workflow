@@ -53,8 +53,10 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
     executionPolicy = 'standard',
     approvedScope,
   } = options;
-  const args = sessionId
-    ? adapter.buildResumeArgs(prompt, sessionId, { executionPolicy, approvedScope })
+  // “仅输入分析”必须是一次性上下文，不能从旧会话带入未提供的文件或消息。
+  const effectiveSessionId = executionPolicy === 'input-only' ? undefined : sessionId;
+  const args = effectiveSessionId
+    ? adapter.buildResumeArgs(prompt, effectiveSessionId, { executionPolicy, approvedScope })
     : adapter.buildArgs(prompt, { executionPolicy, approvedScope });
 
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
@@ -73,7 +75,7 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
       env: { ...process.env, ...env, AGENT_OS_EXECUTION_POLICY: executionPolicy },
     });
     const lines = createInterface({ input: child.stdout });
-    let observedSessionId = sessionId;
+    let observedSessionId = effectiveSessionId;
     let finalResult: CliRunResult | undefined;
     let resultError: Error | undefined;
     let internalError: Error | undefined;
@@ -133,7 +135,7 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
         return;
       }
       for (const event of events) {
-        if ('sessionId' in event && event.sessionId) {
+        if (executionPolicy !== 'input-only' && 'sessionId' in event && event.sessionId) {
           observedSessionId = event.sessionId;
         }
         try {
@@ -148,9 +150,12 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
           continue;
         }
         if (event.type === 'result') {
+          const resultSessionId = executionPolicy === 'input-only'
+            ? undefined
+            : (event.sessionId ?? observedSessionId);
           finalResult = {
             answer: event.answer,
-            sessionId: event.sessionId ?? observedSessionId,
+            ...(resultSessionId ? { sessionId: resultSessionId } : {}),
             ...(event.stats ? { stats: event.stats } : {}),
           };
         }

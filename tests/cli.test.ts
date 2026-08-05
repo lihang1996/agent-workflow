@@ -10,10 +10,13 @@ class NodeScriptAdapter implements CliAdapter {
   readonly command = process.execPath;
   readonly displayName = '测试 CLI';
 
-  constructor(private readonly script: string) {}
+  constructor(
+    private readonly script: string,
+    private readonly resumeScript = script,
+  ) {}
 
   buildArgs(): string[] { return ['-e', this.script]; }
-  buildResumeArgs(): string[] { return this.buildArgs(); }
+  buildResumeArgs(): string[] { return ['-e', this.resumeScript]; }
   parseEvents(line: string): CliEvent[] { return [JSON.parse(line) as CliEvent]; }
 }
 
@@ -59,6 +62,20 @@ test('CLI 超时和预先取消均不会留下运行任务', async () => {
     () => runCli({ adapter, prompt: 'test', cwd: process.cwd(), signal: controller.signal }),
     /执行已取消/,
   );
+});
+
+test('仅输入分析不会恢复或返回持久会话', async () => {
+  const fresh = `console.log(JSON.stringify({type:'result',answer:'fresh',sessionId:'new-session'}))`;
+  const resumed = `console.log(JSON.stringify({type:'result',answer:'resumed',sessionId:'old-session'}))`;
+  const result = await runCli({
+    adapter: new NodeScriptAdapter(fresh, resumed),
+    prompt: '分析已提供日志',
+    cwd: process.cwd(),
+    sessionId: 'old-session',
+    executionPolicy: 'input-only',
+  });
+  assert.equal(result.answer, 'fresh');
+  assert.equal(result.sessionId, undefined);
 });
 
 test('Claude 流同时解析文本、上下文和工具事件', () => {

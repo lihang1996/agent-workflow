@@ -149,8 +149,13 @@ function outputArgs(prompt: string, policy: CliExecutionPolicy, approvedScope?: 
     "stream-json",
     "--verbose",
     ...permissionFlags(policy),
-    ...(policy === 'approved' ? [] : ['--settings', ensureClaudePermissionSettingsFile()]),
-    ...(policy === 'read-only'
+    ...(policy === 'input-only'
+      ? ['--safe-mode', '--disable-slash-commands', '--no-session-persistence']
+      : []),
+    ...(policy === 'approved' || policy === 'input-only'
+      ? []
+      : ['--settings', ensureClaudePermissionSettingsFile()]),
+    ...(policy === 'read-only' || policy === 'input-only'
       ? ['--mcp-config', '{"mcpServers":{}}', '--strict-mcp-config']
       : claudeMcpFlags()),
   ];
@@ -158,6 +163,9 @@ function outputArgs(prompt: string, policy: CliExecutionPolicy, approvedScope?: 
 
 function permissionFlags(policy: CliExecutionPolicy): string[] {
   if (policy === 'approved') return ['--dangerously-skip-permissions'];
+  if (policy === 'input-only') {
+    return ['--permission-mode', 'dontAsk', '--tools', ''];
+  }
   if (policy === 'read-only') {
     return ['--permission-mode', 'dontAsk', '--tools', 'Read,Glob,Grep'];
   }

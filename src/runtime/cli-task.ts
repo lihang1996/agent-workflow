@@ -85,7 +85,7 @@ export async function startCliTask(
   const tracker = new TaskProgressTracker(
     Date.now,
     ctx.contextWindows.get(session.id),
-    !session.cliSessionId,
+    executionPolicy === 'input-only' || !session.cliSessionId,
   );
 
   // 先发卡并同步落盘，再下载资源，缩短孤儿卡窗口。
@@ -258,7 +258,7 @@ export async function startCliTask(
     adapter,
     prompt: taskPrompt,
     cwd,
-    sessionId: session.cliSessionId,
+    sessionId: executionPolicy === 'input-only' ? undefined : session.cliSessionId,
     signal: controller.signal,
     onEvent: onCliEvent,
     executionPolicy,
@@ -273,14 +273,18 @@ export async function startCliTask(
     },
   })
     .then(async (result) => {
-      if (result.sessionId && result.sessionId !== session.cliSessionId) {
+      if (
+        executionPolicy !== 'input-only'
+        && result.sessionId
+        && result.sessionId !== session.cliSessionId
+      ) {
         try {
           await ctx.sessions.setCliSessionId(session.id, result.sessionId);
         } catch (error) {
           console.error('[会话] 保存 CLI 上下文失败:', safeErrorMessage(error));
         }
       }
-      if (result.stats?.contextWindowTokens) {
+      if (executionPolicy !== 'input-only' && result.stats?.contextWindowTokens) {
         ctx.contextWindows.set(session.id, result.stats.contextWindowTokens);
       }
       // 先标记成功，防止停机逻辑把绿卡盖成红卡。

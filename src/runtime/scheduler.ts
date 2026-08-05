@@ -197,7 +197,7 @@ async function runJob(ctx: AppContext, job: ScheduledJob): Promise<ScheduleExecu
     msg,
     session,
     prompt,
-    executionPolicy: job.kind === 'log_inspection' ? 'read-only' : 'standard',
+    executionPolicy: job.kind === 'log_inspection' ? 'input-only' : 'standard',
     onSuccess: async () => settleDeferredRun(ctx, job.id, job.runCount, 'succeeded'),
     onFailure: async (error) => settleDeferredRun(ctx, job.id, job.runCount, 'failed', error.message),
   });
