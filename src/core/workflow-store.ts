@@ -97,6 +97,11 @@ export class JsonWorkflowStore {
       workflow.approvalId === approvalId && workflow.approvalAttempt === approvalAttempt);
   }
 
+  findBySchedule(scheduleJobId: string, scheduleRunCount: number): DeliveryWorkflow | undefined {
+    return [...this.workflows.values()].find((workflow) =>
+      workflow.scheduleJobId === scheduleJobId && workflow.scheduleRunCount === scheduleRunCount);
+  }
+
   list(): DeliveryWorkflow[] {
     return [...this.workflows.values()];
   }
@@ -128,6 +133,10 @@ export class JsonWorkflowStore {
         createdAt: now,
         updatedAt: now,
       });
+      const launchKey = workflowLaunchKey(workflow);
+      const existing = [...this.workflows.values()].find((candidate) =>
+        workflowLaunchKey(candidate) === launchKey);
+      if (existing) return existing;
       await this.replaceAndPersist(workflow.id, workflow);
       return workflow;
     });
@@ -266,6 +275,7 @@ export class JsonWorkflowStore {
       throw new Error(`工作流文件不是有效 JSON: ${this.filePath}`, { cause: error });
     }
     if (!Array.isArray(rows)) throw new Error(`工作流文件格式错误: ${this.filePath}`);
+    const launchKeys = new Set<string>();
     for (const [index, row] of rows.entries()) {
       const parsed = DeliveryWorkflowSchema.safeParse(row);
       if (!parsed.success) {
@@ -275,6 +285,9 @@ export class JsonWorkflowStore {
         );
       }
       if (this.workflows.has(parsed.data.id)) throw new Error(`工作流文件包含重复 ID: ${parsed.data.id}`);
+      const launchKey = workflowLaunchKey(parsed.data);
+      if (launchKeys.has(launchKey)) throw new Error(`工作流文件包含重复启动记录: ${launchKey}`);
+      launchKeys.add(launchKey);
       this.workflows.set(parsed.data.id, parsed.data);
     }
   }
@@ -292,4 +305,28 @@ export class JsonWorkflowStore {
     this.mutationQueue = run.then(() => undefined, () => undefined);
     return run;
   }
+}
+
+function workflowLaunchKey(workflow: {
+  kind: DeliveryWorkflow['kind'];
+  initiatorBotId: string;
+  message: DeliveryWorkflow['message'];
+  approvalId?: string;
+  approvalAttempt?: number;
+  scheduleJobId?: string;
+  scheduleRunCount?: number;
+}): string {
+  if (workflow.approvalId && workflow.approvalAttempt) {
+    return JSON.stringify(['approval', workflow.approvalId, workflow.approvalAttempt]);
+  }
+  if (workflow.scheduleJobId && workflow.scheduleRunCount) {
+    return JSON.stringify(['schedule', workflow.scheduleJobId, workflow.scheduleRunCount]);
+  }
+  return JSON.stringify([
+    'message',
+    workflow.message.chatId,
+    workflow.message.messageId,
+    workflow.initiatorBotId,
+    workflow.kind,
+  ]);
 }

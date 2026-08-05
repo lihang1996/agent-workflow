@@ -196,6 +196,53 @@ test('交付工作流状态可在重启后恢复', async () => {
   }
 });
 
+test('同一消息、审批轮次或定时轮次只创建一份工作流', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-workflow-idempotent-'));
+  const path = join(root, 'workflows.json');
+  try {
+    const store = await JsonWorkflowStore.open(path);
+    const base = {
+      kind: 'team' as const,
+      name: '团队交付流水线',
+      initiatorBotId: 'ceo',
+      goal: '完成登录功能',
+      stepIds: ['pm' as const],
+      message: {
+        messageId: 'om_message', chatId: 'oc_chat', chatType: 'group',
+        rootId: '', threadId: '', senderOpenId: 'ou_owner',
+      },
+    };
+    const [first, duplicate] = await Promise.all([store.create(base), store.create(base)]);
+    assert.equal(duplicate.id, first.id);
+
+    const approvalInput = {
+      ...base,
+      message: { ...base.message, messageId: 'om_approval' },
+      executionPolicy: 'approved' as const,
+      approvalId: '3e3f9af8-009a-4f7f-8ce4-793fac7922d0',
+      approvalAttempt: 1,
+    };
+    const approved = await store.create(approvalInput);
+    assert.equal((await store.create(approvalInput)).id, approved.id);
+    assert.equal(store.findByApproval(approvalInput.approvalId, 1)?.id, approved.id);
+
+    const scheduleInput = {
+      ...base,
+      message: { ...base.message, messageId: 'om_schedule' },
+      scheduleJobId: 'job-1',
+      scheduleRunCount: 1,
+    };
+    const scheduled = await store.create(scheduleInput);
+    assert.equal((await store.create(scheduleInput)).id, scheduled.id);
+    assert.equal(store.findBySchedule('job-1', 1)?.id, scheduled.id);
+    const nextRun = await store.create({ ...scheduleInput, scheduleRunCount: 2 });
+    assert.notEqual(nextRun.id, scheduled.id);
+    assert.equal(store.list().length, 4);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('工作流与 Spec 落盘失败时回滚内存状态', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agent-os-core-store-rollback-'));
   try {
