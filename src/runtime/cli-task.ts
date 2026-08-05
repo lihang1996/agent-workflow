@@ -13,7 +13,7 @@ import { extractResourceKeys } from '../im/message-parser.js';
 import type { Bot, IncomingMessage } from '../im/lark.js';
 import type { Session } from '../core/session-manager.js';
 import { TaskProgressTracker } from '../core/task-progress.js';
-import { redactSecrets, sanitizeForLog } from '../core/log-inspection.js';
+import { sanitizeErrorForLog, sanitizeForLog } from '../core/log-inspection.js';
 import { assertWorkdir } from '../core/workdir.js';
 import type { AppContext } from './app-context.js';
 import type { ActiveRun } from './types.js';
@@ -118,7 +118,7 @@ export async function startCliTask(
     try {
       await onFailure(error);
     } catch (callbackError) {
-      console.error('[工作流] 失败回调执行异常:', (callbackError as Error).message);
+      console.error('[工作流] 失败回调执行异常:', safeErrorMessage(callbackError));
     }
   };
   const cardUpdater = new ThrottledCardUpdater(async (card, options) => {
@@ -179,7 +179,7 @@ export async function startCliTask(
         downloadedPaths.push(absolutePath);
         console.log(`  [下载] ${res.type} → ${absolutePath}`);
       } catch (e) {
-        console.error(`  [下载失败] ${res.key}:`, (e as Error).message);
+        console.error(`  [下载失败] ${sanitizeForLog(res.key, 200)}:`, safeErrorMessage(e));
       }
     }
     if (downloadedPaths.length > 0) {
@@ -419,8 +419,7 @@ export async function startCliTask(
 }
 
 function safeErrorMessage(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return redactSecrets(message.trim() || '未知错误').slice(-2_000);
+  return sanitizeErrorForLog(error);
 }
 
 async function flushPersistActiveRunsSafely(ctx: AppContext): Promise<void> {

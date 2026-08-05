@@ -1,5 +1,10 @@
 import type { ScheduledJob } from '../core/schedule-store.js';
-import { buildLogInspectionPrompt, readLogTail, redactSecrets } from '../core/log-inspection.js';
+import {
+  buildLogInspectionPrompt,
+  readLogTail,
+  redactSecrets,
+  sanitizeErrorForLog,
+} from '../core/log-inspection.js';
 import { highRiskReason, isHighRiskTask } from '../core/risk.js';
 import type { IncomingMessage } from '../im/lark.js';
 import type { AppContext } from './app-context.js';
@@ -56,7 +61,7 @@ export async function runDueSchedules(
       console.error('[审批] 清理过期审批失败:', safeScheduleError(error));
     });
     await reconcileWorkflowSchedules(ctx).catch((error) => {
-      console.error('[定时任务] 修复工作流结算失败:', (error as Error).message);
+      console.error('[定时任务] 修复工作流结算失败:', safeScheduleError(error));
     });
     for (const job of ctx.schedules.listDue()) {
       if (ctx.shuttingDown) break;
@@ -209,6 +214,5 @@ async function runJob(ctx: AppContext, job: ScheduledJob): Promise<ScheduleExecu
 }
 
 function safeScheduleError(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return redactSecrets(message.trim() || '未知错误').slice(-2_000);
+  return sanitizeErrorForLog(error);
 }

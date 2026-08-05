@@ -1,5 +1,5 @@
 import type { ApprovalExecutionOutcome, ApprovalRequest } from '../core/approval-store.js';
-import { redactSecrets } from '../core/log-inspection.js';
+import { sanitizeErrorForLog } from '../core/log-inspection.js';
 import { buildApprovalCard } from '../im/workflow-card.js';
 import type { AppContext } from './app-context.js';
 
@@ -142,6 +142,5 @@ function scheduleOutcomeFor(
 }
 
 function safeApprovalError(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return redactSecrets(message.trim() || '未知错误').slice(0, 2_000);
+  return sanitizeErrorForLog(error);
 }

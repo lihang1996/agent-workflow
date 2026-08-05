@@ -12,7 +12,12 @@ import { filterRunnableSteps } from '../core/pipeline.js';
 import { requestTaskAbort } from '../core/task-abort.js';
 import { assertWorkdir } from '../core/workdir.js';
 import { formatScheduleInterval, formatScheduleRunStatus, parseScheduleInterval } from '../core/schedule-store.js';
-import { assertLogFile, redactSecrets, sanitizeForLog } from '../core/log-inspection.js';
+import {
+  assertLogFile,
+  redactSecrets,
+  sanitizeErrorForLog,
+  sanitizeForLog,
+} from '../core/log-inspection.js';
 import { highRiskReason, isHighRiskTask } from '../core/risk.js';
 import { assertOwnedBy, isAuthorizedOperator } from '../core/access.js';
 import { resolveMentions } from '../im/message-parser.js';
@@ -779,7 +784,7 @@ export async function handleCardAction(
       if (action.value.action === 'reject_high_risk') {
         const rejected = await ctx.approvals.reject(approval.id, action.operatorOpenId);
         await settleApprovalSchedule(ctx, rejected, 'skipped', '负责人拒绝审批').catch((error) => {
-          console.error(`[审批] ${rejected.id} 拒绝结算失败:`, redactSecrets((error as Error).message).slice(0, 2_000));
+          console.error(`[审批] ${rejected.id} 拒绝结算失败:`, sanitizeErrorForLog(error));
         });
         return {
           toast: { type: 'info' as const, content: '已拒绝，高风险任务不会执行。' },
@@ -820,7 +825,7 @@ export async function handleCardAction(
       const latest = approvalId ? ctx.approvals.get(approvalId) : undefined;
       if (latest?.status === 'expired' || latest?.status === 'rejected') {
         await settleApprovalSchedule(ctx, latest, 'skipped', latest.executionError).catch((settleError) => {
-          console.error(`[审批] ${latest.id} 定时任务结算失败:`, redactSecrets((settleError as Error).message).slice(0, 2_000));
+          console.error(`[审批] ${latest.id} 定时任务结算失败:`, sanitizeErrorForLog(settleError));
         });
       }
       return {
@@ -1046,6 +1051,6 @@ function assertCurrentQuestionnaireCard(
 
 function runWorkflowContinuation(task: Promise<void>, label: string): void {
   void task.catch((error) => {
-    console.error(`[工作流] ${label}失败:`, (error as Error).message);
+    console.error(`[工作流] ${label}失败:`, sanitizeErrorForLog(error));
   });
 }

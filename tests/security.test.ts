@@ -12,6 +12,7 @@ import {
   buildLogInspectionPrompt,
   readLogTail,
   redactSecrets,
+  sanitizeErrorForLog,
   sanitizeForLog,
   summarizeLogSignals,
 } from '../src/core/log-inspection.js';
@@ -587,6 +588,17 @@ test('终端日志会脱敏并转义换行、ANSI 和双向控制符', () => {
   assert.match(safe, /\\n/);
   assert.match(safe, /\\u001b/);
   assert.match(safe, /\\u202e/);
+});
+
+test('未知异常写入终端前会统一脱敏并限制长度', () => {
+  const safe = sanitizeErrorForLog(
+    new Error(`password=hunter2\n伪造日志\u001b[31m${'x'.repeat(100)}`),
+    50,
+  );
+  assert.match(safe, /password=\[REDACTED\]/);
+  assert.match(safe, /\\n/);
+  assert.doesNotMatch(safe, /hunter2|\u001b/);
+  assert.ok(safe.length <= 51);
 });
 
 test('日志巡检提供异常基线，敏感路径不会误触发高风险任务执行', () => {

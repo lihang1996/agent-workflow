@@ -1,6 +1,6 @@
 import type { ApprovalRequest } from '../core/approval-store.js';
 import { assertOwnedBy } from '../core/access.js';
-import { redactSecrets } from '../core/log-inspection.js';
+import { sanitizeErrorForLog } from '../core/log-inspection.js';
 import type { IncomingMessage, Bot } from '../im/lark.js';
 import { buildApprovalCard } from '../im/workflow-card.js';
 import type { AppContext } from './app-context.js';
@@ -66,8 +66,7 @@ export async function requestHighRiskApproval(
 }
 
 function safeApprovalError(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return redactSecrets(message.trim() || '未知错误').slice(0, 2_000);
+  return sanitizeErrorForLog(error);
 }
 
 /**

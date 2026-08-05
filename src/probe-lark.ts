@@ -4,6 +4,7 @@
 import 'dotenv/config';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { loadBotConfigs } from './core/bot-config.js';
+import { sanitizeErrorForLog } from './core/log-inspection.js';
 
 interface BotInfoResponse {
   code?: number;
@@ -33,7 +34,7 @@ if (configs.length === 0) {
       console.log(`✅ ${config.id}（${config.name}）凭证有效，open_id=${info.open_id}`);
     } catch (error) {
       failures += 1;
-      console.error(`❌ ${config.id}（${config.name}）连接检查失败：${(error as Error).message}`);
+      console.error(`❌ ${config.id}（${config.name}）连接检查失败：${sanitizeErrorForLog(error)}`);
     }
   }
   if (failures > 0) process.exitCode = 1;

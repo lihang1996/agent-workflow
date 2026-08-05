@@ -108,6 +108,12 @@ export function sanitizeForLog(content: string, maxChars = 1_000): string {
   return safe.length > limit ? `${safe.slice(0, limit)}…` : safe;
 }
 
+/** 把未知异常安全地写入终端；统一处理非 Error、凭证、控制字符和超长文本。 */
+export function sanitizeErrorForLog(error: unknown, maxChars = 2_000): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return sanitizeForLog(message.trim() || '未知错误', maxChars);
+}
+
 /** 给模型提供可核对的基线计数，不把异常判定完全交给自然语言推断。 */
 export function summarizeLogSignals(content: string): LogSignalSummary {
   const lines = content.split(/\r?\n/).filter(Boolean);

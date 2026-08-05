@@ -1,6 +1,6 @@
 import { buildTaskCard } from '../im/card.js';
 import type { PersistedActiveRun } from '../core/active-run-store.js';
-import { sanitizeForLog } from '../core/log-inspection.js';
+import { sanitizeErrorForLog } from '../core/log-inspection.js';
 import type { AppContext } from './app-context.js';
 import type { ActiveRun } from './types.js';
 import { markSessionIdle } from './sessions.js';
@@ -101,7 +101,7 @@ export async function reconcileOrphanedCards(ctx: AppContext): Promise<void> {
       remaining.push(orphan);
       console.error(
         `[任务] 收尾遗留卡片失败 bot=${orphan.botId} card=${orphan.cardId}:`,
-        (error as Error).message,
+        sanitizeErrorForLog(error),
       );
     }
   }
@@ -145,7 +145,7 @@ export async function shutdownActiveRuns(ctx: AppContext, reason: string): Promi
     try {
       await markSessionIdle(ctx, sessionId);
     } catch (error) {
-      console.error('[会话] 停机收尾失败:', (error as Error).message);
+      console.error('[会话] 停机收尾失败:', sanitizeErrorForLog(error));
     }
     run.resolveDone();
   }
@@ -162,6 +162,5 @@ export function freezeRunCard(run: ActiveRun): void {
 }
 
 function logPersistError(error: unknown): void {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error('[任务] 持久化进行中卡片失败:', sanitizeForLog(message, 2_000));
+  console.error('[任务] 持久化进行中卡片失败:', sanitizeErrorForLog(error));
 }

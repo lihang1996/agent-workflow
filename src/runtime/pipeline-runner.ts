@@ -8,7 +8,7 @@ import {
 } from '../core/pipeline.js';
 import type { DeliveryWorkflow } from '../core/workflow-store.js';
 import type { ProductSpec } from '../core/spec-store.js';
-import { redactSecrets, sanitizeForLog } from '../core/log-inspection.js';
+import { redactSecrets, sanitizeErrorForLog, sanitizeForLog } from '../core/log-inspection.js';
 import { buildQuestionnaireCard, buildSpecConfirmationCard } from '../im/workflow-card.js';
 import type { Bot, IncomingMessage } from '../im/lark.js';
 import type { AppContext } from './app-context.js';
@@ -120,7 +120,7 @@ async function createAndStartWorkflow(
     } catch (error) {
       await ctx.workflows.update(workflow.id, {
         status: 'failed',
-        error: `绑定审批失败：${(error as Error).message}`,
+        error: `绑定审批失败：${persistentErrorMessage(error, 2_000)}`,
       });
       throw error;
     }
@@ -158,7 +158,7 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
       await settleWorkflowApproval(ctx, completed, 'succeeded');
       await settleWorkflowSchedule(ctx, completed, 'succeeded');
       await initiator.reply(msg.messageId, `${workflow.name}已全部完成。`, hasThread(msg)).catch((error) => {
-        console.error(`[${workflow.name}] 完成通知发送失败:`, (error as Error).message);
+        console.error(`[${workflow.name}] 完成通知发送失败:`, sanitizeErrorForLog(error));
       });
       return;
     }
@@ -340,7 +340,7 @@ async function completeProductStep(
       } catch (error) {
         console.error(
           `[产品评审] 同步解决 Spec ${existing.id} 评论 ${documentCommentId} 失败，将由轮询重试:`,
-          (error as Error).message,
+          sanitizeErrorForLog(error),
         );
       }
     }
@@ -415,7 +415,7 @@ export async function confirmSpecForReview(ctx: AppContext, specId: string) {
   } catch (error) {
     await ctx.specs.updateIfStatus(confirmed.id, 'confirmed', { status: 'pending_confirmation' })
       .catch((rollbackError) => {
-        console.error(`[工作流] 回滚 Spec ${confirmed.id} 确认状态失败:`, (rollbackError as Error).message);
+        console.error(`[工作流] 回滚 Spec ${confirmed.id} 确认状态失败:`, sanitizeErrorForLog(rollbackError));
       });
     throw error;
   }
@@ -451,7 +451,7 @@ export async function rejectSpecConfirmation(
       status: 'pending_confirmation',
       confirmationFeedback: undefined,
     }).catch((rollbackError) => {
-      console.error(`[工作流] 回滚 Spec ${changed.id} 退回状态失败:`, (rollbackError as Error).message);
+      console.error(`[工作流] 回滚 Spec ${changed.id} 退回状态失败:`, sanitizeErrorForLog(rollbackError));
     });
     throw error;
   }
@@ -537,7 +537,7 @@ export async function resumeRecoverableWorkflows(ctx: AppContext): Promise<void>
       await continueDeliveryWorkflow(ctx, workflow.id);
     } catch (error) {
       await failWorkflow(ctx, workflow.id, `恢复失败：${(error as Error).message}`).catch((failError) => {
-        console.error(`[工作流] ${workflow.id} 保存恢复失败状态异常:`, (failError as Error).message);
+        console.error(`[工作流] ${workflow.id} 保存恢复失败状态异常:`, sanitizeErrorForLog(failError));
       });
     }
   }
@@ -600,7 +600,7 @@ async function failWorkflow(
   error: string,
   expectedStep?: WorkflowStepExpectation,
 ): Promise<void> {
-  const normalizedError = error.trim().slice(-10_000) || '工作流执行失败';
+  const normalizedError = persistentErrorMessage(error, 10_000);
   const failed = expectedStep
     ? await ctx.workflows.updateIfCurrentStep(
       workflowId,
@@ -637,7 +637,7 @@ async function settleWorkflowApproval(
     outcome,
     error,
   ).catch((settleError) => {
-    console.error(`[审批] 工作流 ${workflow.id} 回写失败:`, redactSecrets((settleError as Error).message).slice(0, 2_000));
+    console.error(`[审批] 工作流 ${workflow.id} 回写失败:`, sanitizeErrorForLog(settleError));
   });
 }
 
@@ -657,8 +657,14 @@ async function settleWorkflowSchedule(
     new Date(),
     workflow.scheduleRunCount,
   ).catch((settleError) => {
-    console.error(`[定时任务] 工作流 ${workflow.id} 结算失败:`, (settleError as Error).message);
+    console.error(`[定时任务] 工作流 ${workflow.id} 结算失败:`, sanitizeErrorForLog(settleError));
   });
+}
+
+function persistentErrorMessage(error: unknown, maxChars: number): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const redacted = redactSecrets(message).trim() || '工作流执行失败';
+  return redacted.slice(-maxChars);
 }
 
 export async function reconcileWorkflowSchedules(ctx: AppContext): Promise<void> {

@@ -10,6 +10,7 @@ import type { AppContext } from './app-context.js';
 import { startCliTask } from './cli-task.js';
 import { ensureRunnableSession, topicIdOf } from './sessions.js';
 import type { CliExecutionPolicy } from '../cli/types.js';
+import { sanitizeErrorForLog } from '../core/log-inspection.js';
 
 /** reviewer →（未通过则）dev → 复审，直到通过或达上限。 */
 export async function runCollabReview(
@@ -61,7 +62,7 @@ export async function runCollabReview(
   let failureReported = false;
   const reportFailure = async (error: Error) => {
     await ctx.collabStore.clearRound(topicKey).catch((persistError) => {
-      console.error('[协作] 清理失败轮次异常:', (persistError as Error).message);
+      console.error('[协作] 清理失败轮次异常:', sanitizeErrorForLog(persistError));
     });
     if (failureReported) return;
     failureReported = true;
