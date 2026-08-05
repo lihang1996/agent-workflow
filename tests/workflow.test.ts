@@ -40,6 +40,26 @@ test('问卷带工作流作用域并可持久化答案', async () => {
   }
 });
 
+test('问卷仓库兼容早期 8 位 ID 数据', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-questionnaire-legacy-'));
+  try {
+    const legacy = {
+      id: '244f742c',
+      title: '早期问卷',
+      questions: [{ id: 'auth', prompt: '登录方式？', kind: 'single_choice', options: ['密码', '验证码'] }],
+      answers: { auth: '密码' },
+      status: 'answered',
+      createdAt: '2026-08-04T09:36:48.458Z',
+      updatedAt: '2026-08-04T09:36:48.461Z',
+    };
+    await writeFile(join(root, '244f742c.json'), JSON.stringify(legacy));
+    const store = new JsonQuestionnaireStore(root);
+    assert.deepEqual(await store.get(legacy.id), legacy);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('问卷拒绝歧义结构与越界答案', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agent-os-questionnaire-validation-'));
   try {

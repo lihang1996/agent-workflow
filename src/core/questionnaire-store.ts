@@ -30,6 +30,12 @@ export const QuestionSchema = z.object({
 });
 export type Question = z.infer<typeof QuestionSchema>;
 
+// 兼容早期 randomUUID().slice(0, 8) 生成的问卷 ID；新问卷仍使用完整 UUID。
+const QuestionnaireIdSchema = z.string().regex(
+  /^(?:[0-9a-f]{8}|[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i,
+  '问卷 ID 格式无效',
+);
+
 const QuestionsSchema = z.array(QuestionSchema).min(1).max(20).superRefine((questions, ctx) => {
   const seen = new Set<string>();
   questions.forEach((question, index) => {
@@ -41,7 +47,7 @@ const QuestionsSchema = z.array(QuestionSchema).min(1).max(20).superRefine((ques
 });
 
 export const QuestionnaireSchema = z.object({
-  id: z.string().uuid(),
+  id: QuestionnaireIdSchema,
   title: z.string().trim().min(1).max(100),
   goal: z.string().trim().max(2_000).optional(),
   questions: QuestionsSchema,
@@ -57,8 +63,6 @@ export const QuestionnaireSchema = z.object({
   workflowId: z.string().uuid().optional(),
 });
 export type Questionnaire = z.infer<typeof QuestionnaireSchema>;
-
-const QuestionnaireIdSchema = z.string().uuid();
 
 /** MCP 与飞书表单共用的问卷文件仓库。 */
 export class JsonQuestionnaireStore {
