@@ -8,7 +8,7 @@ import { SessionManager, type Session } from '../src/core/session-manager.js';
 import { JsonSessionStore, type SessionStore } from '../src/core/session-store.js';
 import { JsonTopicStore } from '../src/core/topic-store.js';
 import type { AppContext } from '../src/runtime/app-context.js';
-import { persistActiveRuns, reconcileOrphanedCards } from '../src/runtime/active-runs.js';
+import { persistActiveRuns, reconcileOrphanedCards, shutdownActiveRuns } from '../src/runtime/active-runs.js';
 import { ensureRunnableSession } from '../src/runtime/sessions.js';
 import { handleMessage } from '../src/runtime/message-handler.js';
 import type { Bot, IncomingMessage } from '../src/im/lark.js';
@@ -200,6 +200,32 @@ test('遗留任务卡刷新失败时保留快照供下次重试', async () => {
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('停机收尾会等待成功任务的工作流续跑完成', async () => {
+  let resolveDone = () => {};
+  const done = new Promise<void>((resolve) => { resolveDone = resolve; });
+  const activeRuns = new Map([['session-success', {
+    terminalStatus: 'success' as const,
+    done,
+    resolveDone,
+  }]]);
+  const ctx = {
+    shuttingDown: false,
+    activeRuns,
+    shutdownGraceMs: 1_000,
+    sessions: new SessionManager(),
+    activeRunStore: { clear: async () => undefined },
+  } as unknown as AppContext;
+  let settled = false;
+  const shutdown = shutdownActiveRuns(ctx, '测试停机').then(() => { settled = true; });
+
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  resolveDone();
+  await shutdown;
+  assert.equal(settled, true);
+  assert.equal(activeRuns.size, 0);
 });
 
 test('话题目录落盘失败时回滚内存绑定', async () => {

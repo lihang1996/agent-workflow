@@ -349,7 +349,8 @@ export async function startCliTask(
         }
       }
       console.log(`[CLI:${bot.id}/${adapter.id}] 完成 session_id=${result.sessionId ?? '(无)'}`);
-      if (ctx.activeRuns.get(session.id) === activeRun) ctx.activeRuns.delete(session.id);
+      // CLI 成功后仍保留运行登记，直到 onSuccess 工作流续跑完成；停机时才能等待跨存储状态写完。
+      // 快照会过滤 terminalStatus=success，因此这里落盘不会遗留一张误报中断的成功卡片。
       await flushPersistActiveRunsSafely(ctx);
       try {
         await markSessionIdle(ctx, session.id);
