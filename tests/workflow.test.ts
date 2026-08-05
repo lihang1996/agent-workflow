@@ -32,6 +32,8 @@ import {
   publishSpecToDoc,
   requestSpecChangesFromCard,
   runSpecReviewSync,
+  startSpecReviewSync,
+  stopSpecReviewSync,
 } from '../src/runtime/spec-review.js';
 import { reconcileApprovalExecutions } from '../src/runtime/approval-status.js';
 import type { AppContext } from '../src/runtime/app-context.js';
@@ -969,6 +971,32 @@ test('本地已处理评论会补偿同步为云文档已解决', async () => {
     assert.ok(specs.get(spec.id)?.comments[0].documentResolvedAt);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('产品评审定时同步会兜底入口异常并清理运行标记', async () => {
+  const ctx = {
+    shuttingDown: false,
+    specReviewRunning: false,
+    specs: {
+      listPendingDocumentResolution: () => {
+        throw new Error('secret=review-token\n伪造日志');
+      },
+    },
+  } as unknown as AppContext;
+  const errors: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+  try {
+    startSpecReviewSync(ctx);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(ctx.specReviewRunning, false);
+    assert.match(errors.join('\n'), /云文档评论同步任务异常/);
+    assert.doesNotMatch(errors.join('\n'), /review-token/);
+    assert.match(errors.join('\n'), /\\n伪造日志/);
+  } finally {
+    stopSpecReviewSync(ctx);
+    console.error = originalError;
   }
 });
 

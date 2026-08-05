@@ -1,4 +1,5 @@
 import type { ProductSpec } from '../core/spec-store.js';
+import { sanitizeForLog } from '../core/log-inspection.js';
 import {
   CreatedDocumentWriteError,
   type Bot,
@@ -19,6 +20,10 @@ const MAX_REVIEW_COMMENT_LENGTH = 10_000;
 const MAX_REVIEW_FEEDBACK_ITEM_LENGTH = 2_000;
 const MAX_CARD_REVIEW_LENGTH = 4_000;
 const specOperationTails = new Map<string, Promise<void>>();
+
+function safeReviewError(error: unknown): string {
+  return sanitizeForLog(error instanceof Error ? error.message : String(error));
+}
 
 function syncIntervalMs(): number {
   const parsed = Number(process.env.SPEC_REVIEW_SYNC_INTERVAL_MS);
@@ -116,7 +121,7 @@ async function applyReviewCommentsUnlocked(
       buildSpecReviewCard(latest),
       latest.topicId !== latest.messageId,
     ).catch((error) => {
-      console.error(`[产品评审] 回传 Spec ${latest.id} 卡片失败:`, (error as Error).message);
+      console.error(`[产品评审] 回传 Spec ${latest.id} 卡片失败:`, safeReviewError(error));
       return undefined;
     });
   }
@@ -288,7 +293,7 @@ async function syncResolvedDocumentComments(ctx: AppContext, specId: string): Pr
     } catch (error) {
       console.error(
         `[产品评审] 同步解决 Spec ${spec.id} 评论 ${documentCommentId} 失败:`,
-        (error as Error).message,
+        safeReviewError(error),
       );
     }
   }
@@ -313,13 +318,17 @@ export async function runSpecReviewSync(ctx: AppContext): Promise<void> {
   ctx.specReviewRunning = true;
   try {
     for (const spec of ctx.specs.listPendingDocumentResolution()) {
-      await runSerialSpecOperation(spec.id, () => syncResolvedDocumentComments(ctx, spec.id));
+      try {
+        await runSerialSpecOperation(spec.id, () => syncResolvedDocumentComments(ctx, spec.id));
+      } catch (error) {
+        console.error(`[产品评审] 同步解决 Spec ${spec.id} 评论失败:`, safeReviewError(error));
+      }
     }
     for (const spec of ctx.specs.listPendingReviewRevision()) {
       try {
         await runSerialSpecOperation(spec.id, () => resumePendingReviewRevision(ctx, spec.id));
       } catch (error) {
-        console.error(`[产品评审] 恢复 Spec ${spec.id} 修订流程失败:`, (error as Error).message);
+        console.error(`[产品评审] 恢复 Spec ${spec.id} 修订流程失败:`, safeReviewError(error));
       }
     }
     for (const spec of ctx.specs.listInReview()) {
@@ -330,7 +339,7 @@ export async function runSpecReviewSync(ctx: AppContext): Promise<void> {
           .filter((comment) => !isInternalComment(comment, bot));
         await applyReviewComments(ctx, spec.id, comments, bot);
       } catch (error) {
-        console.error(`[产品评审] 同步 Spec ${spec.id} 评论失败:`, (error as Error).message);
+        console.error(`[产品评审] 同步 Spec ${spec.id} 评论失败:`, safeReviewError(error));
       }
     }
   } finally {
@@ -351,9 +360,12 @@ function runSerialSpecOperation<T>(specId: string, operation: () => Promise<T>):
 
 export function startSpecReviewSync(ctx: AppContext): void {
   if (ctx.specReviewTimer) return;
-  ctx.specReviewTimer = setInterval(() => void runSpecReviewSync(ctx), syncIntervalMs());
+  const tick = () => void runSpecReviewSync(ctx).catch((error) => {
+    console.error('[产品评审] 云文档评论同步任务异常:', safeReviewError(error));
+  });
+  ctx.specReviewTimer = setInterval(tick, syncIntervalMs());
   ctx.specReviewTimer.unref?.();
-  void runSpecReviewSync(ctx);
+  tick();
   console.log('[产品评审] 云文档评论同步已启动');
 }
 
