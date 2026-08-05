@@ -924,13 +924,18 @@ export async function handleCardAction(
       const questionnaire = await ctx.questionnaires.get(questionnaireId);
       if (!questionnaire) throw new Error('问卷不存在或已被删除。');
       assertQuestionnaireAccess(questionnaire, action.operatorOpenId);
+      assertCurrentQuestionnaireCard(questionnaire, action.value);
       const answers: Record<string, string | string[]> = {};
       for (const question of questionnaire.questions) {
         const raw = action.formValue[question.id];
         if (typeof raw === 'string') answers[question.id] = raw;
         else if (Array.isArray(raw)) answers[question.id] = raw.filter((item): item is string => typeof item === 'string');
       }
-      const result = await ctx.questionnaires.recordAnswers(questionnaireId, answers);
+      const result = await ctx.questionnaires.recordAnswers(
+        questionnaireId,
+        answers,
+        questionnaire.updatedAt,
+      );
       if (result.questionnaire.status === 'answered') {
         runWorkflowContinuation(
           resumeWorkflowAfterQuestionnaire(ctx, questionnaireId),
@@ -1012,6 +1017,18 @@ function assertQuestionnaireAccess(
   }
   if (topicId && questionnaire.topicId && questionnaire.topicId !== topicId) {
     throw new Error('问卷不属于当前话题。');
+  }
+}
+
+function assertCurrentQuestionnaireCard(
+  questionnaire: import('../core/questionnaire-store.js').Questionnaire,
+  value: Record<string, unknown>,
+): void {
+  const version = typeof value.questionnaireVersion === 'string'
+    ? value.questionnaireVersion.trim()
+    : '';
+  if (!version || version !== questionnaire.updatedAt) {
+    throw new Error(`这张问卷卡片已过期，请发送 /form ${questionnaire.id} 获取最新版。`);
   }
 }
 

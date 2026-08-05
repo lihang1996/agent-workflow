@@ -385,6 +385,10 @@ test('问卷、Spec 确认和产品评审均使用飞书 form_submit', () => {
   const questionForm = questionCard.body.elements.find((item: any) => item.tag === 'form');
   assert.ok(questionForm);
   assert.equal(questionForm.elements.at(-1).action_type, 'form_submit');
+  assert.equal(
+    questionForm.elements.at(-1).behaviors[0].value.questionnaireVersion,
+    questionnaire.updatedAt,
+  );
   const ids = questionForm.elements
     .filter((item: any) => item.tag !== 'button')
     .map((item: any) => item.element_id);
@@ -404,6 +408,45 @@ test('问卷、Spec 确认和产品评审均使用飞书 form_submit', () => {
   assert.ok((buildSpecStatusCard({
     ...spec, status: 'in_review', docId: 'doc', docUrl: 'https://feishu.cn/docx/doc',
   }) as any).body.elements.find((item: any) => item.tag === 'form'));
+});
+
+test('旧版问卷卡片不能覆盖已经提交的需求答案', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-questionnaire-stale-card-'));
+  try {
+    const questionnaires = new JsonQuestionnaireStore(root);
+    const ownerOpenId = process.env.OWNER_OPEN_ID?.trim() || 'ou_owner';
+    const questionnaire = await questionnaires.create({
+      title: '范围确认',
+      questions: [{ id: 'scope', prompt: '范围', kind: 'single_choice', options: ['A', 'B'] }],
+      ownerOpenId,
+    });
+    const first = await handleCardAction({ questionnaires } as unknown as AppContext, {
+      operatorOpenId: ownerOpenId,
+      messageId: 'om-form',
+      value: {
+        action: 'submit_questionnaire',
+        questionnaireId: questionnaire.id,
+        questionnaireVersion: questionnaire.updatedAt,
+      },
+      formValue: { scope: 'A' },
+    });
+    assert.equal(first.toast?.type, 'success');
+
+    const stale = await handleCardAction({ questionnaires } as unknown as AppContext, {
+      operatorOpenId: ownerOpenId,
+      messageId: 'om-form-old',
+      value: {
+        action: 'submit_questionnaire',
+        questionnaireId: questionnaire.id,
+        questionnaireVersion: questionnaire.updatedAt,
+      },
+      formValue: { scope: 'B' },
+    });
+    assert.match(stale.toast?.content ?? '', /卡片已过期/);
+    assert.equal((await questionnaires.get(questionnaire.id))?.answers?.scope, 'A');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('旧版 Spec 卡片不能确认最新版方案', async () => {

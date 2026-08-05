@@ -80,7 +80,10 @@ export function buildQuestionnaireCard(questionnaire: Questionnaire): CardJson {
             name: `questionnaire_${questionnaire.id}`.slice(0, 40),
             elements: [
               ...questionnaire.questions.map((question) => questionElement(question, questionnaire.answers?.[question.id])),
-              button('submit_questionnaire', { questionnaireId: questionnaire.id }, '提交澄清结果', 'primary', true),
+              button('submit_questionnaire', {
+                questionnaireId: questionnaire.id,
+                questionnaireVersion: questionnaire.updatedAt,
+              }, '提交澄清结果', 'primary', true),
             ],
           }]),
       ],

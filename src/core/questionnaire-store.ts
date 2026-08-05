@@ -132,10 +132,14 @@ export class JsonQuestionnaireStore {
   async recordAnswers(
     id: string,
     answers: Record<string, string | string[]>,
+    expectedUpdatedAt?: string,
   ): Promise<{ questionnaire: Questionnaire; missingRequired: string[] }> {
     return this.enqueueMutation(async () => {
       const current = await this.get(id);
       if (!current) throw new Error(`问卷不存在: ${id}`);
+      if (expectedUpdatedAt && current.updatedAt !== expectedUpdatedAt) {
+        throw new Error(`这张问卷卡片已过期，请发送 /form ${id} 获取最新版。`);
+      }
       const normalized = normalizeAnswers(current, answers);
       const merged = { ...(current.answers ?? {}), ...normalized };
       const missingRequired = current.questions
@@ -146,11 +150,17 @@ export class JsonQuestionnaireStore {
             || (typeof value === 'string' ? value.trim().length === 0 : value.length === 0);
         })
         .map((question) => question.id);
+      if (current.status === 'answered') {
+        if (answersEqual(current.answers ?? {}, merged)) {
+          return { questionnaire: current, missingRequired: [] };
+        }
+        throw new Error('问卷已经完成，不能再修改答案。');
+      }
       const questionnaire = QuestionnaireSchema.parse({
         ...current,
         answers: merged,
         status: missingRequired.length === 0 ? 'answered' : 'awaiting_answers',
-        updatedAt: new Date().toISOString(),
+        updatedAt: nextUpdatedAt(current.updatedAt),
       });
       await this.write(questionnaire);
       return { questionnaire, missingRequired };
@@ -175,6 +185,28 @@ export class JsonQuestionnaireStore {
     this.mutationQueue = run.then(() => undefined, () => undefined);
     return run;
   }
+}
+
+function nextUpdatedAt(previous: string): string {
+  return new Date(Math.max(Date.now(), Date.parse(previous) + 1)).toISOString();
+}
+
+function answersEqual(
+  left: Record<string, string | string[]>,
+  right: Record<string, string | string[]>,
+): boolean {
+  const leftKeys = Object.keys(left).sort();
+  const rightKeys = Object.keys(right).sort();
+  if (leftKeys.length !== rightKeys.length || leftKeys.some((key, index) => key !== rightKeys[index])) {
+    return false;
+  }
+  return leftKeys.every((key) => {
+    const leftValue = left[key];
+    const rightValue = right[key];
+    return Array.isArray(leftValue) && Array.isArray(rightValue)
+      ? leftValue.length === rightValue.length && leftValue.every((value, index) => value === rightValue[index])
+      : leftValue === rightValue;
+  });
 }
 
 function normalizeAnswers(
