@@ -70,6 +70,12 @@ export class JsonQuestionnaireStore {
 
   constructor(private readonly directory = resolve('data', 'questionnaires')) {}
 
+  static async open(directory = resolve('data', 'questionnaires')): Promise<JsonQuestionnaireStore> {
+    const store = new JsonQuestionnaireStore(directory);
+    await store.validateAll();
+    return store;
+  }
+
   async create(input: {
     title: string;
     goal?: string;
@@ -94,7 +100,8 @@ export class JsonQuestionnaireStore {
   }
 
   async get(id: string): Promise<Questionnaire | undefined> {
-    QuestionnaireIdSchema.parse(id);
+    const parsedId = QuestionnaireIdSchema.safeParse(id);
+    if (!parsedId.success) throw new Error(`问卷 ID 格式无效: ${id}`);
     try {
       const raw = await readFile(join(this.directory, `${id}.json`), 'utf8');
       let value: unknown;
@@ -105,6 +112,7 @@ export class JsonQuestionnaireStore {
       }
       const parsed = QuestionnaireSchema.safeParse(value);
       if (!parsed.success) throw new Error(`问卷文件格式错误: ${id}（${parsed.error.issues[0]?.message ?? '未知错误'}）`);
+      if (parsed.data.id !== id) throw new Error(`问卷文件 ID 不一致: 文件名=${id} 内容=${parsed.data.id}`);
       return parsed.data;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
@@ -127,6 +135,20 @@ export class JsonQuestionnaireStore {
       .filter((row): row is Questionnaire =>
         row?.workflowId === workflowId && row.status === 'awaiting_answers')
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
+  }
+
+  /** 启动时完整校验问卷目录，避免损坏记录在工作流执行到一半时才暴露。 */
+  private async validateAll(): Promise<void> {
+    let names: string[];
+    try {
+      names = await readdir(this.directory);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
+    await Promise.all(
+      names.filter((name) => name.endsWith('.json')).map((name) => this.get(name.slice(0, -5))),
+    );
   }
 
   async recordAnswers(

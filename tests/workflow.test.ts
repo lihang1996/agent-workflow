@@ -334,15 +334,39 @@ test('工作流、Spec 与问卷落盘失败后清理临时文件', async () => 
   }
 });
 
-test('损坏的工作流与 Spec 记录会阻止启动', async () => {
+test('损坏的工作流、Spec 与问卷记录会阻止启动', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agent-os-core-store-invalid-'));
   try {
     const workflowPath = join(root, 'workflows.json');
     const specPath = join(root, 'specs.json');
+    const questionnaireDir = join(root, 'questionnaires');
     await writeFile(workflowPath, JSON.stringify([{ id: 'broken' }]));
     await writeFile(specPath, JSON.stringify([{ id: 'broken' }]));
+    await mkdir(questionnaireDir);
+    await writeFile(join(questionnaireDir, '12345678.json'), JSON.stringify({ id: 'broken' }));
     await assert.rejects(() => JsonWorkflowStore.open(workflowPath), /第 1 条记录格式错误/);
     await assert.rejects(() => JsonSpecStore.open(specPath), /第 1 条记录格式错误/);
+    await assert.rejects(() => JsonQuestionnaireStore.open(questionnaireDir), /问卷文件格式错误/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('问卷文件名必须与内容 ID 一致', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-questionnaire-id-mismatch-'));
+  try {
+    const fileId = '12345678';
+    const contentId = '87654321';
+    const now = new Date().toISOString();
+    await writeFile(join(root, `${fileId}.json`), JSON.stringify({
+      id: contentId,
+      title: '错位问卷',
+      questions: [{ id: 'scope', prompt: '范围？', kind: 'text' }],
+      status: 'awaiting_answers',
+      createdAt: now,
+      updatedAt: now,
+    }));
+    await assert.rejects(() => JsonQuestionnaireStore.open(root), /问卷文件 ID 不一致/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -21,7 +21,7 @@ const root = resolve(process.env.AGENT_OS_ROOT ?? join(here, '../..'));
 loadEnv({ path: join(root, '.env') });
 
 const storeDir = join(root, 'data', 'questionnaires');
-const store = new JsonQuestionnaireStore(storeDir);
+const store = await JsonQuestionnaireStore.open(storeDir);
 
 function textResult(payload: unknown) {
   return {
