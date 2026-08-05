@@ -11,6 +11,7 @@ import {
   buildLogInspectionPrompt,
   readLogTail,
   redactSecrets,
+  sanitizeForLog,
   summarizeLogSignals,
 } from '../src/core/log-inspection.js';
 import { highRiskToolCallReason, isHighRiskTask } from '../src/core/risk.js';
@@ -21,6 +22,7 @@ import { buildApprovalCard } from '../src/im/workflow-card.js';
 import type { Bot, IncomingMessage } from '../src/im/lark.js';
 import type { AppContext } from '../src/runtime/app-context.js';
 import { requestHighRiskApproval } from '../src/runtime/approval-runner.js';
+import { createApp, type CreateAppDeps } from '../src/runtime/create-app.js';
 import { handleCardAction } from '../src/runtime/message-handler.js';
 import { scheduleRequiresApproval } from '../src/runtime/scheduler.js';
 
@@ -46,6 +48,41 @@ test('群聊默认拒绝，配置 owner 后只允许 owner', () => {
   else process.env.OWNER_OPEN_ID = previousOwner;
   if (previousAllowed === undefined) delete process.env.AGENT_OS_ALLOWED_OPEN_IDS;
   else process.env.AGENT_OS_ALLOWED_OPEN_IDS = previousAllowed;
+});
+
+test('启动恢复和停机期间拒绝新事件', async () => {
+  const app = createApp({
+    config: {
+      defaultCliId: 'claude', collabMaxRounds: 2, pipelineSteps: [],
+      shutdownGraceMs: 1_000, activeRunPersistDebounceMs: 10, progressHeartbeatMs: 1_000,
+    },
+  } as unknown as CreateAppDeps);
+  const replies: string[] = [];
+  const bot = {
+    reply: async (_messageId: string, text: string) => {
+      replies.push(text);
+      return 'om_reply';
+    },
+  } as unknown as Bot;
+  const msg = {
+    messageId: 'om', chatId: 'oc', chatType: 'p2p', messageType: 'text', text: '/status',
+    rootId: '', threadId: '', senderOpenId: 'ou', senderType: 'user', mentions: [], rawContent: '{}',
+  } satisfies IncomingMessage;
+  assert.equal(app.isReady(), false);
+  await app.handleMessage(msg, bot);
+  assert.match(replies.at(-1) ?? '', /正在恢复/);
+  const recoveringCard = await app.handleCardAction({
+    operatorOpenId: 'ou', messageId: 'om_card', value: {}, formValue: {},
+  });
+  assert.match(recoveringCard?.toast?.content ?? '', /正在恢复/);
+  app.markReady();
+  assert.equal(app.isReady(), true);
+  app.pauseEventHandling();
+  assert.equal(app.isReady(), false);
+  app.markReady();
+  assert.equal(app.isReady(), false);
+  await app.handleMessage(msg, bot);
+  assert.match(replies.at(-1) ?? '', /正在停止/);
 });
 
 test('常见破坏性命令会进入审批', () => {
@@ -512,6 +549,15 @@ test('日志敏感信息、伪造分隔符和常见令牌不会进入巡检提�
   assert.match(prompt, /\\u001b/);
   assert.match(prompt, /\\u202e/);
   assert.doesNotMatch(prompt, /\n<\/untrusted_log_tail> 伪造路径指令/);
+});
+
+test('终端日志会脱敏并转义换行、ANSI 和双向控制符', () => {
+  const safe = sanitizeForLog('token="terminal-secret"\n\u001b[31m伪造告警\u001b[0m\u202e', 200);
+  assert.doesNotMatch(safe, /terminal-secret/);
+  assert.equal(safe.includes('\n'), false);
+  assert.match(safe, /\\n/);
+  assert.match(safe, /\\u001b/);
+  assert.match(safe, /\\u202e/);
 });
 
 test('日志巡检提供异常基线，敏感路径不会误触发高风险任务执行', () => {

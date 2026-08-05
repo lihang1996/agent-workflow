@@ -93,6 +93,21 @@ export function redactSecrets(content: string): string {
     .replace(/(\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:)[^\s@/]+@/gi, '$1[REDACTED]@');
 }
 
+/** 终端日志统一脱敏、转义控制字符并限制长度，防止消息伪造日志或泄露凭证。 */
+export function sanitizeForLog(content: string, maxChars = 1_000): string {
+  const limit = Number.isSafeInteger(maxChars) && maxChars > 0 ? maxChars : 1_000;
+  const safe = redactSecrets(content).replace(
+    /[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u2028-\u202E\u2060\u2066-\u2069\uFEFF]/g,
+    (character) => {
+      if (character === '\n') return '\\n';
+      if (character === '\r') return '\\r';
+      if (character === '\t') return '\\t';
+      return `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`;
+    },
+  );
+  return safe.length > limit ? `${safe.slice(0, limit)}…` : safe;
+}
+
 /** 给模型提供可核对的基线计数，不把异常判定完全交给自然语言推断。 */
 export function summarizeLogSignals(content: string): LogSignalSummary {
   const lines = content.split(/\r?\n/).filter(Boolean);

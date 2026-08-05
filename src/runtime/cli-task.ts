@@ -13,7 +13,7 @@ import { extractResourceKeys } from '../im/message-parser.js';
 import type { Bot, IncomingMessage } from '../im/lark.js';
 import type { Session } from '../core/session-manager.js';
 import { TaskProgressTracker } from '../core/task-progress.js';
-import { redactSecrets } from '../core/log-inspection.js';
+import { redactSecrets, sanitizeForLog } from '../core/log-inspection.js';
 import { assertWorkdir } from '../core/workdir.js';
 import type { AppContext } from './app-context.js';
 import type { ActiveRun } from './types.js';
@@ -209,7 +209,7 @@ export async function startCliTask(
         console.log(`[CLI:${bot.id}/${adapter.id}] session=${event.sessionId}`);
         break;
       case 'assistant':
-        console.log(`[CLI:${bot.id}/${adapter.id}] assistant: ${truncate(redactSecrets(event.text))}`);
+        console.log(`[CLI:${bot.id}/${adapter.id}] assistant: ${truncate(sanitizeForLog(event.text, 500))}`);
         break;
       case 'tool_start':
         console.log(`[CLI:${bot.id}/${adapter.id}] tool_start: ${event.label}`);

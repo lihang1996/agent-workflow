@@ -12,7 +12,7 @@ import { filterRunnableSteps } from '../core/pipeline.js';
 import { requestTaskAbort } from '../core/task-abort.js';
 import { assertWorkdir } from '../core/workdir.js';
 import { formatScheduleInterval, formatScheduleRunStatus, parseScheduleInterval } from '../core/schedule-store.js';
-import { assertLogFile, redactSecrets } from '../core/log-inspection.js';
+import { assertLogFile, redactSecrets, sanitizeForLog } from '../core/log-inspection.js';
 import { highRiskReason, isHighRiskTask } from '../core/risk.js';
 import { assertOwnedBy, isAuthorizedOperator } from '../core/access.js';
 import { resolveMentions } from '../im/message-parser.js';
@@ -76,9 +76,9 @@ export async function handleMessage(
   });
 
   console.log(`[收到] bot=${bot.id}(${bot.name}) chat=${msg.chatId} threadId=${msg.threadId} rootId=${msg.rootId} sender=${msg.senderOpenId}`);
-  console.log(`  原文: ${msg.text}`);
-  console.log(`  还原: ${resolved}`);
-  console.log(`  mentions: ${msg.mentions.map((m) => `${m.key}=${m.name}(${m.openId})`).join(', ') || '(无)'}`);
+  console.log(`  原文: ${sanitizeForLog(msg.text, 500)}`);
+  console.log(`  还原: ${sanitizeForLog(resolved, 500)}`);
+  console.log(`  mentions: ${sanitizeForLog(msg.mentions.map((m) => `${m.key}=${m.name}(${m.openId})`).join(', ') || '(无)', 500)}`);
   console.log(`  [会话] ${isNew ? '新建' : '复用'} id=${session.id} status=${session.status} engine=${session.cliId}`);
 
   const command = parseCommand(resolved);

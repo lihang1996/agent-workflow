@@ -8,7 +8,7 @@ import {
 } from '../core/pipeline.js';
 import type { DeliveryWorkflow } from '../core/workflow-store.js';
 import type { ProductSpec } from '../core/spec-store.js';
-import { redactSecrets } from '../core/log-inspection.js';
+import { redactSecrets, sanitizeForLog } from '../core/log-inspection.js';
 import { buildQuestionnaireCard, buildSpecConfirmationCard } from '../im/workflow-card.js';
 import type { Bot, IncomingMessage } from '../im/lark.js';
 import type { AppContext } from './app-context.js';
@@ -125,7 +125,7 @@ async function createAndStartWorkflow(
       throw error;
     }
   }
-  console.log(`[${name}] workflow=${workflow.id} 目标=${truncate(goal, 60)} 步骤=${workflow.stepIds.join(' → ')}`);
+  console.log(`[${name}] workflow=${workflow.id} 目标=${truncate(sanitizeForLog(goal, 120), 60)} 步骤=${workflow.stepIds.join(' → ')}`);
   try {
     await initiator.reply(
       msg.messageId,

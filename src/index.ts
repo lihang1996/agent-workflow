@@ -19,6 +19,7 @@ import { JsonScheduleStore } from './core/schedule-store.js';
 import { JsonApprovalStore } from './core/approval-store.js';
 import { JsonWorkflowStore } from './core/workflow-store.js';
 import { resolveWorkdir } from './core/workdir.js';
+import { sanitizeForLog } from './core/log-inspection.js';
 import { listEngines } from './cli/registry.js';
 import { isCliId, type CliId } from './cli/types.js';
 import { logMcpStatus } from './mcp/config.js';
@@ -96,6 +97,42 @@ const app = createApp({
   },
 });
 
+let shutdownPromise: Promise<void> | undefined;
+
+/** 停止接收新事件，收尾进行中任务后退出进程；重复信号复用同一轮收尾。 */
+function shutdownAndExit(reason: string, exitCode = 0): Promise<void> {
+  if (shutdownPromise) return shutdownPromise;
+  app.pauseEventHandling();
+  shutdownPromise = (async () => {
+    console.log(`[进程] ${reason}，开始收尾进行中任务…`);
+    app.stopScheduler();
+    app.stopSpecReviewSync();
+    try {
+      await app.shutdownActiveRuns(reason);
+    } catch (error) {
+      console.error('[进程] 收尾失败:', safeProcessError(error));
+    } finally {
+      process.exit(exitCode);
+    }
+  })();
+  return shutdownPromise;
+}
+
+process.once('SIGINT', () => {
+  void shutdownAndExit('服务已停止（SIGINT），任务中断');
+});
+process.once('SIGTERM', () => {
+  void shutdownAndExit('服务已停止（SIGTERM），任务中断');
+});
+process.once('uncaughtException', (error) => {
+  console.error('[进程] uncaughtException:', safeProcessError(error));
+  void shutdownAndExit('服务异常退出（uncaughtException），任务中断', 1);
+});
+process.once('unhandledRejection', (reason) => {
+  console.error('[进程] unhandledRejection:', safeProcessError(reason));
+  void shutdownAndExit('服务异常退出（unhandledRejection），任务中断', 1);
+});
+
 for (const config of botConfigs) {
   try {
     const bot = await startBot({
@@ -109,7 +146,7 @@ for (const config of botConfigs) {
       `[Bot] 已连接 id=${bot.id} name=${bot.name} open_id=${bot.openId || '(未知，将按名称匹配 @)'}`,
     );
   } catch (error) {
-    console.error(`[Bot] 启动失败 id=${config.id}:`, (error as Error).message);
+    console.error(`[Bot] 启动失败 id=${config.id}:`, safeProcessError(error));
   }
 }
 
@@ -121,34 +158,14 @@ if (app.botsById.size === 0) {
 await app.reconcileOrphanedCards();
 await app.reconcileApprovalExecutions();
 await app.resumeRecoverableWorkflows();
-app.startScheduler();
-app.startSpecReviewSync();
-
-/** 收尾进行中任务后退出进程。 */
-async function shutdownAndExit(reason: string, exitCode = 0): Promise<void> {
-  console.log(`[进程] ${reason}，开始收尾进行中任务…`);
-  app.stopScheduler();
-  app.stopSpecReviewSync();
-  try {
-    await app.shutdownActiveRuns(reason);
-  } catch (error) {
-    console.error('[进程] 收尾失败:', (error as Error).message);
-  } finally {
-    process.exit(exitCode);
-  }
+app.markReady();
+if (app.isReady()) {
+  console.log('[启动] 会话、审批和工作流恢复完成，开始接收新事件');
+  app.startScheduler();
+  app.startSpecReviewSync();
 }
 
-process.once('SIGINT', () => {
-  void shutdownAndExit('服务已停止（SIGINT），任务中断');
-});
-process.once('SIGTERM', () => {
-  void shutdownAndExit('服务已停止（SIGTERM），任务中断');
-});
-process.once('uncaughtException', (error) => {
-  console.error('[进程] uncaughtException:', error);
-  void shutdownAndExit('服务异常退出（uncaughtException），任务中断', 1);
-});
-process.once('unhandledRejection', (reason) => {
-  console.error('[进程] unhandledRejection:', reason);
-  void shutdownAndExit('服务异常退出（unhandledRejection），任务中断', 1);
-});
+function safeProcessError(error: unknown): string {
+  const detail = error instanceof Error ? (error.stack ?? error.message) : String(error);
+  return sanitizeForLog(detail, 4_000);
+}

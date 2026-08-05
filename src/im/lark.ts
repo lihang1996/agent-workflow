@@ -6,6 +6,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { extname, join } from 'node:path';
 import type { BotConfig } from '../core/bot-config.js';
+import { sanitizeForLog } from '../core/log-inspection.js';
 import {
   extractMessageText,
   parseMentions,
@@ -611,7 +612,7 @@ export async function startBot(opts: BotOptions): Promise<Bot> {
       console.log(
         `[卡片] bot=${bot.id} 收到 card.action.trigger`,
         `operator=${data?.operator?.open_id ?? '(无)'}`,
-        `value=${JSON.stringify(value ?? null)}`,
+        `value=${sanitizeForLog(JSON.stringify(value ?? null), 1_000)}`,
       );
       if (!onCardAction) {
         console.warn(`[卡片] bot=${bot.id} 未注册 onCardAction，忽略按钮回调`);
@@ -622,7 +623,7 @@ export async function startBot(opts: BotOptions): Promise<Bot> {
         // 必须返回对象；undefined 时飞书客户端可能当成交互失败。
         return response ?? {};
       } catch (error) {
-        console.error(`[卡片] bot=${bot.id} 处理按钮回调失败:`, (error as Error).message);
+        console.error(`[卡片] bot=${bot.id} 处理按钮回调失败:`, sanitizeForLog((error as Error).message, 2_000));
         return {
           toast: { type: 'error', content: '操作失败，请稍后重试。' },
         };

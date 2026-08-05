@@ -37,26 +37,59 @@ export interface App {
   ) => Promise<void>;
   resumeRecoverableWorkflows: () => Promise<void>;
   reconcileApprovalExecutions: () => Promise<void>;
+  markReady: () => void;
+  pauseEventHandling: () => void;
+  isReady: () => boolean;
 }
 
 /** 组装运行时上下文并绑定消息/卡片处理器。 */
 export function createApp(deps: CreateAppDeps): App {
   const ctx = createAppContext(deps);
+  let eventState: 'recovering' | 'ready' | 'stopping' = 'recovering';
 
   return {
     ctx,
     botsById: ctx.botsById,
-    handleMessage: (msg, bot) => handleMessage(ctx, msg, bot),
-    handleCardAction: (action) => handleCardAction(ctx, action),
+    handleMessage: async (msg, bot) => {
+      if (eventState !== 'ready') {
+        const text = eventState === 'stopping'
+          ? 'Agent OS 正在停止，暂不接收新任务。'
+          : 'Agent OS 正在恢复会话和工作流，请稍后重新发送。';
+        await bot.reply(msg.messageId, text, !!msg.threadId || !!msg.rootId);
+        return;
+      }
+      await handleMessage(ctx, msg, bot);
+    },
+    handleCardAction: (action) => {
+      if (eventState !== 'ready') {
+        return Promise.resolve({
+          toast: {
+            type: 'warning' as const,
+            content: eventState === 'stopping'
+              ? '系统正在停止，请勿继续操作。'
+              : '系统正在恢复，请稍后再试。',
+          },
+        });
+      }
+      return handleCardAction(ctx, action);
+    },
     reconcileOrphanedCards: () => reconcileOrphanedCards(ctx),
     shutdownActiveRuns: (reason) => shutdownActiveRuns(ctx, reason),
     startScheduler: () => startScheduler(ctx),
     stopScheduler: () => stopScheduler(ctx),
     startSpecReviewSync: () => startSpecReviewSync(ctx),
     stopSpecReviewSync: () => stopSpecReviewSync(ctx),
-    handleDocumentComment: (event, bot) => handleDocumentComment(ctx, event, bot),
+    handleDocumentComment: async (event, bot) => {
+      if (eventState !== 'ready') return;
+      await handleDocumentComment(ctx, event, bot);
+    },
     resumeRecoverableWorkflows: () => resumeRecoverableWorkflows(ctx),
     reconcileApprovalExecutions: () => reconcileApprovalExecutions(ctx),
+    markReady: () => {
+      if (eventState === 'recovering') eventState = 'ready';
+    },
+    pauseEventHandling: () => { eventState = 'stopping'; },
+    isReady: () => eventState === 'ready',
   };
 }
 
