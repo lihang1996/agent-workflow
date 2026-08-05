@@ -1,16 +1,16 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { redactSecrets } from './log-inspection.js';
 
 const StoredMessageSchema = z.object({
-  messageId: z.string().min(1),
-  chatId: z.string().min(1),
-  chatType: z.string(),
-  rootId: z.string(),
-  threadId: z.string(),
-  senderOpenId: z.string(),
+  messageId: z.string().trim().min(1).max(200),
+  chatId: z.string().trim().min(1).max(200),
+  chatType: z.string().max(50),
+  rootId: z.string().max(200),
+  threadId: z.string().max(200),
+  senderOpenId: z.string().trim().min(1).max(200),
 });
 export type StoredMessage = z.infer<typeof StoredMessageSchema>;
 
@@ -20,12 +20,12 @@ const TimestampSchema = z.string().min(1).refine(
 );
 
 export const ApprovalSchema = z.object({
-  id: z.string().min(1),
-  botId: z.string().min(1),
-  ownerOpenId: z.string().min(1),
+  id: z.string().trim().min(1).max(100),
+  botId: z.string().trim().min(1).max(100),
+  ownerOpenId: z.string().trim().min(1).max(200),
   action: z.enum(['task', 'pipeline', 'squad', 'review']),
-  prompt: z.string().min(1),
-  reason: z.string().min(1),
+  prompt: z.string().trim().min(1).max(100_000),
+  reason: z.string().trim().min(1).max(2_000),
   message: StoredMessageSchema,
   status: z.enum([
     'pending',
@@ -39,15 +39,41 @@ export const ApprovalSchema = z.object({
   createdAt: TimestampSchema,
   expiresAt: TimestampSchema.optional(),
   decidedAt: TimestampSchema.optional(),
-  decidedBy: z.string().optional(),
-  cardMessageId: z.string().min(1).optional(),
+  decidedBy: z.string().trim().min(1).max(200).optional(),
+  cardMessageId: z.string().trim().min(1).max(200).optional(),
   workflowId: z.string().uuid().optional(),
-  scheduleJobId: z.string().min(1).optional(),
+  scheduleJobId: z.string().trim().min(1).max(100).optional(),
   scheduleRunCount: z.number().int().min(1).optional(),
   executionAttempt: z.number().int().min(0).default(0),
   executionStartedAt: TimestampSchema.optional(),
   executionFinishedAt: TimestampSchema.optional(),
-  executionError: z.string().optional(),
+  executionError: z.string().max(2_000).optional(),
+}).superRefine((approval, ctx) => {
+  if (!!approval.scheduleJobId !== !!approval.scheduleRunCount) {
+    ctx.addIssue({ code: 'custom', path: ['scheduleJobId'], message: '定时任务编号与运行轮次必须同时存在' });
+  }
+  if (approval.workflowId && approval.action !== 'pipeline' && approval.action !== 'squad') {
+    ctx.addIssue({ code: 'custom', path: ['workflowId'], message: '只有团队工作流审批可以关联工作流' });
+  }
+  if (approval.status === 'pending' && approval.executionAttempt !== 0) {
+    ctx.addIssue({ code: 'custom', path: ['executionAttempt'], message: '待审批记录不能包含执行轮次' });
+  }
+  if (approval.status === 'executing') {
+    if (approval.executionAttempt < 1 || !approval.executionStartedAt) {
+      ctx.addIssue({ code: 'custom', path: ['executionStartedAt'], message: '执行中审批必须包含有效执行轮次和开始时间' });
+    }
+    if (!approval.decidedAt || !approval.decidedBy) {
+      ctx.addIssue({ code: 'custom', path: ['decidedAt'], message: '执行中审批必须包含审批人和审批时间' });
+    }
+  }
+  if (approval.status === 'succeeded' || approval.status === 'failed') {
+    if (approval.executionAttempt < 1 || !approval.executionFinishedAt) {
+      ctx.addIssue({ code: 'custom', path: ['executionFinishedAt'], message: '执行终态必须包含执行轮次和完成时间' });
+    }
+  }
+  if (approval.status === 'rejected' && (!approval.decidedAt || !approval.decidedBy)) {
+    ctx.addIssue({ code: 'custom', path: ['decidedAt'], message: '拒绝记录必须包含审批人和审批时间' });
+  }
 });
 export type ApprovalRequest = z.infer<typeof ApprovalSchema>;
 
@@ -60,6 +86,11 @@ export interface ApprovalStoreOptions {
   now?: () => Date;
   ttlMs?: number;
 }
+
+export type ApprovalCreateInput = Pick<
+  ApprovalRequest,
+  'botId' | 'ownerOpenId' | 'action' | 'prompt' | 'reason' | 'message'
+> & Partial<Pick<ApprovalRequest, 'scheduleJobId' | 'scheduleRunCount'>>;
 
 /** 审批默认 30 分钟失效，避免旧卡在很久以后仍可放行。 */
 export function parseApprovalTtlMs(value: string | undefined): number {
@@ -74,7 +105,7 @@ export function parseApprovalTtlMs(value: string | undefined): number {
 
 export class JsonApprovalStore {
   private readonly approvals = new Map<string, ApprovalRequest>();
-  private writeQueue: Promise<void> = Promise.resolve();
+  private mutationQueue: Promise<void> = Promise.resolve();
   private readonly now: () => Date;
   private readonly ttlMs: number;
 
@@ -97,62 +128,56 @@ export class JsonApprovalStore {
     return [...this.approvals.values()];
   }
 
-  async create(input: Omit<
-    ApprovalRequest,
-    | 'id'
-    | 'status'
-    | 'createdAt'
-    | 'expiresAt'
-    | 'executionAttempt'
-    | 'executionStartedAt'
-    | 'executionFinishedAt'
-    | 'executionError'
-  >): Promise<ApprovalRequest> {
-    const now = this.now();
-    const approval: ApprovalRequest = {
-      ...input,
-      id: randomUUID(),
-      status: 'pending',
-      createdAt: now.toISOString(),
-      expiresAt: new Date(now.getTime() + this.ttlMs).toISOString(),
-      executionAttempt: 0,
-    };
-    this.approvals.set(approval.id, approval);
-    await this.persist();
-    return approval;
+  async create(input: ApprovalCreateInput): Promise<ApprovalRequest> {
+    return this.enqueueMutation(async () => {
+      const duplicate = this.findDuplicate(input);
+      if (duplicate) return duplicate;
+      const now = this.now();
+      const approval = ApprovalSchema.parse({
+        ...input,
+        id: randomUUID(),
+        status: 'pending',
+        createdAt: now.toISOString(),
+        expiresAt: new Date(now.getTime() + this.ttlMs).toISOString(),
+        executionAttempt: 0,
+      });
+      await this.replaceAndPersist(approval.id, approval);
+      return approval;
+    });
   }
 
   /** 记录飞书审批卡 message_id，供异步执行结果回写原卡。 */
   async setCardMessageId(id: string, cardMessageId: string): Promise<ApprovalRequest> {
-    if (!cardMessageId.trim()) throw new Error('审批卡 message_id 不能为空');
-    const current = this.get(id);
-    if (!current) throw new Error(`审批不存在: ${id}`);
-    const next: ApprovalRequest = {
-      ...current,
-      cardMessageId,
-    };
-    this.approvals.set(id, next);
-    await this.persist();
-    return next;
+    return this.enqueueMutation(async () => {
+      const normalized = cardMessageId.trim();
+      if (!normalized) throw new Error('审批卡 message_id 不能为空');
+      const current = this.require(id);
+      if (current.cardMessageId === normalized) return current;
+      if (current.cardMessageId) throw new Error('审批卡已经绑定，不能改绑到其它消息。');
+      if (current.status !== 'pending') throw new Error(`审批当前状态为 ${current.status}，不能再绑定卡片。`);
+      const next = ApprovalSchema.parse({ ...current, cardMessageId: normalized });
+      await this.replaceAndPersist(id, next);
+      return next;
+    });
   }
 
   /** 拒绝待审批任务；负责人校验与状态切换在同一个临界区完成。 */
   async reject(id: string, decidedBy: string): Promise<ApprovalRequest> {
-    const current = this.requireOwner(id, decidedBy);
-    const expired = await this.expireIfNeeded(current);
-    if (expired) throw new Error('审批已过期，请重新发起。');
-    if (current.status !== 'pending') throw new Error(`审批已处理：${current.status}`);
-    const now = this.now().toISOString();
-    const next: ApprovalRequest = {
-      ...current,
-      status: 'rejected',
-      decidedAt: now,
-      decidedBy,
-      executionFinishedAt: now,
-    };
-    this.approvals.set(id, next);
-    await this.persist();
-    return next;
+    return this.enqueueMutation(async () => {
+      const current = this.requireOwner(id, decidedBy);
+      if (await this.expireCurrentIfNeeded(current)) throw new Error('审批已过期，请重新发起。');
+      if (current.status !== 'pending') throw new Error(`审批已处理：${current.status}`);
+      const now = this.now().toISOString();
+      const next = ApprovalSchema.parse({
+        ...current,
+        status: 'rejected',
+        decidedAt: now,
+        decidedBy,
+        executionFinishedAt: now,
+      });
+      await this.replaceAndPersist(id, next);
+      return next;
+    });
   }
 
   /**
@@ -160,27 +185,28 @@ export class JsonApprovalStore {
    * executionAttempt 用于阻止上一轮异步回调覆盖新一轮结果。
    */
   async beginExecution(id: string, decidedBy: string): Promise<ApprovalRequest> {
-    const current = this.requireOwner(id, decidedBy);
-    const expired = await this.expireIfNeeded(current);
-    if (expired) throw new Error('审批已过期，请重新发起。');
-    if (current.status !== 'pending' && current.status !== 'approved' && current.status !== 'failed') {
-      throw new Error(`审批当前状态为 ${current.status}，不能重复执行。`);
-    }
-    const now = this.now().toISOString();
-    const next: ApprovalRequest = {
-      ...current,
-      status: 'executing',
-      decidedAt: current.decidedAt ?? now,
-      decidedBy: current.decidedBy ?? decidedBy,
-      executionAttempt: current.executionAttempt + 1,
-      executionStartedAt: now,
-      executionFinishedAt: undefined,
-      executionError: undefined,
-      workflowId: undefined,
-    };
-    this.approvals.set(id, next);
-    await this.persist();
-    return next;
+    return this.enqueueMutation(async () => {
+      const current = this.requireOwner(id, decidedBy);
+      if (await this.expireCurrentIfNeeded(current)) throw new Error('审批已过期，请重新发起。');
+      if (!current.cardMessageId) throw new Error('审批卡绑定缺失，请重新发起审批。');
+      if (current.status !== 'pending' && current.status !== 'approved' && current.status !== 'failed') {
+        throw new Error(`审批当前状态为 ${current.status}，不能重复执行。`);
+      }
+      const now = this.now().toISOString();
+      const next = ApprovalSchema.parse({
+        ...current,
+        status: 'executing',
+        decidedAt: current.decidedAt ?? now,
+        decidedBy: current.decidedBy ?? decidedBy,
+        executionAttempt: current.executionAttempt + 1,
+        executionStartedAt: now,
+        executionFinishedAt: undefined,
+        executionError: undefined,
+        workflowId: undefined,
+      });
+      await this.replaceAndPersist(id, next);
+      return next;
+    });
   }
 
   async attachWorkflow(
@@ -188,15 +214,17 @@ export class JsonApprovalStore {
     executionAttempt: number,
     workflowId: string,
   ): Promise<ApprovalRequest> {
-    const current = this.get(id);
-    if (!current) throw new Error(`审批不存在: ${id}`);
-    if (current.status !== 'executing' || current.executionAttempt !== executionAttempt) {
-      throw new Error(`审批 ${id} 已不属于当前执行轮次。`);
-    }
-    const next = ApprovalSchema.parse({ ...current, workflowId });
-    this.approvals.set(id, next);
-    await this.persist();
-    return next;
+    return this.enqueueMutation(async () => {
+      const current = this.require(id);
+      if (current.status !== 'executing' || current.executionAttempt !== executionAttempt) {
+        throw new Error(`审批 ${id} 已不属于当前执行轮次。`);
+      }
+      if (current.workflowId === workflowId) return current;
+      if (current.workflowId) throw new Error(`审批 ${id} 已关联其它工作流。`);
+      const next = ApprovalSchema.parse({ ...current, workflowId });
+      await this.replaceAndPersist(id, next);
+      return next;
+    });
   }
 
   async finishExecution(
@@ -205,52 +233,39 @@ export class JsonApprovalStore {
     outcome: ApprovalExecutionOutcome,
     error?: string,
   ): Promise<ApprovalRequest> {
-    const current = this.get(id);
-    if (!current) throw new Error(`审批不存在: ${id}`);
-    // 旧轮次回调或已经落盘的终态直接忽略，保证完成操作幂等。
-    if (current.executionAttempt !== executionAttempt || current.status !== 'executing') return current;
-    const next: ApprovalRequest = {
-      ...current,
-      status: outcome,
-      executionFinishedAt: this.now().toISOString(),
-      executionError: outcome === 'failed' ? sanitizeApprovalError(error) : undefined,
-    };
-    this.approvals.set(id, next);
-    await this.persist();
-    return next;
+    return this.enqueueMutation(async () => {
+      const current = this.require(id);
+      // 旧轮次回调或已经落盘的终态直接忽略，保证完成操作幂等。
+      if (current.executionAttempt !== executionAttempt || current.status !== 'executing') return current;
+      const next = ApprovalSchema.parse({
+        ...current,
+        status: outcome,
+        executionFinishedAt: this.now().toISOString(),
+        executionError: outcome === 'failed' ? sanitizeApprovalError(error) : undefined,
+      });
+      await this.replaceAndPersist(id, next);
+      return next;
+    });
   }
 
   /** 审批卡发送失败时保留审计记录，但确保这条记录永远不能被批准。 */
   async expire(id: string, reason = '审批已失效'): Promise<ApprovalRequest> {
-    const current = this.get(id);
-    if (!current) throw new Error(`审批不存在: ${id}`);
-    if (!this.isAuthorizationOpen(current)) return current;
-    const next: ApprovalRequest = {
-      ...current,
-      status: 'expired',
-      executionFinishedAt: this.now().toISOString(),
-      executionError: sanitizeApprovalError(reason),
-    };
-    this.approvals.set(id, next);
-    await this.persist();
-    return next;
+    return this.enqueueMutation(async () => {
+      const current = this.require(id);
+      if (!this.isAuthorizationOpen(current)) return current;
+      return this.expireCurrent(current, reason);
+    });
   }
 
   async expireStale(reason = '审批等待超时'): Promise<ApprovalRequest[]> {
-    const changed: ApprovalRequest[] = [];
-    for (const current of this.approvals.values()) {
-      if (!this.isAuthorizationOpen(current) || !this.isExpired(current)) continue;
-      const next: ApprovalRequest = {
-        ...current,
-        status: 'expired',
-        executionFinishedAt: this.now().toISOString(),
-        executionError: sanitizeApprovalError(reason),
-      };
-      this.approvals.set(next.id, next);
-      changed.push(next);
-    }
-    if (changed.length > 0) await this.persist();
-    return changed;
+    return this.enqueueMutation(async () => {
+      const changed = [...this.approvals.values()]
+        .filter((current) => this.isAuthorizationOpen(current) && this.isExpired(current))
+        .map((current) => this.expiredRecord(current, reason));
+      if (changed.length === 0) return [];
+      await this.replaceManyAndPersist(changed);
+      return changed;
+    });
   }
 
   /**
@@ -259,42 +274,45 @@ export class JsonApprovalStore {
   async reconcileInterrupted(
     workflowState: (workflowId: string) => ApprovalWorkflowState | undefined,
   ): Promise<ApprovalRequest[]> {
-    const changed: ApprovalRequest[] = [];
-    for (const current of this.approvals.values()) {
-      if (this.isAuthorizationOpen(current) && this.isExpired(current)) {
-        const next = await this.expire(current.id, '审批等待超时');
-        changed.push(next);
-        continue;
-      }
-      if (current.status === 'approved') {
-        const next: ApprovalRequest = {
+    return this.enqueueMutation(async () => {
+      const changed: ApprovalRequest[] = [];
+      for (const current of this.approvals.values()) {
+        if (this.isAuthorizationOpen(current) && !current.cardMessageId) {
+          changed.push(this.expiredRecord(current, '审批卡绑定缺失，审批已失效。'));
+          continue;
+        }
+        if (this.isAuthorizationOpen(current) && this.isExpired(current)) {
+          changed.push(this.expiredRecord(current, '审批等待超时'));
+          continue;
+        }
+        if (current.status === 'approved') {
+          changed.push(ApprovalSchema.parse({
+            ...current,
+            status: 'failed',
+            executionAttempt: Math.max(1, current.executionAttempt),
+            executionStartedAt: current.executionStartedAt ?? current.decidedAt ?? current.createdAt,
+            executionFinishedAt: this.now().toISOString(),
+            executionError: '服务升级前的执行状态不完整，请确认后重试。',
+          }));
+          continue;
+        }
+        if (current.status !== 'executing') continue;
+        const state = current.workflowId ? workflowState(current.workflowId) : undefined;
+        if (state === 'running') continue;
+        changed.push(ApprovalSchema.parse({
           ...current,
-          status: 'failed',
+          status: state === 'succeeded' ? 'succeeded' : 'failed',
           executionFinishedAt: this.now().toISOString(),
-          executionError: '服务升级前的执行状态不完整，请确认后重试。',
-        };
-        this.approvals.set(next.id, next);
-        changed.push(next);
-        continue;
+          executionError: state === 'succeeded'
+            ? undefined
+            : state === 'failed'
+              ? '关联工作流执行失败，请查看工作流消息后重试。'
+              : '上次执行被服务重启中断，请确认后重试。',
+        }));
       }
-      if (current.status !== 'executing') continue;
-      const state = current.workflowId ? workflowState(current.workflowId) : undefined;
-      if (state === 'running') continue;
-      const next: ApprovalRequest = {
-        ...current,
-        status: state === 'succeeded' ? 'succeeded' : 'failed',
-        executionFinishedAt: this.now().toISOString(),
-        executionError: state === 'succeeded'
-          ? undefined
-          : state === 'failed'
-            ? '关联工作流执行失败，请查看工作流消息后重试。'
-            : '上次执行被服务重启中断，请确认后重试。',
-      };
-      this.approvals.set(next.id, next);
-      changed.push(next);
-    }
-    if (changed.length > 0) await this.persist();
-    return changed;
+      if (changed.length > 0) await this.replaceManyAndPersist(changed);
+      return changed;
+    });
   }
 
   private async load(): Promise<void> {
@@ -305,21 +323,38 @@ export class JsonApprovalStore {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
       throw error;
     }
-    const rows: unknown = JSON.parse(raw);
+    let rows: unknown;
+    try {
+      rows = JSON.parse(raw);
+    } catch (error) {
+      throw new Error(`审批文件不是有效 JSON: ${this.filePath}`, { cause: error });
+    }
     if (!Array.isArray(rows)) throw new Error(`审批文件格式错误: ${this.filePath}`);
-    for (const row of rows) {
-      const parsed = ApprovalSchema.safeParse(row);
-      if (!parsed.success) continue;
+    for (const [index, row] of rows.entries()) {
+      const parsed = ApprovalSchema.safeParse(normalizeLegacyApprovalRow(row));
+      if (!parsed.success) {
+        const issue = parsed.error.issues[0];
+        throw new Error(
+          `审批文件第 ${index + 1} 条记录格式错误: ${issue?.path.join('.') || '(根)'} ${issue?.message ?? ''}`.trim(),
+        );
+      }
       const createdAt = new Date(parsed.data.createdAt);
       const expiresAt = parsed.data.expiresAt
         ?? new Date(createdAt.getTime() + this.ttlMs).toISOString();
-      this.approvals.set(parsed.data.id, { ...parsed.data, expiresAt });
+      const approval = ApprovalSchema.parse({ ...parsed.data, expiresAt });
+      if (this.approvals.has(approval.id)) throw new Error(`审批文件包含重复 ID: ${approval.id}`);
+      this.approvals.set(approval.id, approval);
     }
   }
 
-  private requireOwner(id: string, operatorOpenId: string): ApprovalRequest {
-    const current = this.get(id);
+  private require(id: string): ApprovalRequest {
+    const current = this.approvals.get(id);
     if (!current) throw new Error(`审批不存在: ${id}`);
+    return current;
+  }
+
+  private requireOwner(id: string, operatorOpenId: string): ApprovalRequest {
+    const current = this.require(id);
     if (!operatorOpenId || current.ownerOpenId !== operatorOpenId) {
       throw new Error('只有指定负责人可以处理该审批。');
     }
@@ -331,9 +366,9 @@ export class JsonApprovalStore {
     return new Date(approval.expiresAt).getTime() <= this.now().getTime();
   }
 
-  private async expireIfNeeded(approval: ApprovalRequest): Promise<boolean> {
+  private async expireCurrentIfNeeded(approval: ApprovalRequest): Promise<boolean> {
     if (!this.isAuthorizationOpen(approval) || !this.isExpired(approval)) return false;
-    await this.expire(approval.id, '审批等待超时');
+    await this.expireCurrent(approval, '审批等待超时');
     return true;
   }
 
@@ -341,19 +376,93 @@ export class JsonApprovalStore {
     return approval.status === 'pending' || approval.status === 'approved' || approval.status === 'failed';
   }
 
-  private persist(): Promise<void> {
+  private findDuplicate(input: ApprovalCreateInput): ApprovalRequest | undefined {
+    return [...this.approvals.values()].find((approval) => {
+      if (input.scheduleJobId && input.scheduleRunCount) {
+        return approval.scheduleJobId === input.scheduleJobId
+          && approval.scheduleRunCount === input.scheduleRunCount;
+      }
+      return !approval.scheduleJobId
+        && approval.botId === input.botId
+        && approval.action === input.action
+        && approval.message.messageId === input.message.messageId;
+    });
+  }
+
+  private expiredRecord(current: ApprovalRequest, reason: string): ApprovalRequest {
+    return ApprovalSchema.parse({
+      ...current,
+      status: 'expired',
+      executionFinishedAt: this.now().toISOString(),
+      executionError: sanitizeApprovalError(reason),
+    });
+  }
+
+  private async expireCurrent(current: ApprovalRequest, reason: string): Promise<ApprovalRequest> {
+    const next = this.expiredRecord(current, reason);
+    await this.replaceAndPersist(current.id, next);
+    return next;
+  }
+
+  private async replaceAndPersist(id: string, next: ApprovalRequest): Promise<void> {
+    const previous = this.approvals.get(id);
+    this.approvals.set(id, next);
+    try {
+      await this.persist();
+    } catch (error) {
+      if (previous) this.approvals.set(id, previous);
+      else this.approvals.delete(id);
+      throw error;
+    }
+  }
+
+  private async replaceManyAndPersist(nextRecords: ApprovalRequest[]): Promise<void> {
+    const previous = new Map(this.approvals);
+    for (const next of nextRecords) this.approvals.set(next.id, next);
+    try {
+      await this.persist();
+    } catch (error) {
+      this.approvals.clear();
+      for (const [id, approval] of previous) this.approvals.set(id, approval);
+      throw error;
+    }
+  }
+
+  private async persist(): Promise<void> {
     const payload = JSON.stringify([...this.approvals.values()], null, 2);
-    const write = async () => {
-      await mkdir(dirname(this.filePath), { recursive: true });
-      const temp = `${this.filePath}.tmp`;
+    await mkdir(dirname(this.filePath), { recursive: true });
+    const temp = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
+    try {
       await writeFile(temp, `${payload}\n`, 'utf8');
       await rename(temp, this.filePath);
-    };
-    this.writeQueue = this.writeQueue.then(write, write);
-    return this.writeQueue;
+    } catch (error) {
+      await unlink(temp).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private enqueueMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.mutationQueue.then(operation, operation);
+    this.mutationQueue = run.then(() => undefined, () => undefined);
+    return run;
   }
 }
 
 function sanitizeApprovalError(error: string | undefined): string {
   return redactSecrets(error?.trim() || '执行失败').slice(0, 2_000);
+}
+
+function normalizeLegacyApprovalRow(row: unknown): unknown {
+  if (!row || typeof row !== 'object' || Array.isArray(row)) return row;
+  const record = row as Record<string, unknown>;
+  // 早期版本可能把旧 approved 状态在重启时转成 attempt=0 的终态。
+  // 终态不会再接收执行回调，迁移为首轮记录不会重新授权或重复执行。
+  if (
+    (record.status === 'succeeded' || record.status === 'failed')
+    && (record.executionAttempt === undefined || record.executionAttempt === 0)
+    && typeof record.executionFinishedAt === 'string'
+  ) {
+    return { ...record, executionAttempt: 1 };
+  }
+  return row;
 }

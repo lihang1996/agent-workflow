@@ -12,7 +12,7 @@ import { filterRunnableSteps } from '../core/pipeline.js';
 import { requestTaskAbort } from '../core/task-abort.js';
 import { assertWorkdir } from '../core/workdir.js';
 import { formatScheduleInterval, formatScheduleRunStatus, parseScheduleInterval } from '../core/schedule-store.js';
-import { assertLogFile } from '../core/log-inspection.js';
+import { assertLogFile, redactSecrets } from '../core/log-inspection.js';
 import { highRiskReason, isHighRiskTask } from '../core/risk.js';
 import { assertOwnedBy, isAuthorizedOperator } from '../core/access.js';
 import { resolveMentions } from '../im/message-parser.js';
@@ -751,17 +751,21 @@ export async function handleCardAction(
     try {
       let approval = ctx.approvals.get(approvalId);
       if (!approval) throw new Error('审批不存在或已被删除。');
-      if (action.operatorOpenId !== approval.ownerOpenId) {
+      try {
+        assertOwnedBy(approval.ownerOpenId, action.operatorOpenId);
+      } catch {
         return { toast: { type: 'warning' as const, content: '只有指定负责人可以处理该审批。' } };
       }
-      // 兼容升级前未记录 message_id 的审批；之后的异步结果仍能更新原卡。
-      if (!approval.cardMessageId && action.messageId) {
-        approval = await ctx.approvals.setCardMessageId(approval.id, action.messageId);
+      if (!approval.cardMessageId) {
+        throw new Error('审批卡绑定缺失，不能执行；请重新发起审批。');
+      }
+      if (!action.messageId || action.messageId !== approval.cardMessageId) {
+        throw new Error('只能在最初绑定的审批卡上处理该任务。');
       }
       if (action.value.action === 'reject_high_risk') {
         const rejected = await ctx.approvals.reject(approval.id, action.operatorOpenId);
         await settleApprovalSchedule(ctx, rejected, 'skipped', '负责人拒绝审批').catch((error) => {
-          console.error(`[审批] ${rejected.id} 拒绝结算失败:`, (error as Error).message);
+          console.error(`[审批] ${rejected.id} 拒绝结算失败:`, redactSecrets((error as Error).message).slice(0, 2_000));
         });
         return {
           toast: { type: 'info' as const, content: '已拒绝，高风险任务不会执行。' },
@@ -802,7 +806,7 @@ export async function handleCardAction(
       const latest = approvalId ? ctx.approvals.get(approvalId) : undefined;
       if (latest?.status === 'expired' || latest?.status === 'rejected') {
         await settleApprovalSchedule(ctx, latest, 'skipped', latest.executionError).catch((settleError) => {
-          console.error(`[审批] ${latest.id} 定时任务结算失败:`, (settleError as Error).message);
+          console.error(`[审批] ${latest.id} 定时任务结算失败:`, redactSecrets((settleError as Error).message).slice(0, 2_000));
         });
       }
       return {

@@ -284,6 +284,7 @@ test('重启可修复已落盘工作流与审批之间的关联窗口', async ()
       botId: 'ceo', ownerOpenId: 'ou_owner', action: 'pipeline', prompt: '部署生产', reason: '生产发布',
       message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: '', senderOpenId: 'ou' },
     });
+    await approvals.setCardMessageId(approval.id, 'om_approval_card');
     const executing = await approvals.beginExecution(approval.id, 'ou_owner');
     const workflow = await workflows.create({
       kind: 'team', name: '团队交付流水线', initiatorBotId: 'ceo', goal: approval.prompt,

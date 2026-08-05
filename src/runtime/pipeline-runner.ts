@@ -8,6 +8,7 @@ import {
 } from '../core/pipeline.js';
 import type { DeliveryWorkflow } from '../core/workflow-store.js';
 import type { ProductSpec } from '../core/spec-store.js';
+import { redactSecrets } from '../core/log-inspection.js';
 import { buildQuestionnaireCard, buildSpecConfirmationCard } from '../im/workflow-card.js';
 import type { Bot, IncomingMessage } from '../im/lark.js';
 import type { AppContext } from './app-context.js';
@@ -636,7 +637,7 @@ async function settleWorkflowApproval(
     outcome,
     error,
   ).catch((settleError) => {
-    console.error(`[审批] 工作流 ${workflow.id} 回写失败:`, (settleError as Error).message);
+    console.error(`[审批] 工作流 ${workflow.id} 回写失败:`, redactSecrets((settleError as Error).message).slice(0, 2_000));
   });
 }
 

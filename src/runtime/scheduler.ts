@@ -53,7 +53,7 @@ export async function runDueSchedules(
   ctx.schedulerRunning = true;
   try {
     await expireStaleApprovals(ctx).catch((error) => {
-      console.error('[审批] 清理过期审批失败:', (error as Error).message);
+      console.error('[审批] 清理过期审批失败:', safeScheduleError(error));
     });
     await reconcileWorkflowSchedules(ctx).catch((error) => {
       console.error('[定时任务] 修复工作流结算失败:', (error as Error).message);

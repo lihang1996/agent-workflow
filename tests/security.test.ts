@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { isAuthorizedOperator } from '../src/core/access.js';
-import { JsonApprovalStore } from '../src/core/approval-store.js';
+import { JsonApprovalStore, type ApprovalRequest } from '../src/core/approval-store.js';
 import {
   assertLogFile,
   buildLogInspectionPrompt,
@@ -18,7 +18,19 @@ import { assertWorkdir } from '../src/core/workdir.js';
 import { ClaudeAdapter } from '../src/cli/claude-adapter.js';
 import { CodexAdapter } from '../src/cli/codex-adapter.js';
 import { buildApprovalCard } from '../src/im/workflow-card.js';
+import type { Bot, IncomingMessage } from '../src/im/lark.js';
+import type { AppContext } from '../src/runtime/app-context.js';
+import { requestHighRiskApproval } from '../src/runtime/approval-runner.js';
+import { handleCardAction } from '../src/runtime/message-handler.js';
 import { scheduleRequiresApproval } from '../src/runtime/scheduler.js';
+
+async function bindApprovalCard(
+  store: JsonApprovalStore,
+  approval: Pick<ApprovalRequest, 'id'>,
+  messageId = `om_card_${approval.id}`,
+): Promise<ApprovalRequest> {
+  return store.setCardMessageId(approval.id, messageId);
+}
 
 test('群聊默认拒绝，配置 owner 后只允许 owner', () => {
   const previousOwner = process.env.OWNER_OPEN_ID;
@@ -47,6 +59,10 @@ test('常见破坏性命令会进入审批', () => {
     'kubectl delete deployment api',
     'terraform destroy -auto-approve',
     '执行 rｍ\u200b -rf ./data',
+    "执行 r''m -rf ./data",
+    'git -C ./repo push origin main',
+    'Remove-Item -Recurse ./data',
+    'systemctl restart api',
     '把 main 分支强制推送到远程仓库',
   ]) {
     assert.equal(isHighRiskTask(prompt), true, prompt);
@@ -76,8 +92,19 @@ test('审批状态机支持过期、并发防重、失败重试和旧回调隔�
     const approval = await store.create(input);
     assert.match(approval.id, /^[0-9a-f-]{36}$/);
     await assert.rejects(() => store.beginExecution(approval.id, 'ou_other'), /只有指定负责人/);
+    await assert.rejects(() => store.beginExecution(approval.id, 'ou_owner'), /审批卡绑定缺失/);
+    await bindApprovalCard(store, approval);
 
-    const first = await store.beginExecution(approval.id, 'ou_owner');
+    const claims = await Promise.allSettled([
+      store.beginExecution(approval.id, 'ou_owner'),
+      store.beginExecution(approval.id, 'ou_owner'),
+    ]);
+    const fulfilled = claims.filter(
+      (result): result is PromiseFulfilledResult<ApprovalRequest> => result.status === 'fulfilled',
+    );
+    assert.equal(fulfilled.length, 1);
+    assert.equal(claims.filter((result) => result.status === 'rejected').length, 1);
+    const first = fulfilled[0].value;
     assert.equal(first.status, 'executing');
     assert.equal(first.executionAttempt, 1);
     await assert.rejects(() => store.beginExecution(approval.id, 'ou_owner'), /不能重复执行/);
@@ -92,8 +119,18 @@ test('审批状态机支持过期、并发防重、失败重试和旧回调隔�
     await store.finishExecution(second.id, second.executionAttempt, 'succeeded');
     assert.equal(store.get(approval.id)?.status, 'succeeded');
 
-    const expiring = await store.create({ ...input, prompt: 'sudo reboot' });
-    const failedBeforeExpiry = await store.create({ ...input, prompt: 'git push origin release' });
+    const expiring = await store.create({
+      ...input,
+      prompt: 'sudo reboot',
+      message: { ...input.message, messageId: 'om_expiring' },
+    });
+    const failedBeforeExpiry = await store.create({
+      ...input,
+      prompt: 'git push origin release',
+      message: { ...input.message, messageId: 'om_failed_before_expiry' },
+    });
+    await bindApprovalCard(store, expiring);
+    await bindApprovalCard(store, failedBeforeExpiry);
     const failedRun = await store.beginExecution(failedBeforeExpiry.id, 'ou_owner');
     await store.finishExecution(failedRun.id, failedRun.executionAttempt, 'failed', 'network error');
     now = new Date(now.getTime() + 60_001);
@@ -109,6 +146,96 @@ test('审批状态机支持过期、并发防重、失败重试和旧回调隔�
   }
 });
 
+test('审批创建幂等，落盘失败回滚，损坏或重复记录阻止启动', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-approval-store-'));
+  const path = join(root, 'approvals.json');
+  try {
+    const store = await JsonApprovalStore.open(path);
+    const input = {
+      botId: 'dev', ownerOpenId: 'ou_owner', action: 'task' as const,
+      prompt: 'git push origin main', reason: '外部推送',
+      message: {
+        messageId: 'om_once', chatId: 'oc', chatType: 'p2p',
+        rootId: '', threadId: '', senderOpenId: 'ou_owner',
+      },
+    };
+    const [first, duplicate] = await Promise.all([store.create(input), store.create(input)]);
+    assert.equal(duplicate.id, first.id);
+    assert.equal(store.list().length, 1);
+
+    await rm(path);
+    await mkdir(path);
+    await assert.rejects(() => store.setCardMessageId(first.id, 'om_card'), /EISDIR|directory|目录/i);
+    assert.equal(store.get(first.id)?.cardMessageId, undefined);
+
+    const invalidJson = join(root, 'invalid-json.json');
+    await writeFile(invalidJson, '{');
+    await assert.rejects(() => JsonApprovalStore.open(invalidJson), /不是有效 JSON/);
+    const invalidRow = join(root, 'invalid-row.json');
+    await writeFile(invalidRow, JSON.stringify([{ id: 'broken' }]));
+    await assert.rejects(() => JsonApprovalStore.open(invalidRow), /第 1 条记录格式错误/);
+    const duplicateRows = join(root, 'duplicates.json');
+    await writeFile(duplicateRows, JSON.stringify([first, first]));
+    await assert.rejects(() => JsonApprovalStore.open(duplicateRows), /重复 ID/);
+    const legacyTerminal = join(root, 'legacy-terminal.json');
+    const finishedAt = new Date().toISOString();
+    await writeFile(legacyTerminal, JSON.stringify([{
+      ...first,
+      status: 'failed',
+      executionAttempt: 0,
+      executionFinishedAt: finishedAt,
+      executionError: '旧版本重启中断',
+    }]));
+    const migrated = await JsonApprovalStore.open(legacyTerminal);
+    assert.equal(migrated.get(first.id)?.executionAttempt, 1);
+    assert.equal(migrated.get(first.id)?.status, 'failed');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('重复消息只发送一张审批卡，发卡失败后审批立即失效', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-approval-card-send-'));
+  try {
+    const approvals = await JsonApprovalStore.open(join(root, 'approvals.json'));
+    const msg: IncomingMessage = {
+      messageId: 'om_source', chatId: 'oc', chatType: 'p2p', messageType: 'text',
+      text: 'git push origin main', rootId: '', threadId: '', senderOpenId: 'ou_owner',
+      senderType: 'user', mentions: [], rawContent: '{"text":"git push origin main"}',
+    };
+    let sent = 0;
+    const bot = {
+      id: 'dev',
+      replyCard: async () => {
+        sent += 1;
+        return 'om_approval_card';
+      },
+    } as unknown as Bot;
+    const ctx = { approvals } as unknown as AppContext;
+    const first = await requestHighRiskApproval(ctx, {
+      bot, msg, prompt: msg.text, action: 'task', reason: '外部推送',
+    });
+    const duplicate = await requestHighRiskApproval(ctx, {
+      bot, msg, prompt: msg.text, action: 'task', reason: '外部推送',
+    });
+    assert.equal(duplicate.id, first.id);
+    assert.equal(sent, 1);
+
+    const failedMsg = { ...msg, messageId: 'om_failed_card' };
+    const failedBot = {
+      id: 'dev',
+      replyCard: async () => { throw new Error('飞书不可用'); },
+    } as unknown as Bot;
+    await assert.rejects(() => requestHighRiskApproval(ctx, {
+      bot: failedBot, msg: failedMsg, prompt: 'sudo reboot', action: 'task', reason: '系统重启',
+    }), /飞书不可用/);
+    const failed = approvals.list().find((approval) => approval.message.messageId === failedMsg.messageId);
+    assert.equal(failed?.status, 'expired');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('审批重启校准保留持久化工作流并中止孤立 CLI', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agent-os-approval-recovery-'));
   try {
@@ -119,6 +246,7 @@ test('审批重启校准保留持久化工作流并中止孤立 CLI', async () =
       message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: '', senderOpenId: 'ou' },
     };
     const workflowApproval = await store.create(common);
+    await bindApprovalCard(store, workflowApproval);
     const running = await store.beginExecution(workflowApproval.id, 'ou_owner');
     const workflowId = '6b4ca8b5-b1f3-48e4-839f-9007ce250aa1';
     await store.attachWorkflow(running.id, running.executionAttempt, workflowId);
@@ -126,7 +254,12 @@ test('审批重启校准保留持久化工作流并中止孤立 CLI', async () =
     const changed = await store.reconcileInterrupted(() => 'succeeded');
     assert.equal(changed[0].status, 'succeeded');
 
-    const direct = await store.create({ ...common, action: 'task' });
+    const direct = await store.create({
+      ...common,
+      action: 'task',
+      message: { ...common.message, messageId: 'om_direct' },
+    });
+    await bindApprovalCard(store, direct);
     await store.beginExecution(direct.id, 'ou_owner');
     const interrupted = await store.reconcileInterrupted(() => undefined);
     assert.equal(interrupted[0].status, 'failed');
@@ -147,7 +280,7 @@ test('CLI 按普通、只读和已审批任务使用不同权限边界', () => {
     const codex = new CodexAdapter();
     const standard = codex.buildArgs('修改 README', { executionPolicy: 'standard' });
     assert.equal(standard[standard.indexOf('--sandbox') + 1], 'workspace-write');
-    assert.deepEqual(standard.slice(0, 2), ['--ask-for-approval', 'never']);
+    assert.deepEqual(standard.slice(0, 2), ['--ask-for-approval', 'untrusted']);
     assert.match(standard.at(-1) ?? '', /没有获得高风险操作审批/);
     const readonly = codex.buildArgs('分析日志', { executionPolicy: 'read-only' });
     assert.equal(readonly[readonly.indexOf('--sandbox') + 1], 'read-only');
@@ -161,6 +294,7 @@ test('CLI 按普通、只读和已审批任务使用不同权限边界', () => {
     assert.equal(inputOnly.includes('mcp_servers={}'), true);
     assert.match(inputOnly.at(-1) ?? '', /不得调用任何工具/);
     const approved = codex.buildArgs('git push', { executionPolicy: 'approved', approvedScope: '只推送 main 分支' });
+    assert.deepEqual(approved.slice(0, 2), ['--ask-for-approval', 'never']);
     assert.equal(approved[approved.indexOf('--sandbox') + 1], 'danger-full-access');
     assert.match(approved.at(-1) ?? '', /只推送 main 分支/);
     assert.match(approved[approved.indexOf('-c') + 1], /developer_instructions=.*只推送 main 分支/);
@@ -223,6 +357,7 @@ test('审批失败卡展示原因并只提供重试按钮', async () => {
       botId: 'dev', ownerOpenId: 'ou', action: 'task', prompt: 'rm file', reason: '不可逆删除',
       message: { messageId: 'om', chatId: 'oc', chatType: 'p2p', rootId: '', threadId: '', senderOpenId: 'ou' },
     });
+    await bindApprovalCard(store, created);
     const running = await store.beginExecution(created.id, 'ou');
     const failed = await store.finishExecution(created.id, running.executionAttempt, 'failed', '启动失败');
     const card = buildApprovalCard(failed) as any;
@@ -232,9 +367,10 @@ test('审批失败卡展示原因并只提供重试按钮', async () => {
 
     const scheduled = await store.create({
       botId: 'dev', ownerOpenId: 'ou', action: 'task', prompt: 'token=top-secret git push', reason: '外部推送',
-      message: { messageId: 'om', chatId: 'oc', chatType: 'p2p', rootId: '', threadId: '', senderOpenId: 'ou' },
+      message: { messageId: 'om_scheduled', chatId: 'oc', chatType: 'p2p', rootId: '', threadId: '', senderOpenId: 'ou' },
       scheduleJobId: 'job-1', scheduleRunCount: 1,
     });
+    await bindApprovalCard(store, scheduled);
     const scheduledRun = await store.beginExecution(scheduled.id, 'ou');
     const scheduledFailed = await store.finishExecution(scheduled.id, scheduledRun.executionAttempt, 'failed', 'token=runtime-secret');
     const scheduledCard = buildApprovalCard(scheduledFailed) as any;
@@ -242,6 +378,50 @@ test('审批失败卡展示原因并只提供重试按钮', async () => {
     assert.doesNotMatch(scheduledCard.body.elements[0].content, /top-secret|runtime-secret/);
     assert.match(scheduledCard.body.elements[0].content, /补偿策略/);
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('高风险审批只能从最初绑定的卡片处理', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-approval-binding-'));
+  const previousOwner = process.env.OWNER_OPEN_ID;
+  process.env.OWNER_OPEN_ID = 'ou_owner';
+  try {
+    const store = await JsonApprovalStore.open(join(root, 'approvals.json'));
+    const approval = await store.create({
+      botId: 'dev', ownerOpenId: 'ou_owner', action: 'task', prompt: 'git push origin main', reason: '外部推送',
+      message: { messageId: 'om_source', chatId: 'oc', chatType: 'p2p', rootId: '', threadId: '', senderOpenId: 'ou_owner' },
+    });
+    await bindApprovalCard(store, approval, 'om_original_card');
+    const response = await handleCardAction({ approvals: store } as unknown as AppContext, {
+      operatorOpenId: 'ou_owner',
+      messageId: 'om_forged_card',
+      value: { action: 'approve_high_risk', approvalId: approval.id },
+      formValue: {},
+    });
+    assert.match(response.toast?.content ?? '', /最初绑定的审批卡/);
+    assert.equal(store.get(approval.id)?.status, 'pending');
+    process.env.OWNER_OPEN_ID = 'ou_new_owner';
+    const revoked = await handleCardAction({ approvals: store } as unknown as AppContext, {
+      operatorOpenId: 'ou_owner',
+      messageId: 'om_original_card',
+      value: { action: 'reject_high_risk', approvalId: approval.id },
+      formValue: {},
+    });
+    assert.match(revoked.toast?.content ?? '', /只有指定负责人/);
+    assert.equal(store.get(approval.id)?.status, 'pending');
+    process.env.OWNER_OPEN_ID = 'ou_owner';
+    const rejected = await handleCardAction({ approvals: store } as unknown as AppContext, {
+      operatorOpenId: 'ou_owner',
+      messageId: 'om_original_card',
+      value: { action: 'reject_high_risk', approvalId: approval.id },
+      formValue: {},
+    });
+    assert.match(rejected.toast?.content ?? '', /已拒绝/);
+    assert.equal(store.get(approval.id)?.status, 'rejected');
+  } finally {
+    if (previousOwner === undefined) delete process.env.OWNER_OPEN_ID;
+    else process.env.OWNER_OPEN_ID = previousOwner;
     await rm(root, { recursive: true, force: true });
   }
 });

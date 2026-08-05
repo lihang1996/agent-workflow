@@ -1,4 +1,5 @@
 import type { ApprovalExecutionOutcome, ApprovalRequest } from '../core/approval-store.js';
+import { redactSecrets } from '../core/log-inspection.js';
 import { buildApprovalCard } from '../im/workflow-card.js';
 import type { AppContext } from './app-context.js';
 
@@ -13,7 +14,7 @@ export async function updateApprovalCard(
   try {
     await bot.updateCard(approval.cardMessageId, buildApprovalCard(approval));
   } catch (error) {
-    console.error(`[审批] 更新卡片失败 id=${approval.id}:`, (error as Error).message);
+    console.error(`[审批] 更新卡片失败 id=${approval.id}:`, safeApprovalError(error));
   }
 }
 
@@ -32,7 +33,7 @@ export async function finishApprovalExecution(
   );
   if (approval.executionAttempt === executionAttempt && approval.status === outcome) {
     await settleApprovalSchedule(ctx, approval, outcome, error).catch((settleError) => {
-      console.error(`[审批] ${approval.id} 定时任务结算失败:`, (settleError as Error).message);
+      console.error(`[审批] ${approval.id} 定时任务结算失败:`, safeApprovalError(settleError));
     });
   }
   await updateApprovalCard(ctx, approval);
@@ -66,7 +67,7 @@ export async function expireStaleApprovals(ctx: AppContext): Promise<void> {
   const expired = await ctx.approvals.expireStale();
   for (const approval of expired) {
     await settleApprovalSchedule(ctx, approval, 'skipped', approval.executionError).catch((error) => {
-      console.error(`[审批] ${approval.id} 过期结算失败:`, (error as Error).message);
+      console.error(`[审批] ${approval.id} 过期结算失败:`, safeApprovalError(error));
     });
     await updateApprovalCard(ctx, approval);
   }
@@ -75,7 +76,7 @@ export async function expireStaleApprovals(ctx: AppContext): Promise<void> {
     const outcome = scheduleOutcomeFor(approval);
     if (!outcome) continue;
     await settleApprovalSchedule(ctx, approval, outcome, approval.executionError).catch((error) => {
-      console.error(`[审批] ${approval.id} 定时任务补偿结算失败:`, (error as Error).message);
+      console.error(`[审批] ${approval.id} 定时任务补偿结算失败:`, safeApprovalError(error));
     });
   }
 }
@@ -124,7 +125,7 @@ export async function reconcileApprovalExecutions(ctx: AppContext): Promise<void
     const scheduleOutcome = scheduleOutcomeFor(approval);
     if (scheduleOutcome) {
       await settleApprovalSchedule(ctx, approval, scheduleOutcome, approval.executionError).catch((error) => {
-        console.error(`[审批] ${approval.id} 重启结算失败:`, (error as Error).message);
+        console.error(`[审批] ${approval.id} 重启结算失败:`, safeApprovalError(error));
       });
     }
   }
@@ -138,4 +139,9 @@ function scheduleOutcomeFor(
   if (approval.status === 'failed') return 'failed';
   if (approval.status === 'rejected' || approval.status === 'expired') return 'skipped';
   return undefined;
+}
+
+function safeApprovalError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return redactSecrets(message.trim() || '未知错误').slice(0, 2_000);
 }

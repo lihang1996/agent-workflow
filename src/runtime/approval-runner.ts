@@ -1,4 +1,6 @@
 import type { ApprovalRequest } from '../core/approval-store.js';
+import { assertOwnedBy } from '../core/access.js';
+import { redactSecrets } from '../core/log-inspection.js';
 import type { IncomingMessage, Bot } from '../im/lark.js';
 import { buildApprovalCard } from '../im/workflow-card.js';
 import type { AppContext } from './app-context.js';
@@ -38,6 +40,8 @@ export async function requestHighRiskApproval(
       senderOpenId: options.msg.senderOpenId,
     },
   });
+  // 飞书可能重投同一条消息；已有审批（含终态）不能重复发卡或重新授权。
+  if (approval.cardMessageId || approval.status !== 'pending') return approval;
   try {
     const cardMessageId = await options.bot.replyCard(
       options.msg.messageId,
@@ -47,9 +51,22 @@ export async function requestHighRiskApproval(
     if (!cardMessageId) throw new Error('飞书未返回审批卡 message_id');
     return await ctx.approvals.setCardMessageId(approval.id, cardMessageId);
   } catch (error) {
-    await ctx.approvals.expire(approval.id, `审批卡发送失败：${(error as Error).message}`).catch(() => undefined);
-    throw error;
+    const message = safeApprovalError(error);
+    try {
+      await ctx.approvals.expire(approval.id, `审批卡发送失败：${message}`);
+    } catch (stateError) {
+      throw new Error(
+        `审批卡发送失败：${message}；审批失效状态保存失败：${safeApprovalError(stateError)}`,
+        { cause: error },
+      );
+    }
+    throw new Error(`审批卡发送失败：${message}`, { cause: error });
   }
+}
+
+function safeApprovalError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return redactSecrets(message.trim() || '未知错误').slice(0, 2_000);
 }
 
 /**
@@ -61,6 +78,10 @@ export async function executeApprovedAction(
   approvalId: string,
   operatorOpenId: string,
 ): Promise<ApprovalRequest> {
+  const pending = ctx.approvals.get(approvalId);
+  if (!pending) throw new Error(`审批不存在: ${approvalId}`);
+  // 配置负责人变更后，旧负责人不能继续使用尚未处理的历史卡片。
+  assertOwnedBy(pending.ownerOpenId, operatorOpenId);
   const approval = await ctx.approvals.beginExecution(approvalId, operatorOpenId);
   await updateApprovalCard(ctx, approval);
   try {
@@ -107,6 +128,9 @@ async function runApprovedAction(ctx: AppContext, approval: ApprovalRequest): Pr
     return;
   }
   if (approval.action === 'squad') {
+    if (bot.id !== 'dev' && bot.id !== 'ceo') {
+      throw new Error('内部交付小队必须由开发工程师或 CEO Bot 执行。');
+    }
     await runDeliverySquad(ctx, {
       initiator: bot,
       msg,

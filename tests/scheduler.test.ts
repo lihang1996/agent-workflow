@@ -223,6 +223,7 @@ test('定时高风险任务等待真实审批结果后再结算', async () => {
       reason: '会向外部仓库推送内容', message: claimed.message,
       scheduleJobId: claimed.id, scheduleRunCount: claimed.runCount,
     });
+    await approvals.setCardMessageId(approval.id, 'om_card_first_run');
     const executing = await approvals.beginExecution(approval.id, 'ou_owner');
     const ctx = { schedules, approvals, botsById: new Map() } as unknown as AppContext;
     await finishApprovalExecution(ctx, approval.id, executing.executionAttempt, 'succeeded');
@@ -234,6 +235,7 @@ test('定时高风险任务等待真实审批结果后再结算', async () => {
       reason: '会向外部仓库推送内容', message: next.message,
       scheduleJobId: next.id, scheduleRunCount: next.runCount,
     });
+    await approvals.setCardMessageId(rejected.id, 'om_card_second_run');
     const rejectedState = await approvals.reject(rejected.id, 'ou_owner');
     await settleApprovalSchedule(ctx, rejectedState, 'skipped', '负责人拒绝审批');
     assert.equal(schedules.get(next.id)?.lastStatus, 'skipped');
@@ -258,6 +260,7 @@ test('重启后待审批定时任务保持占位，审批终态可修复跨存�
       reason: '会向外部仓库推送内容', message: claimed.message,
       scheduleJobId: claimed.id, scheduleRunCount: claimed.runCount,
     });
+    await initialApprovals.setCardMessageId(approval.id, 'om_card_restart');
 
     const schedules = await JsonScheduleStore.open(schedulePath);
     const approvals = await JsonApprovalStore.open(approvalPath);

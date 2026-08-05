@@ -100,7 +100,7 @@ export class CodexAdapter implements CliAdapter {
     const policy = options.executionPolicy ?? 'standard';
     return [
       '--ask-for-approval',
-      'never',
+      codexApprovalPolicyFor(policy),
       '-c',
       `developer_instructions=${JSON.stringify(instructionsForExecutionPolicy(policy, options.approvedScope))}`,
       'exec',
@@ -117,7 +117,7 @@ export class CodexAdapter implements CliAdapter {
     const policy = options.executionPolicy ?? 'standard';
     return [
       '--ask-for-approval',
-      'never',
+      codexApprovalPolicyFor(policy),
       '-c',
       `developer_instructions=${JSON.stringify(instructionsForExecutionPolicy(policy, options.approvedScope))}`,
       'exec',
@@ -288,4 +288,10 @@ function mcpFlagsFor(policy: CliExecutionPolicy): string[] {
     return ['--ignore-user-config', '-c', 'mcp_servers={}'];
   }
   return codexMcpFlags();
+}
+
+function codexApprovalPolicyFor(policy: CliExecutionPolicy): 'untrusted' | 'never' {
+  // 普通任务遇到 Codex 判定为不可信的命令时必须失败并回到飞书审批门；
+  // 已审批任务由持久化审批记录限定范围，其它只读策略依赖沙箱直接拒绝写入。
+  return policy === 'standard' ? 'untrusted' : 'never';
 }
