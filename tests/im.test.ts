@@ -7,6 +7,7 @@ import {
   parseMentions,
   resolveMentions,
 } from '../src/im/message-parser.js';
+import { parseCommand } from '../src/core/command-parser.js';
 import { resourceLocalName } from '../src/im/lark.js';
 
 test('畸形飞书消息不会打断解析', () => {
@@ -45,6 +46,20 @@ test('富文本、图片、文件、音视频资源可解析并去重', () => {
   assert.deepEqual(extractResourceKeys('media', '{"file_key":"file_video","file_name":"demo.mp4"}'), [
     { type: 'file', key: 'file_video', fileName: 'demo.mp4' },
   ]);
+});
+
+test('富文本提及后的斜杠命令可被识别', () => {
+  const post = JSON.stringify({
+    zh_cn: {
+      content: [[
+        { tag: 'at', user_id: 'ou_bot' },
+        { tag: 'text', text: ' /help' },
+      ]],
+    },
+  });
+  const text = extractMessageText('post', post);
+  assert.equal(text, '@ou_bot /help');
+  assert.deepEqual(parseCommand(text), { name: 'help' });
 });
 
 test('飞书资源 key 不能控制本地保存路径', () => {

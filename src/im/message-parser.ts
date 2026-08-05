@@ -82,7 +82,10 @@ function postParagraphs(parsed: JsonRecord): PostElement[][] {
 }
 
 function renderPostElement(element: PostElement): string {
-  if (element.tag === 'at') return stringValue(element.user_id) ?? '';
+  if (element.tag === 'at') {
+    const userId = stringValue(element.user_id);
+    return userId ? `@${userId}` : '';
+  }
   if (element.tag === 'br') return '\n';
   if (['text', 'a', 'code', 'code_block', 'md'].includes(String(element.tag ?? ''))) {
     return typeof element.text === 'string' ? element.text : '';
