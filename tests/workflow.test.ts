@@ -14,9 +14,14 @@ import {
   confirmSpecForReview,
   reconcileWorkflowSpecStates,
   rejectSpecConfirmation,
-  resumeWorkflowAfterProductReview,
 } from '../src/runtime/pipeline-runner.js';
-import { publishSpecToDoc } from '../src/runtime/spec-review.js';
+import {
+  approveSpecReview,
+  CARD_REVIEW_COMMENT_PREFIX,
+  publishSpecToDoc,
+  requestSpecChangesFromCard,
+  runSpecReviewSync,
+} from '../src/runtime/spec-review.js';
 import { reconcileApprovalExecutions } from '../src/runtime/approval-status.js';
 import type { AppContext } from '../src/runtime/app-context.js';
 
@@ -603,8 +608,10 @@ test('产品评审通过后恢复内部交付工作流', async () => {
       ownerOpenId: 'ou',
       botId: 'pm',
       workflowId: workflow.id,
+      docId: 'doc-approved',
+      docUrl: 'https://feishu.cn/docx/doc-approved',
     });
-    await specs.update(spec.id, { status: 'approved' });
+    await specs.update(spec.id, { status: 'in_review' });
     await workflows.update(workflow.id, {
       status: 'awaiting_doc_review',
       nextStepIndex: 1,
@@ -612,12 +619,14 @@ test('产品评审通过后恢复内部交付工作流', async () => {
     });
     const replies: string[] = [];
     const ceo = { id: 'ceo', reply: async (_id: string, text: string) => { replies.push(text); } } as any;
-    await resumeWorkflowAfterProductReview({
+    const pm = { id: 'pm', openId: 'ou_pm', listDocumentComments: async () => [] } as any;
+    const approved = await approveSpecReview({
       shuttingDown: false,
       workflows,
       specs,
-      botsById: new Map([['ceo', ceo]]),
+      botsById: new Map([['ceo', ceo], ['pm', pm]]),
     } as AppContext, spec.id);
+    assert.equal(approved.status, 'approved');
     assert.equal(workflows.get(workflow.id)?.status, 'completed');
     assert.equal(workflows.get(workflow.id)?.priorOutputs.pm, '最终 Spec');
     assert.match(replies[0], /全部完成/);
@@ -644,4 +653,167 @@ test('云文档评论按远端 ID 去重并只解决本轮意见', async () => {
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('并发提交产品修改意见只创建一次云文档评论', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-review-comment-race-'));
+  try {
+    const specs = await JsonSpecStore.open(join(root, 'specs.json'));
+    const workflows = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const workflow = await workflows.create({
+      kind: 'team', name: '团队交付流水线', initiatorBotId: 'ceo', goal: '登录', stepIds: ['pm'],
+      message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt', senderOpenId: 'ou' },
+    });
+    const spec = await specs.create({
+      title: '登录', content: 'Spec', chatId: 'oc', topicId: 'omt', messageId: 'om',
+      ownerOpenId: 'ou', botId: 'pm', workflowId: workflow.id,
+      docId: 'doc-review', docUrl: 'https://feishu.cn/docx/doc-review',
+    });
+    await specs.update(spec.id, { status: 'in_review' });
+    await workflows.update(workflow.id, { status: 'awaiting_doc_review', specId: spec.id, nextStepIndex: 1 });
+    let remoteCreates = 0;
+    const pm = {
+      id: 'pm', openId: 'ou_pm',
+      createDocumentComment: async () => `comment-${++remoteCreates}`,
+      replyCard: async () => 'om-card',
+    } as any;
+    const ctx = {
+      shuttingDown: true,
+      specs,
+      workflows,
+      botsById: new Map([['pm', pm]]),
+    } as AppContext;
+    const results = await Promise.allSettled([
+      requestSpecChangesFromCard(ctx, spec.id, 'ou', '补充异常流程'),
+      requestSpecChangesFromCard(ctx, spec.id, 'ou', '补充异常流程'),
+    ]);
+    assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
+    assert.equal(results.filter((result) => result.status === 'rejected').length, 1);
+    assert.equal(remoteCreates, 1);
+    assert.equal(specs.get(spec.id)?.comments.length, 1);
+    assert.equal(workflows.get(workflow.id)?.status, 'ready');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('评审通过前发现远端新评论会转回产品修订', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-review-remote-gate-'));
+  try {
+    const specs = await JsonSpecStore.open(join(root, 'specs.json'));
+    const workflows = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const workflow = await workflows.create({
+      kind: 'team', name: '团队交付流水线', initiatorBotId: 'ceo', goal: '登录', stepIds: ['pm'],
+      message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt', senderOpenId: 'ou' },
+    });
+    const spec = await specs.create({
+      title: '登录', content: 'Spec', chatId: 'oc', topicId: 'omt', messageId: 'om',
+      ownerOpenId: 'ou', botId: 'pm', workflowId: workflow.id,
+      docId: 'doc-gate', docUrl: 'https://feishu.cn/docx/doc-gate',
+    });
+    await specs.update(spec.id, { status: 'in_review' });
+    await workflows.update(workflow.id, { status: 'awaiting_doc_review', specId: spec.id, nextStepIndex: 1 });
+    const pm = {
+      id: 'pm', openId: 'ou_pm',
+      listDocumentComments: async () => [{
+        id: 'comment-new', commentId: 'comment-new', authorOpenId: 'ou_reviewer',
+        content: '补充失败重试规则', resolved: false,
+      }],
+      replyCard: async () => 'om-card',
+    } as any;
+    const ctx = {
+      shuttingDown: true,
+      specs,
+      workflows,
+      botsById: new Map([['pm', pm]]),
+    } as AppContext;
+    await assert.rejects(() => approveSpecReview(ctx, spec.id), /发现新的云文档评审意见/);
+    assert.equal(specs.get(spec.id)?.status, 'changes_requested');
+    assert.equal(specs.get(spec.id)?.comments[0]?.docCommentId, 'comment-new');
+    assert.equal(workflows.get(workflow.id)?.status, 'ready');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('卡片评论远端成功而本地中断后可由评审检查恢复', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-review-card-recover-'));
+  try {
+    const specs = await JsonSpecStore.open(join(root, 'specs.json'));
+    const workflows = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const workflow = await workflows.create({
+      kind: 'team', name: '团队交付流水线', initiatorBotId: 'ceo', goal: '登录', stepIds: ['pm'],
+      message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt', senderOpenId: 'ou' },
+    });
+    const spec = await specs.create({
+      title: '登录', content: 'Spec', chatId: 'oc', topicId: 'omt', messageId: 'om',
+      ownerOpenId: 'ou', botId: 'pm', workflowId: workflow.id,
+      docId: 'doc-card-recover', docUrl: 'https://feishu.cn/docx/doc-card-recover',
+    });
+    await specs.update(spec.id, { status: 'in_review' });
+    await workflows.update(workflow.id, { status: 'awaiting_doc_review', specId: spec.id, nextStepIndex: 1 });
+    const pm = {
+      id: 'pm', openId: 'ou_pm',
+      listDocumentComments: async () => [{
+        id: 'comment-card', commentId: 'comment-card', authorOpenId: 'ou_pm',
+        content: `${CARD_REVIEW_COMMENT_PREFIX} 补充失败重试规则`, resolved: false,
+      }],
+      replyCard: async () => 'om-card',
+    } as any;
+    await assert.rejects(() => approveSpecReview({
+      shuttingDown: true,
+      specs,
+      workflows,
+      botsById: new Map([['pm', pm]]),
+    } as AppContext, spec.id), /发现新的云文档评审意见/);
+    assert.equal(specs.get(spec.id)?.comments[0]?.content, '补充失败重试规则');
+    assert.equal(workflows.get(workflow.id)?.status, 'ready');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('本地已处理评论会补偿同步为云文档已解决', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-review-resolution-sync-'));
+  try {
+    const specs = await JsonSpecStore.open(join(root, 'specs.json'));
+    let spec = await specs.create({
+      title: '登录', content: 'Spec', chatId: 'oc', topicId: 'omt', messageId: 'om',
+      ownerOpenId: 'ou', botId: 'pm', docId: 'doc-resolution',
+      docUrl: 'https://feishu.cn/docx/doc-resolution',
+    });
+    spec = await specs.addComment(spec.id, 'ou_reviewer', '补充边界', 'comment-root:reply-a');
+    spec = await specs.resolveComments(spec.id, new Set([spec.comments[0].id]));
+    const resolved: string[] = [];
+    const pm = {
+      id: 'pm',
+      resolveDocumentComment: async (_docId: string, commentId: string) => { resolved.push(commentId); },
+    } as any;
+    await runSpecReviewSync({
+      shuttingDown: false,
+      specReviewRunning: false,
+      specs,
+      botsById: new Map([['pm', pm]]),
+    } as AppContext);
+    assert.deepEqual(resolved, ['comment-root']);
+    assert.ok(specs.get(spec.id)?.comments[0].documentResolvedAt);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('产品评审卡会转义未处理评论', () => {
+  const card = buildSpecReviewCard({
+    id: 'spec-review-card', title: '登录', content: 'Spec', chatId: 'oc', topicId: 'omt', messageId: 'om',
+    ownerOpenId: 'ou', botId: 'pm', status: 'changes_requested',
+    docId: 'doc-card', docUrl: 'https://feishu.cn/docx/doc-card',
+    comments: [{
+      id: '6b4ca8b5-b1f3-48e4-839f-9007ce250aa1', authorOpenId: 'ou_reviewer',
+      content: '*伪造强调* <at id=all>', resolved: false, createdAt: new Date().toISOString(),
+    }],
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+  }) as any;
+  const comments = card.body.elements.find((item: any) => item.tag === 'markdown' && /待处理意见/.test(item.content));
+  assert.match(comments.content, /\\\*伪造强调\\\*/);
+  assert.match(comments.content, /\\<at id=all\\>/);
 });

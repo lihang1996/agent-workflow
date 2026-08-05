@@ -135,7 +135,10 @@ export function buildSpecConfirmationCard(spec: ProductSpec): CardJson {
 }
 
 export function buildSpecReviewCard(spec: ProductSpec): CardJson {
-  const comment = spec.comments.filter((item) => !item.resolved).map((item) => `- ${item.content}`).join('\n');
+  const comment = spec.comments
+    .filter((item) => !item.resolved)
+    .map((item) => `- ${escapeCardMarkdown(item.content, 2_000)}`)
+    .join('\n');
   const reviewing = spec.status === 'in_review';
   const statusTitle = spec.status === 'approved'
     ? '产品 Spec · 评审通过'
@@ -162,6 +165,7 @@ export function buildSpecReviewCard(spec: ProductSpec): CardJson {
                   required: false,
                   input_type: 'multiline_text',
                   rows: 3,
+                  max_length: 4_000,
                   label: { tag: 'plain_text', content: '修改意见（要求修改时必填）' },
                   placeholder: { tag: 'plain_text', content: '请输入需要产品经理处理的意见' },
                 },

@@ -256,12 +256,15 @@ async function completeProductStep(
   const handledCommentIds = new Set(
     (workflow.priorOutputs.review_comment_ids ?? '').split(',').map((id) => id.trim()).filter(Boolean),
   );
+  const documentCommentGroups = new Map<string, string[]>();
   if (existing?.docId && handledCommentIds.size > 0) {
-    const documentCommentIds = new Set(existing.comments
-      .filter((comment) => handledCommentIds.has(comment.id) && comment.docCommentId)
-      .map((comment) => comment.docCommentId!.split(':', 1)[0]));
-    for (const commentId of documentCommentIds) {
-      await actor.resolveDocumentComment(existing.docId, commentId);
+    for (const comment of existing.comments) {
+      if (!handledCommentIds.has(comment.id) || !comment.docCommentId) continue;
+      const documentCommentId = comment.docCommentId.split(':', 1)[0];
+      documentCommentGroups.set(
+        documentCommentId,
+        [...(documentCommentGroups.get(documentCommentId) ?? []), comment.id],
+      );
     }
   }
   let spec = existing
@@ -302,6 +305,19 @@ async function completeProductStep(
     `产品 Spec 已生成（${spec.id}）。确认前架构和开发步骤不会启动。`,
     hasThread(msg),
   );
+  if (existing?.docId) {
+    for (const [documentCommentId, localCommentIds] of documentCommentGroups) {
+      try {
+        await actor.resolveDocumentComment(existing.docId, documentCommentId);
+        await ctx.specs.markDocumentCommentsResolved(existing.id, new Set(localCommentIds));
+      } catch (error) {
+        console.error(
+          `[产品评审] 同步解决 Spec ${existing.id} 评论 ${documentCommentId} 失败，将由轮询重试:`,
+          (error as Error).message,
+        );
+      }
+    }
+  }
 }
 
 function isCurrentExecutingStep(
@@ -426,14 +442,14 @@ export async function resumeWorkflowForSpecRevision(
   commentIds: string[] = [],
 ): Promise<void> {
   const spec = ctx.specs.get(specId);
-  if (!spec?.workflowId) return;
+  if (!spec?.workflowId || spec.status !== 'changes_requested') return;
   const workflow = requireWorkflow(ctx, spec.workflowId);
   const transitioned = await prepareWorkflowForSpecRevision(
     ctx,
     spec,
     feedback,
     commentIds,
-    ['awaiting_spec_confirmation', 'awaiting_doc_review'],
+    'awaiting_doc_review',
   );
   if (!transitioned) return;
   await continueDeliveryWorkflow(ctx, workflow.id);
@@ -474,11 +490,12 @@ export async function resumeWorkflowAfterProductReview(ctx: AppContext, specId: 
   if (workflow.status !== 'awaiting_doc_review' || workflow.specId !== spec.id) {
     throw new Error(`工作流当前状态为 ${workflow.status}，无法启动内部交付小队。`);
   }
-  await ctx.workflows.update(workflow.id, {
+  const transitioned = await ctx.workflows.updateIfStatus(workflow.id, 'awaiting_doc_review', {
     status: 'ready',
     priorOutputs: { ...workflow.priorOutputs, pm: spec.content },
     error: undefined,
   });
+  if (!transitioned) throw new Error(`工作流当前状态为 ${ctx.workflows.get(workflow.id)?.status ?? 'unknown'}，无法启动内部交付小队。`);
   await continueDeliveryWorkflow(ctx, workflow.id);
 }
 
@@ -506,19 +523,22 @@ export async function resumeRecoverableWorkflows(ctx: AppContext): Promise<void>
 /** 修复 Spec 与工作流分文件写入之间的进程中断窗口。 */
 export async function reconcileWorkflowSpecStates(ctx: AppContext): Promise<void> {
   for (const workflow of ctx.workflows.list()) {
-    if (workflow.status !== 'awaiting_spec_confirmation' || !workflow.specId) continue;
+    if (!workflow.specId) continue;
     const spec = ctx.specs.get(workflow.specId);
     if (!spec || spec.workflowId !== workflow.id) {
       throw new Error(`工作流 ${workflow.id} 的 Spec 关联损坏。`);
     }
-    if (spec.status === 'confirmed' || spec.status === 'published' || spec.status === 'in_review' || spec.status === 'approved') {
+    if (
+      workflow.status === 'awaiting_spec_confirmation'
+      && (spec.status === 'confirmed' || spec.status === 'published' || spec.status === 'in_review' || spec.status === 'approved')
+    ) {
       await ctx.workflows.updateIfStatus(workflow.id, 'awaiting_spec_confirmation', {
         status: 'awaiting_doc_review',
         error: undefined,
       });
       continue;
     }
-    if (spec.status === 'changes_requested' && spec.confirmationFeedback) {
+    if (workflow.status === 'awaiting_spec_confirmation' && spec.status === 'changes_requested' && spec.confirmationFeedback) {
       await prepareWorkflowForSpecRevision(
         ctx,
         spec,
@@ -526,6 +546,27 @@ export async function reconcileWorkflowSpecStates(ctx: AppContext): Promise<void
         [],
         'awaiting_spec_confirmation',
       );
+      continue;
+    }
+    if (workflow.status === 'awaiting_doc_review' && spec.status === 'changes_requested') {
+      const comments = spec.comments.filter((comment) => !comment.resolved);
+      if (comments.length > 0) {
+        await prepareWorkflowForSpecRevision(
+          ctx,
+          spec,
+          comments.map((comment) => `- ${comment.content.slice(0, 2_000)}`).join('\n'),
+          comments.map((comment) => comment.id),
+          'awaiting_doc_review',
+        );
+      }
+      continue;
+    }
+    if (workflow.status === 'awaiting_doc_review' && spec.status === 'approved') {
+      await ctx.workflows.updateIfStatus(workflow.id, 'awaiting_doc_review', {
+        status: 'ready',
+        priorOutputs: { ...workflow.priorOutputs, pm: spec.content },
+        error: undefined,
+      });
     }
   }
 }

@@ -22,8 +22,12 @@ export const SpecCommentSchema = z.object({
   resolved: z.boolean().default(false),
   createdAt: z.iso.datetime(),
   resolvedAt: z.iso.datetime().optional(),
+  documentResolvedAt: z.iso.datetime().optional(),
 });
 export type SpecComment = z.infer<typeof SpecCommentSchema>;
+export type NewSpecComment = Pick<SpecComment, 'authorOpenId' | 'content'> & {
+  docCommentId?: string;
+};
 
 export const ProductSpecSchema = z.object({
   // 兼容早期 8 位 ID；新记录使用完整 UUID。
@@ -40,7 +44,7 @@ export const ProductSpecSchema = z.object({
   confirmationFeedback: z.string().trim().min(1).max(4_000).optional(),
   status: SpecStatusSchema,
   docId: z.string().trim().min(1).max(500).optional(),
-  docUrl: z.url().refine((value) => value.startsWith('https://'), '云文档地址必须使用 HTTPS').optional(),
+  docUrl: z.url().refine(isFeishuDocumentUrl, '云文档地址必须是飞书 Docx HTTPS 地址').optional(),
   comments: z.array(SpecCommentSchema).max(2_000).default([]),
   createdAt: z.iso.datetime(),
   updatedAt: z.iso.datetime(),
@@ -107,6 +111,20 @@ export class JsonSpecStore {
   listInReview(): ProductSpec[] {
     return [...this.specs.values()]
       .filter((spec) => spec.status === 'in_review' && !!spec.docId)
+      .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
+  }
+
+  listPendingDocumentResolution(): ProductSpec[] {
+    return [...this.specs.values()]
+      .filter((spec) => !!spec.docId && spec.comments.some((comment) =>
+        comment.resolved && !!comment.docCommentId && !comment.documentResolvedAt))
+      .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
+  }
+
+  listPendingReviewRevision(): ProductSpec[] {
+    return [...this.specs.values()]
+      .filter((spec) => spec.status === 'changes_requested'
+        && spec.comments.some((comment) => !comment.resolved))
       .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
   }
 
@@ -193,6 +211,38 @@ export class JsonSpecStore {
     });
   }
 
+  /** 同一轮远端评审意见一次落盘，避免部分评论成功后中断。 */
+  async addComments(id: string, inputs: readonly NewSpecComment[]): Promise<ProductSpec> {
+    return this.enqueueMutation(async () => {
+      const spec = this.require(id);
+      const knownDocumentIds = new Set(spec.comments.flatMap((comment) =>
+        comment.docCommentId ? [comment.docCommentId] : []));
+      const additions: SpecComment[] = [];
+      for (const input of inputs) {
+        if (input.docCommentId && knownDocumentIds.has(input.docCommentId)) continue;
+        const comment = SpecCommentSchema.parse({
+          id: randomUUID(),
+          authorOpenId: input.authorOpenId,
+          content: input.content,
+          ...(input.docCommentId ? { docCommentId: input.docCommentId } : {}),
+          resolved: false,
+          createdAt: new Date().toISOString(),
+        });
+        additions.push(comment);
+        if (comment.docCommentId) knownDocumentIds.add(comment.docCommentId);
+      }
+      if (additions.length === 0) return spec;
+      const next = ProductSpecSchema.parse({
+        ...spec,
+        comments: [...spec.comments, ...additions],
+        status: 'changes_requested',
+        updatedAt: new Date().toISOString(),
+      });
+      await this.replaceAndPersist(id, next);
+      return next;
+    });
+  }
+
   async resolveComments(id: string, commentIds?: ReadonlySet<string>): Promise<ProductSpec> {
     return this.enqueueMutation(async () => {
       const spec = this.require(id);
@@ -205,6 +255,23 @@ export class JsonSpecStore {
           : { ...comment, resolved: true, resolvedAt: now }),
         updatedAt: now,
       });
+      await this.replaceAndPersist(id, next);
+      return next;
+    });
+  }
+
+  async markDocumentCommentsResolved(id: string, commentIds: ReadonlySet<string>): Promise<ProductSpec> {
+    return this.enqueueMutation(async () => {
+      const spec = this.require(id);
+      const now = new Date().toISOString();
+      let changed = false;
+      const comments = spec.comments.map((comment) => {
+        if (!commentIds.has(comment.id) || comment.documentResolvedAt) return comment;
+        changed = true;
+        return { ...comment, documentResolvedAt: now };
+      });
+      if (!changed) return spec;
+      const next = ProductSpecSchema.parse({ ...spec, comments, updatedAt: now });
       await this.replaceAndPersist(id, next);
       return next;
     });
@@ -268,5 +335,19 @@ export class JsonSpecStore {
     const run = this.mutationQueue.then(operation, operation);
     this.mutationQueue = run.then(() => undefined, () => undefined);
     return run;
+  }
+}
+
+function isFeishuDocumentUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
+    const trustedHost = host === 'feishu.cn'
+      || host.endsWith('.feishu.cn')
+      || host === 'larksuite.com'
+      || host.endsWith('.larksuite.com');
+    return url.protocol === 'https:' && trustedHost && url.pathname.startsWith('/docx/');
+  } catch {
+    return false;
   }
 }

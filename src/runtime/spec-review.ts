@@ -14,6 +14,10 @@ import {
 
 export const CARD_REVIEW_COMMENT_PREFIX = '[Agent OS 卡片评审]';
 const DEFAULT_SYNC_INTERVAL_MS = 60_000;
+const MAX_REVIEW_COMMENTS_PER_REVISION = 20;
+const MAX_REVIEW_COMMENT_LENGTH = 10_000;
+const MAX_REVIEW_FEEDBACK_ITEM_LENGTH = 2_000;
+const MAX_CARD_REVIEW_LENGTH = 4_000;
 const specOperationTails = new Map<string, Promise<void>>();
 
 function syncIntervalMs(): number {
@@ -26,48 +30,97 @@ function reviewBot(ctx: AppContext, spec: ProductSpec, fallback?: Bot): Bot | un
 }
 
 function isInternalComment(comment: DocumentComment, bot: Bot): boolean {
-  return comment.authorOpenId === bot.openId || comment.content.startsWith(CARD_REVIEW_COMMENT_PREFIX);
+  return comment.authorOpenId === bot.openId
+    && !comment.content.trim().startsWith(CARD_REVIEW_COMMENT_PREFIX);
+}
+
+function unseenReviewComments(spec: ProductSpec, comments: DocumentComment[]): DocumentComment[] {
+  const known = new Set(spec.comments.flatMap((comment) => comment.docCommentId ? [comment.docCommentId] : []));
+  const seen = new Set<string>();
+  const unseen: DocumentComment[] = [];
+  for (const comment of comments) {
+    const id = comment.id.trim();
+    const rawContent = comment.content.trim();
+    const content = rawContent.startsWith(CARD_REVIEW_COMMENT_PREFIX)
+      ? rawContent.slice(CARD_REVIEW_COMMENT_PREFIX.length).trim()
+      : rawContent;
+    if (comment.resolved || !id || !content || known.has(id) || seen.has(id)) continue;
+    if (id.length > 500) throw new Error('飞书评论 ID 超出本地存储上限。');
+    seen.add(id);
+    unseen.push({
+      ...comment,
+      id,
+      commentId: comment.commentId.trim() || id,
+      authorOpenId: (comment.authorOpenId.trim() || 'feishu-reviewer').slice(0, 200),
+      content: content.slice(0, MAX_REVIEW_COMMENT_LENGTH),
+    });
+    if (unseen.length >= MAX_REVIEW_COMMENTS_PER_REVISION) break;
+  }
+  return unseen;
+}
+
+function reviewFeedback(comments: DocumentComment[]): string {
+  return comments
+    .map((comment) => `- ${comment.content.slice(0, MAX_REVIEW_FEEDBACK_ITEM_LENGTH)}`)
+    .join('\n');
 }
 
 async function applyReviewComments(
   ctx: AppContext,
-  spec: ProductSpec,
+  specId: string,
   comments: DocumentComment[],
   fallbackBot?: Bot,
 ): Promise<ProductSpec> {
+  return runSerialSpecOperation(specId, () =>
+    applyReviewCommentsUnlocked(ctx, specId, comments, fallbackBot));
+}
+
+async function applyReviewCommentsUnlocked(
+  ctx: AppContext,
+  specId: string,
+  comments: DocumentComment[],
+  fallbackBot?: Bot,
+): Promise<ProductSpec> {
+  const spec = ctx.specs.get(specId);
+  if (!spec) throw new Error(`Spec 不存在: ${specId}`);
   if (spec.status !== 'in_review') return spec;
   if (!spec.workflowId) throw new Error(`Spec ${spec.id} 没有关联交付工作流，无法把评审意见交给产品经理。`);
-  const known = new Set(spec.comments.flatMap((comment) => comment.docCommentId ? [comment.docCommentId] : []));
-  const unseen = comments.filter((comment) => !comment.resolved && !known.has(comment.id));
+  const workflow = ctx.workflows.get(spec.workflowId);
+  if (!workflow || workflow.status !== 'awaiting_doc_review' || workflow.specId !== spec.id) {
+    throw new Error('交付工作流不在产品评审节点，无法处理云文档评论。');
+  }
+
+  const unseen = unseenReviewComments(spec, comments);
   if (unseen.length === 0) return spec;
 
-  let changed = spec;
-  const localCommentIds: string[] = [];
-  for (const comment of unseen) {
-    changed = await ctx.specs.addComment(
-      changed.id,
-      comment.authorOpenId || 'feishu-reviewer',
-      comment.content,
-      comment.id,
-    );
-    const local = changed.comments.find((candidate) => candidate.docCommentId === comment.id);
-    if (local) localCommentIds.push(local.id);
+  const changed = await ctx.specs.addComments(spec.id, unseen.map((comment) => ({
+    authorOpenId: comment.authorOpenId,
+    content: comment.content,
+    docCommentId: comment.id,
+  })));
+  const unseenIds = new Set(unseen.map((comment) => comment.id));
+  const localCommentIds = changed.comments
+    .filter((comment) => !!comment.docCommentId && unseenIds.has(comment.docCommentId))
+    .map((comment) => comment.id);
+  await resumeWorkflowForSpecRevision(ctx, changed.id, reviewFeedback(unseen), localCommentIds);
+  const latestWorkflow = ctx.workflows.get(workflow.id);
+  if (latestWorkflow?.status === 'failed') {
+    throw new Error(latestWorkflow.error ?? '产品经理修订工作流启动失败。');
   }
-  const feedback = unseen.map((comment) => `- ${comment.content}`).join('\n');
-  await resumeWorkflowForSpecRevision(ctx, changed.id, feedback, localCommentIds);
 
-  const bot = reviewBot(ctx, changed, fallbackBot);
+  const latest = ctx.specs.get(changed.id) ?? changed;
+  const bot = reviewBot(ctx, latest, fallbackBot);
   if (bot) {
     await bot.replyCard(
-      changed.messageId,
-      buildSpecReviewCard(ctx.specs.get(changed.id) ?? changed),
-      changed.topicId !== changed.messageId,
+      latest.messageId,
+      buildSpecReviewCard(latest),
+      latest.topicId !== latest.messageId,
     ).catch((error) => {
-      console.error(`[产品评审] 回传 Spec ${changed.id} 卡片失败:`, (error as Error).message);
+      console.error(`[产品评审] 回传 Spec ${latest.id} 卡片失败:`, (error as Error).message);
       return undefined;
     });
   }
-  return ctx.specs.get(changed.id) ?? changed;
+  return latest;
 }
 
 /** 已确认 Spec 首次创建云文档；修订后覆盖原文档，链接保持不变。 */
@@ -124,34 +177,41 @@ async function publishSpecToDocUnlocked(ctx: AppContext, specId: string): Promis
   }
 }
 
-function runSerialSpecOperation<T>(specId: string, operation: () => Promise<T>): Promise<T> {
-  const previous = specOperationTails.get(specId) ?? Promise.resolve();
-  const run = previous.then(operation, operation);
-  const tail = run.then(() => undefined, () => undefined);
-  specOperationTails.set(specId, tail);
-  void tail.then(() => {
-    if (specOperationTails.get(specId) === tail) specOperationTails.delete(specId);
-  });
-  return run;
+/** 评审通过前同步检查远端评论；与“要求修改”共用同一把 Spec 锁。 */
+export async function approveSpecReview(ctx: AppContext, specId: string): Promise<ProductSpec> {
+  return runSerialSpecOperation(specId, () => approveSpecReviewUnlocked(ctx, specId));
 }
 
-/** 校验工作流后落产品评审结果；续跑失败时恢复为可重试的评审中状态。 */
-export async function approveSpecReview(ctx: AppContext, specId: string): Promise<ProductSpec> {
+async function approveSpecReviewUnlocked(ctx: AppContext, specId: string): Promise<ProductSpec> {
   const spec = ctx.specs.get(specId);
   if (!spec) throw new Error('Spec 不存在或已被删除。');
   if (spec.status !== 'in_review') throw new Error(`当前 Spec 状态为 ${spec.status}，无法通过评审。`);
   if (!spec.workflowId) throw new Error(`Spec ${spec.id} 没有关联交付工作流。`);
+  if (!spec.docId) throw new Error('Spec 尚未关联飞书云文档。');
   const workflow = ctx.workflows.get(spec.workflowId);
   if (!workflow || workflow.status !== 'awaiting_doc_review' || workflow.specId !== spec.id) {
     throw new Error('交付工作流不在产品评审节点，无法启动内部交付小队。');
   }
-  const approved = await ctx.specs.update(spec.id, { status: 'approved' });
+  if (spec.comments.some((comment) => !comment.resolved)) {
+    throw new Error('仍有未处理的评审意见，不能通过评审。');
+  }
+  const bot = reviewBot(ctx, spec);
+  if (!bot) throw new Error('产品经理 Bot 未连接，无法核对云文档评论。');
+  const remoteComments = (await bot.listDocumentComments(spec.docId))
+    .filter((comment) => !isInternalComment(comment, bot));
+  if (unseenReviewComments(spec, remoteComments).length > 0) {
+    await applyReviewCommentsUnlocked(ctx, spec.id, remoteComments, bot);
+    throw new Error('发现新的云文档评审意见，已交给产品经理处理，本次不能通过。');
+  }
+
+  const approved = await ctx.specs.updateIfStatus(spec.id, 'in_review', { status: 'approved' });
+  if (!approved) throw new Error(`当前 Spec 状态为 ${ctx.specs.get(spec.id)?.status ?? 'unknown'}，无法重复通过评审。`);
   try {
     await resumeWorkflowAfterProductReview(ctx, approved.id);
     return approved;
   } catch (error) {
     if (ctx.workflows.get(workflow.id)?.status === 'awaiting_doc_review') {
-      await ctx.specs.update(spec.id, { status: 'in_review' });
+      await ctx.specs.updateIfStatus(spec.id, 'approved', { status: 'in_review' });
     }
     throw error;
   }
@@ -164,25 +224,36 @@ export async function requestSpecChangesFromCard(
   authorOpenId: string,
   content: string,
 ): Promise<ProductSpec> {
-  const spec = ctx.specs.get(specId);
-  if (!spec) throw new Error('Spec 不存在或已被删除。');
-  if (spec.status !== 'in_review') throw new Error(`当前 Spec 状态为 ${spec.status}，无法处理评审。`);
-  if (!spec.docId) throw new Error('Spec 尚未关联飞书云文档，无法发起云文档评审。');
-  const bot = reviewBot(ctx, spec);
-  if (!bot) throw new Error('产品经理 Bot 未连接，无法处理评审意见。');
-  const documentCommentId = await bot.createDocumentComment(
-    spec.docId,
-    `${CARD_REVIEW_COMMENT_PREFIX} ${content}`,
-  );
-  if (!documentCommentId) throw new Error('飞书没有返回评论 ID，评审意见尚未进入处理流程，请重试。');
-  const comment: DocumentComment = {
-    id: documentCommentId,
-    commentId: documentCommentId,
-    authorOpenId,
-    content,
-    resolved: false,
-  };
-  return applyReviewComments(ctx, spec, [comment], bot);
+  return runSerialSpecOperation(specId, async () => {
+    const normalized = content.trim();
+    if (!normalized) throw new Error('请先填写修改意见。');
+    if (normalized.length > MAX_CARD_REVIEW_LENGTH) throw new Error('修改意见不能超过 4000 字。');
+    if (!authorOpenId.trim()) throw new Error('评审人身份缺失。');
+    const spec = ctx.specs.get(specId);
+    if (!spec) throw new Error('Spec 不存在或已被删除。');
+    if (spec.status !== 'in_review') throw new Error(`当前 Spec 状态为 ${spec.status}，无法处理评审。`);
+    if (!spec.docId) throw new Error('Spec 尚未关联飞书云文档，无法发起云文档评审。');
+    if (!spec.workflowId) throw new Error(`Spec ${spec.id} 没有关联交付工作流。`);
+    const workflow = ctx.workflows.get(spec.workflowId);
+    if (!workflow || workflow.status !== 'awaiting_doc_review' || workflow.specId !== spec.id) {
+      throw new Error('交付工作流不在产品评审节点，无法处理评审意见。');
+    }
+    const bot = reviewBot(ctx, spec);
+    if (!bot) throw new Error('产品经理 Bot 未连接，无法处理评审意见。');
+    const documentCommentId = await bot.createDocumentComment(
+      spec.docId,
+      `${CARD_REVIEW_COMMENT_PREFIX} ${normalized}`,
+    );
+    if (!documentCommentId?.trim()) throw new Error('飞书没有返回评论 ID，评审意见尚未进入处理流程，请重试。');
+    const comment: DocumentComment = {
+      id: documentCommentId,
+      commentId: documentCommentId,
+      authorOpenId,
+      content: normalized,
+      resolved: false,
+    };
+    return applyReviewCommentsUnlocked(ctx, spec.id, [comment], bot);
+  });
 }
 
 /** 实时接收飞书云文档评论事件。 */
@@ -196,21 +267,68 @@ export async function handleDocumentComment(
   const bot = reviewBot(ctx, spec, sourceBot) ?? sourceBot;
   const comment = await bot.getDocumentComment(event.documentId, event.commentId, event.replyId);
   if (!comment || isInternalComment(comment, bot)) return;
-  await applyReviewComments(ctx, spec, [comment], bot);
+  await applyReviewComments(ctx, spec.id, [comment], bot);
 }
 
-/** 轮询用于补偿服务离线期间或飞书事件配置遗漏的评论。 */
+async function syncResolvedDocumentComments(ctx: AppContext, specId: string): Promise<void> {
+  const spec = ctx.specs.get(specId);
+  if (!spec?.docId) return;
+  const bot = reviewBot(ctx, spec);
+  if (!bot) return;
+  const groups = new Map<string, string[]>();
+  for (const comment of spec.comments) {
+    if (!comment.resolved || !comment.docCommentId || comment.documentResolvedAt) continue;
+    const documentCommentId = comment.docCommentId.split(':', 1)[0];
+    groups.set(documentCommentId, [...(groups.get(documentCommentId) ?? []), comment.id]);
+  }
+  for (const [documentCommentId, localCommentIds] of groups) {
+    try {
+      await bot.resolveDocumentComment(spec.docId, documentCommentId);
+      await ctx.specs.markDocumentCommentsResolved(spec.id, new Set(localCommentIds));
+    } catch (error) {
+      console.error(
+        `[产品评审] 同步解决 Spec ${spec.id} 评论 ${documentCommentId} 失败:`,
+        (error as Error).message,
+      );
+    }
+  }
+}
+
+async function resumePendingReviewRevision(ctx: AppContext, specId: string): Promise<void> {
+  const spec = ctx.specs.get(specId);
+  if (!spec || spec.status !== 'changes_requested') return;
+  const comments = spec.comments.filter((comment) => !comment.resolved);
+  if (comments.length === 0) return;
+  await resumeWorkflowForSpecRevision(
+    ctx,
+    spec.id,
+    comments.map((comment) => `- ${comment.content.slice(0, MAX_REVIEW_FEEDBACK_ITEM_LENGTH)}`).join('\n'),
+    comments.map((comment) => comment.id),
+  );
+}
+
+/** 轮询用于补偿服务离线期间、事件漏收和评论解决失败。 */
 export async function runSpecReviewSync(ctx: AppContext): Promise<void> {
   if (ctx.shuttingDown || ctx.specReviewRunning) return;
   ctx.specReviewRunning = true;
   try {
+    for (const spec of ctx.specs.listPendingDocumentResolution()) {
+      await runSerialSpecOperation(spec.id, () => syncResolvedDocumentComments(ctx, spec.id));
+    }
+    for (const spec of ctx.specs.listPendingReviewRevision()) {
+      try {
+        await runSerialSpecOperation(spec.id, () => resumePendingReviewRevision(ctx, spec.id));
+      } catch (error) {
+        console.error(`[产品评审] 恢复 Spec ${spec.id} 修订流程失败:`, (error as Error).message);
+      }
+    }
     for (const spec of ctx.specs.listInReview()) {
       const bot = reviewBot(ctx, spec);
       if (!bot || !spec.docId) continue;
       try {
         const comments = (await bot.listDocumentComments(spec.docId))
           .filter((comment) => !isInternalComment(comment, bot));
-        await applyReviewComments(ctx, spec, comments, bot);
+        await applyReviewComments(ctx, spec.id, comments, bot);
       } catch (error) {
         console.error(`[产品评审] 同步 Spec ${spec.id} 评论失败:`, (error as Error).message);
       }
@@ -218,6 +336,17 @@ export async function runSpecReviewSync(ctx: AppContext): Promise<void> {
   } finally {
     ctx.specReviewRunning = false;
   }
+}
+
+function runSerialSpecOperation<T>(specId: string, operation: () => Promise<T>): Promise<T> {
+  const previous = specOperationTails.get(specId) ?? Promise.resolve();
+  const run = previous.then(operation, operation);
+  const tail = run.then(() => undefined, () => undefined);
+  specOperationTails.set(specId, tail);
+  void tail.then(() => {
+    if (specOperationTails.get(specId) === tail) specOperationTails.delete(specId);
+  });
+  return run;
 }
 
 export function startSpecReviewSync(ctx: AppContext): void {
