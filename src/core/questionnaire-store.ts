@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { z } from 'zod';
 
@@ -176,8 +176,13 @@ export class JsonQuestionnaireStore {
     await mkdir(this.directory, { recursive: true });
     const destination = join(this.directory, `${questionnaire.id}.json`);
     const temp = `${destination}.${process.pid}.${randomUUID()}.tmp`;
-    await writeFile(temp, `${JSON.stringify(questionnaire, null, 2)}\n`, 'utf8');
-    await rename(temp, destination);
+    try {
+      await writeFile(temp, `${JSON.stringify(questionnaire, null, 2)}\n`, 'utf8');
+      await rename(temp, destination);
+    } catch (error) {
+      await unlink(temp).catch(() => undefined);
+      throw error;
+    }
   }
 
   private enqueueMutation<T>(operation: () => Promise<T>): Promise<T> {

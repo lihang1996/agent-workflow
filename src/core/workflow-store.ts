@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { z } from 'zod';
 import { DELIVERY_SQUAD_STEPS } from './pipeline.js';
@@ -296,8 +296,13 @@ export class JsonWorkflowStore {
     const payload = JSON.stringify([...this.workflows.values()], null, 2);
     await mkdir(dirname(this.filePath), { recursive: true });
     const temp = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
-    await writeFile(temp, `${payload}\n`, 'utf8');
-    await rename(temp, this.filePath);
+    try {
+      await writeFile(temp, `${payload}\n`, 'utf8');
+      await rename(temp, this.filePath);
+    } catch (error) {
+      await unlink(temp).catch(() => undefined);
+      throw error;
+    }
   }
 
   private enqueueMutation<T>(operation: () => Promise<T>): Promise<T> {

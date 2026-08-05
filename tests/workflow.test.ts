@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -279,6 +279,56 @@ test('工作流与 Spec 落盘失败时回滚内存状态', async () => {
     }));
     assert.equal(workflows.list().length, 0);
     assert.equal(specs.listByTopic('oc', 'omt').length, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('工作流、Spec 与问卷落盘失败后清理临时文件', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-core-store-temp-cleanup-'));
+  try {
+    const workflowPath = join(root, 'workflows.json');
+    const specPath = join(root, 'specs.json');
+    const questionnaireDir = join(root, 'questionnaires');
+    const questionnaireId = '6b4ca8b5-b1f3-48e4-839f-9007ce250aa1';
+    await Promise.all([
+      mkdir(workflowPath),
+      mkdir(specPath),
+      mkdir(join(questionnaireDir, `${questionnaireId}.json`), { recursive: true }),
+    ]);
+
+    await assert.rejects(() => new JsonWorkflowStore(workflowPath).create({
+      kind: 'team',
+      name: '临时文件清理',
+      initiatorBotId: 'ceo',
+      goal: '验证工作流临时文件清理',
+      stepIds: ['pm'],
+      message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: '', senderOpenId: 'ou' },
+    }));
+    await assert.rejects(() => new JsonSpecStore(specPath).create({
+      title: '临时文件清理',
+      content: '验证 Spec 临时文件清理',
+      chatId: 'oc',
+      topicId: 'omt',
+      messageId: 'om',
+      ownerOpenId: 'ou',
+      botId: 'pm',
+    }));
+    const now = new Date().toISOString();
+    await assert.rejects(() => new JsonQuestionnaireStore(questionnaireDir).save({
+      id: questionnaireId,
+      title: '临时文件清理',
+      questions: [{ id: 'scope', prompt: '范围？', kind: 'text' }],
+      status: 'awaiting_answers',
+      createdAt: now,
+      updatedAt: now,
+    }));
+
+    const remaining = [
+      ...await readdir(root),
+      ...await readdir(questionnaireDir),
+    ];
+    assert.deepEqual(remaining.filter((name) => name.endsWith('.tmp')), []);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
