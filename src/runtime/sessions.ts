@@ -6,7 +6,7 @@ import type { AppContext } from './app-context.js';
 
 /** 话题 ID：thread > root > message。 */
 export function topicIdOf(msg: IncomingMessage): string {
-  return msg.threadId || msg.rootId || msg.messageId;
+  return msg.topicId?.trim() || msg.threadId || msg.rootId || msg.messageId;
 }
 
 /** 按优先级解析本次任务工作目录。 */
@@ -77,6 +77,7 @@ export async function ensureRunnableSession(
 ): Promise<Session | undefined> {
   const { session } = await ctx.sessions.resolve({
     messageId: msg.messageId,
+    topicId: topicIdOf(msg),
     chatId: msg.chatId,
     threadId: msg.threadId,
     rootId: msg.rootId,

@@ -7,7 +7,7 @@ import type { AppContext } from './app-context.js';
 import { startCliTask } from './cli-task.js';
 import { runDeliverySquad, runTeamPipeline } from './pipeline-runner.js';
 import { runCollabReview } from './collab-runner.js';
-import { ensureRunnableSession } from './sessions.js';
+import { ensureRunnableSession, topicIdOf } from './sessions.js';
 import { finishApprovalExecution, updateApprovalCard } from './approval-status.js';
 
 export async function requestHighRiskApproval(
@@ -33,6 +33,7 @@ export async function requestHighRiskApproval(
     scheduleRunCount: options.scheduleRunCount,
     message: {
       messageId: options.msg.messageId,
+      topicId: topicIdOf(options.msg),
       chatId: options.msg.chatId,
       chatType: options.msg.chatType,
       rootId: options.msg.rootId,
@@ -102,8 +103,16 @@ export async function executeApprovedAction(
 async function runApprovedAction(ctx: AppContext, approval: ApprovalRequest): Promise<void> {
   const bot = ctx.botsById.get(approval.botId);
   if (!bot) throw new Error(`执行 Bot 未连接：${approval.botId}`);
+  const scheduledMessage = approval.scheduleJobId
+    ? ctx.schedules.get(approval.scheduleJobId)?.message
+    : undefined;
   const msg: IncomingMessage = {
     messageId: approval.message.messageId,
+    topicId: approval.message.topicId
+      || scheduledMessage?.topicId
+      || scheduledMessage?.threadId
+      || scheduledMessage?.rootId
+      || scheduledMessage?.messageId,
     chatId: approval.message.chatId,
     chatType: approval.message.chatType,
     messageType: 'text',

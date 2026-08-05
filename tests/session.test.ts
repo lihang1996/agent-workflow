@@ -9,6 +9,8 @@ import { JsonSessionStore, type SessionStore } from '../src/core/session-store.j
 import { JsonTopicStore } from '../src/core/topic-store.js';
 import type { AppContext } from '../src/runtime/app-context.js';
 import { persistActiveRuns, reconcileOrphanedCards } from '../src/runtime/active-runs.js';
+import { ensureRunnableSession } from '../src/runtime/sessions.js';
+import type { Bot, IncomingMessage } from '../src/im/lark.js';
 
 function closedSession(): Session {
   return {
@@ -84,6 +86,24 @@ test('并发会话变更不会把失败状态带入后一份快照', async () =>
   const persisted = saves.at(-1);
   assert.equal(persisted?.find((session) => session.id === first.id)?.status, 'creating');
   assert.equal(persisted?.find((session) => session.id === second.id)?.status, 'active');
+});
+
+test('内部触发消息沿用原话题会话而不是触发消息 ID', async () => {
+  const sessions = new SessionManager({ createId: () => 'stable-session' });
+  const ctx = { sessions } as unknown as AppContext;
+  const bot = { id: 'dev' } as Bot;
+  const base = {
+    topicId: 'om-original-topic', chatId: 'oc', chatType: 'p2p', messageType: 'text', text: '',
+    rootId: '', threadId: '', senderOpenId: 'ou', senderType: 'user', mentions: [], rawContent: '{}',
+  };
+  const first = await ensureRunnableSession(ctx, bot, {
+    ...base, messageId: 'om-schedule-kickoff-1',
+  } satisfies IncomingMessage);
+  const second = await ensureRunnableSession(ctx, bot, {
+    ...base, messageId: 'om-schedule-kickoff-2',
+  } satisfies IncomingMessage);
+  assert.equal(first?.threadId, 'om-original-topic');
+  assert.equal(second?.id, first?.id);
 });
 
 test('损坏会话记录会明确报错且不会被静默覆盖', async () => {

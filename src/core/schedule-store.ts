@@ -12,6 +12,7 @@ export type ScheduleRunOutcome = Exclude<ScheduleRunStatus, 'idle' | 'running'>;
 
 const StoredMessageSchema = z.object({
   messageId: z.string().trim().min(1).max(200),
+  topicId: z.string().trim().min(1).max(200).optional(),
   chatId: z.string().trim().min(1).max(200),
   chatType: z.string().max(50),
   rootId: z.string().max(200),
@@ -91,7 +92,7 @@ export class JsonScheduleStore {
 
   listByTopic(chatId: string, topicId: string): ScheduledJob[] {
     return [...this.jobs.values()]
-      .filter((job) => job.message.chatId === chatId && (job.message.threadId || job.message.rootId || job.message.messageId) === topicId)
+      .filter((job) => job.message.chatId === chatId && messageTopicId(job.message) === topicId)
       .sort((a, b) => a.nextRunAt.localeCompare(b.nextRunAt));
   }
 
@@ -336,4 +337,8 @@ export class JsonScheduleStore {
     this.mutationQueue = run.then(() => undefined, () => undefined);
     return run;
   }
+}
+
+function messageTopicId(message: StoredMessage): string {
+  return message.topicId || message.threadId || message.rootId || message.messageId;
 }

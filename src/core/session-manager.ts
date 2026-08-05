@@ -18,6 +18,7 @@ export interface Session {
 
 export interface MessageAddress {
   messageId: string;
+  topicId?: string;
   chatId: string;
   threadId: string;
   rootId: string;
@@ -45,7 +46,7 @@ const ALLOWED_TRANSITIONS: Record<SessionStatus, SessionStatus[]> = {
 
 /** 话题 ID：优先 thread，其次 root，最后消息本身。 */
 function topicIdOf(message: MessageAddress): string {
-  return message.threadId || message.rootId || message.messageId;
+  return message.topicId?.trim() || message.threadId || message.rootId || message.messageId;
 }
 
 /** 会话索引键：同一话题下按 bot 隔离。 */

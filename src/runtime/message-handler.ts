@@ -69,6 +69,7 @@ export async function handleMessage(
   const hasThread = !!msg.threadId || !!msg.rootId;
   const { session, isNew } = await ctx.sessions.resolve({
     messageId: msg.messageId,
+    topicId: topicIdOf(msg),
     chatId: msg.chatId,
     threadId: msg.threadId,
     rootId: msg.rootId,
@@ -545,6 +546,7 @@ export async function handleMessage(
         intervalMs,
         message: {
           messageId: msg.messageId,
+          topicId,
           chatId: msg.chatId,
           chatType: msg.chatType,
           rootId: msg.rootId,

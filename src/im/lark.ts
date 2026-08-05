@@ -18,6 +18,8 @@ export { extractMessageText } from './message-parser.js';
 
 export interface IncomingMessage {
   messageId: string;
+  /** 定时任务/审批/工作流内部续接时使用的稳定原话题 ID；真实飞书事件通常无需设置。 */
+  topicId?: string;
   chatId: string;
   chatType: string;
   messageType: string;

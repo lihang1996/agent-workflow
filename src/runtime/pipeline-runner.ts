@@ -144,7 +144,7 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
   if (ctx.shuttingDown) return;
   const workflow = await ctx.workflows.claimReady(workflowId);
   if (!workflow) return;
-  const msg = messageForWorkflow(workflow);
+  const msg = messageForWorkflow(ctx, workflow);
   const initiator = ctx.botsById.get(workflow.initiatorBotId);
   try {
     if (!initiator) throw new Error(`发起 Bot 未连接：${workflow.initiatorBotId}`);
@@ -243,7 +243,7 @@ async function completeProductStep(
 ): Promise<void> {
   let workflow = requireWorkflow(ctx, workflowId);
   if (!isCurrentExecutingStep(workflow, stepIndex, 'pm')) return;
-  const msg = messageForWorkflow(workflow);
+  const msg = messageForWorkflow(ctx, workflow);
   const initiator = ctx.botsById.get(workflow.initiatorBotId) ?? actor;
   const questionnaire = await ctx.questionnaires.latestAwaitingForWorkflow(workflow.id);
   workflow = requireWorkflow(ctx, workflowId);
@@ -616,7 +616,7 @@ async function failWorkflow(
   if (!failed) return;
   const initiator = ctx.botsById.get(failed.initiatorBotId);
   if (initiator) {
-    const msg = messageForWorkflow(failed);
+    const msg = messageForWorkflow(ctx, failed);
     await initiator.reply(msg.messageId, `${failed.name}已停止：${normalizedError}`, hasThread(msg)).catch(() => undefined);
   }
   await settleWorkflowApproval(ctx, failed, 'failed', normalizedError);
@@ -690,6 +690,7 @@ function stepsFor(workflow: DeliveryWorkflow): PipelineStep[] {
 function storedMessage(msg: IncomingMessage): DeliveryWorkflow['message'] {
   return {
     messageId: msg.messageId,
+    topicId: topicIdOf(msg),
     chatId: msg.chatId,
     chatType: msg.chatType,
     rootId: msg.rootId,
@@ -698,9 +699,17 @@ function storedMessage(msg: IncomingMessage): DeliveryWorkflow['message'] {
   };
 }
 
-function messageForWorkflow(workflow: DeliveryWorkflow): IncomingMessage {
+function messageForWorkflow(ctx: AppContext, workflow: DeliveryWorkflow): IncomingMessage {
+  const scheduledMessage = workflow.scheduleJobId
+    ? ctx.schedules.get(workflow.scheduleJobId)?.message
+    : undefined;
   return {
     ...workflow.message,
+    topicId: workflow.message.topicId
+      || scheduledMessage?.topicId
+      || scheduledMessage?.threadId
+      || scheduledMessage?.rootId
+      || scheduledMessage?.messageId,
     messageType: 'text',
     text: '',
     senderType: 'user',

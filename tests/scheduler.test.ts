@@ -57,6 +57,26 @@ test('定时任务创建幂等且并发只认领一个运行轮次', async () =>
   }
 });
 
+test('私聊定时任务持久化原话题标识', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-schedule-topic-'));
+  const path = join(root, 'schedules.json');
+  try {
+    const store = await JsonScheduleStore.open(path);
+    const created = await store.create({
+      botId: 'dev', ownerOpenId: 'ou_owner', kind: 'task', prompt: '检查项目', intervalMs: 60_000,
+      message: {
+        messageId: 'om-original-topic', topicId: 'om-original-topic', chatId: 'oc_chat',
+        chatType: 'p2p', rootId: '', threadId: '', senderOpenId: 'ou_owner',
+      },
+    });
+    const reopened = await JsonScheduleStore.open(path);
+    assert.equal(reopened.get(created.id)?.message.topicId, 'om-original-topic');
+    assert.equal(reopened.listByTopic('oc_chat', 'om-original-topic').length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('定时任务忽略旧轮次结果且执行中不能删除', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agent-os-schedule-stale-result-'));
   try {

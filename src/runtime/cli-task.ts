@@ -22,7 +22,7 @@ import {
   flushPersistActiveRuns,
   schedulePersistActiveRuns,
 } from './active-runs.js';
-import { markSessionIdle, truncate, workdirFor } from './sessions.js';
+import { markSessionIdle, topicIdOf, truncate, workdirFor } from './sessions.js';
 
 /** 发卡 + 跑 CLI + 流式更新；支持完成后回调。 */
 export async function startCliTask(
@@ -286,7 +286,7 @@ export async function startCliTask(
     approvedScope: executionPolicy === 'approved' ? (approvedScope ?? options.prompt) : undefined,
     env: {
       AGENT_OS_CHAT_ID: msg.chatId,
-      AGENT_OS_TOPIC_ID: msg.threadId || msg.rootId || msg.messageId,
+      AGENT_OS_TOPIC_ID: topicIdOf(msg),
       AGENT_OS_OWNER_OPEN_ID: msg.senderOpenId,
       AGENT_OS_BOT_ID: bot.id,
       AGENT_OS_MESSAGE_ID: msg.messageId,

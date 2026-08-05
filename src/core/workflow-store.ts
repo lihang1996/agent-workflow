@@ -6,6 +6,7 @@ import { DELIVERY_SQUAD_STEPS } from './pipeline.js';
 
 const WorkflowMessageSchema = z.object({
   messageId: z.string().trim().min(1).max(200),
+  topicId: z.string().trim().min(1).max(200).optional(),
   chatId: z.string().trim().min(1).max(200),
   chatType: z.string().max(50),
   rootId: z.string().max(200),

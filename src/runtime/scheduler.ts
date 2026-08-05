@@ -140,6 +140,10 @@ async function runJob(ctx: AppContext, job: ScheduledJob): Promise<ScheduleExecu
   if (!kickoffId) throw new Error('飞书未返回定时任务启动消息 ID');
   const msg: IncomingMessage = {
     messageId: kickoffId,
+    topicId: job.message.topicId
+      || job.message.threadId
+      || job.message.rootId
+      || job.message.messageId,
     chatId: job.message.chatId,
     chatType: job.message.chatType,
     messageType: 'text',
