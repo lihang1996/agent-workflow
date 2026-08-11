@@ -1,6 +1,10 @@
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { AGENT_OS_ROOT, tsxLoaderPath } from '../mcp/config.js';
+import {
+  AGENT_OS_ROOT,
+  BUNDLED_ASK_MCP_PERMISSION_RULES,
+  tsxLoaderPath,
+} from '../mcp/config.js';
 
 let cachedClaudeSettingsPath: string | undefined;
 let cachedClaudeSettingsBody: string | undefined;
@@ -20,6 +24,7 @@ const STANDARD_ALLOWED_TOOLS = [
   'TaskList',
   'TaskGet',
   'NotebookEdit',
+  ...BUNDLED_ASK_MCP_PERMISSION_RULES,
   'Bash(pnpm *)',
   'Bash(npm *)',
   'Bash(npx *)',

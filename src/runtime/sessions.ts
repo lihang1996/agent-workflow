@@ -75,14 +75,16 @@ export async function ensureRunnableSession(
   bot: Bot,
   msg: IncomingMessage,
 ): Promise<Session | undefined> {
+  const topicId = topicIdOf(msg);
+  const preferredCliId = ctx.topics?.getCliId?.(msg.chatId, topicId);
   const { session } = await ctx.sessions.resolve({
     messageId: msg.messageId,
-    topicId: topicIdOf(msg),
+    topicId,
     chatId: msg.chatId,
     threadId: msg.threadId,
     rootId: msg.rootId,
     botId: bot.id,
-  });
+  }, preferredCliId);
   if (session.status === 'closed') {
     return ctx.sessions.reopen(session.id);
   }

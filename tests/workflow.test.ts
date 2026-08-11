@@ -12,6 +12,8 @@ import {
 import { JsonQuestionnaireStore, questionnaireMatchesContext } from '../src/core/questionnaire-store.js';
 import { JsonApprovalStore } from '../src/core/approval-store.js';
 import { JsonSpecStore } from '../src/core/spec-store.js';
+import { SessionManager } from '../src/core/session-manager.js';
+import { JsonTopicStore } from '../src/core/topic-store.js';
 import { assertManualWorkflowRetryAllowed, JsonWorkflowStore } from '../src/core/workflow-store.js';
 import { CreatedDocumentWriteError, normalizeDocumentMarkdown, partitionConvertedBlocks } from '../src/im/lark.js';
 import {
@@ -23,7 +25,9 @@ import {
 import {
   confirmSpecForReview,
   confirmSpecAndStartDelivery,
+  completeProductStep,
   ensureCanonicalSpecSnapshotFile,
+  reconcileWorkflowTopicCliIds,
   reconcileWorkflowSpecStates,
   rejectSpecConfirmation,
   runDeliverySquad,
@@ -216,6 +220,51 @@ test('交付工作流状态可在重启后恢复', async () => {
     assert.equal(reopened.get(workflow.id)?.nextStepIndex, 1);
     assert.equal(reopened.get(workflow.id)?.executionPolicy, 'approved');
     assert.equal(reopened.get(workflow.id)?.approvalAttempt, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('升级前 CEO 已选 Codex 的等待中工作流会迁移为话题统一引擎', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-workflow-topic-engine-migration-'));
+  try {
+    const workflows = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const topics = await JsonTopicStore.open(join(root, 'topics.json'));
+    const sessions = new SessionManager({
+      createId: (() => {
+        let value = 0;
+        return () => `migration-session-${++value}`;
+      })(),
+      defaultCliId: 'claude',
+    });
+    const address = (botId: string) => ({
+      messageId: `om-${botId}`, chatId: 'oc', threadId: 'omt', rootId: '', botId,
+    });
+    const ceo = (await sessions.resolve(address('ceo'))).session;
+    await sessions.transition(ceo.id, 'idle');
+    await sessions.setCliId(ceo.id, 'codex');
+    const pm = (await sessions.resolve(address('pm'))).session;
+    await sessions.transition(pm.id, 'idle');
+    await sessions.setCliSessionId(pm.id, 'old-claude-context');
+    const workflow = await workflows.create({
+      kind: 'team', name: '团队交付流水线', initiatorBotId: 'ceo', goal: '修复问题', stepIds: ['pm'],
+      message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt', senderOpenId: 'ou' },
+    });
+    await workflows.update(workflow.id, { status: 'awaiting_questions' });
+    const ctx = {
+      workflows,
+      topics,
+      sessions,
+      defaultCliId: 'claude',
+      contextWindows: new Map([[pm.id, 200_000]]),
+    } as unknown as AppContext;
+
+    await reconcileWorkflowTopicCliIds(ctx);
+
+    assert.equal(topics.getCliId('oc', 'omt'), 'codex');
+    assert.equal(sessions.get(pm.id)?.cliId, 'codex');
+    assert.equal(sessions.get(pm.id)?.cliSessionId, undefined);
+    assert.equal(ctx.contextWindows.has(pm.id), false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -446,7 +495,7 @@ test('重启可修复已落盘工作流与审批之间的关联窗口', async ()
   }
 });
 
-test('问卷、Spec 确认和产品评审均使用飞书 form_submit', () => {
+test('问卷、Spec 退回和产品评审使用飞书 form_submit，Spec 确认不提交退回意见', () => {
   const questionnaire = {
     id: '6b4ca8b5-b1f3-48e4-839f-9007ce250aa1',
     title: '澄清',
@@ -461,7 +510,7 @@ test('问卷、Spec 确认和产品评审均使用飞书 form_submit', () => {
   const spec = {
     id: 'spec-1',
     title: '登录',
-    content: '内容',
+    content: '### RQ-001 登录\n内容',
     chatId: 'oc',
     topicId: 'omt',
     messageId: 'om',
@@ -488,9 +537,18 @@ test('问卷、Spec 确认和产品评审均使用飞书 form_submit', () => {
   const confirmationForm = confirmationCard.body.elements.find((item: any) => item.tag === 'form');
   assert.ok(confirmationForm);
   const confirmationButtons = confirmationForm.elements.filter((item: any) => item.tag === 'button');
-  assert.equal(confirmationButtons.every((item: any) => item.form_action_type === 'submit'), true);
+  assert.deepEqual(
+    confirmationButtons.map((item: any) => item.behaviors[0].value.action),
+    ['reject_spec'],
+  );
+  assert.equal(confirmationButtons[0].form_action_type, 'submit');
   assert.equal(confirmationButtons.every((item: any) =>
     item.behaviors[0].value.specVersion === spec.updatedAt), true);
+  const confirmButton = confirmationCard.body.elements.find((item: any) =>
+    item.tag === 'button' && item.behaviors[0].value.action === 'confirm_spec');
+  assert.ok(confirmButton);
+  assert.equal(confirmButton.form_action_type, undefined);
+  assert.equal(confirmationForm.elements.find((item: any) => item.name === 'confirmationFeedback').required, true);
   const reviewCard = buildSpecReviewCard({ ...spec, status: 'in_review', docId: 'doc', docUrl: 'https://feishu.cn/docx/doc' }) as any;
   const reviewForm = reviewCard.body.elements.find((item: any) => item.tag === 'form');
   assert.ok(reviewForm);
@@ -603,6 +661,54 @@ test('PM 在澄清完成后输出可执行 Spec，退回后输出修订版', () 
   });
   assert.match(revision, /产品经理修订/);
   assert.match(revision, /补充异常流程/);
+  assert.match(revision, /必须调用 MCP 工具 propose_questions/);
+});
+
+test('PM 未创建问卷时不能把内联澄清问题保存成待确认 Spec', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-pm-output-contract-'));
+  try {
+    const workflows = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const specs = await JsonSpecStore.open(join(root, 'specs.json'));
+    const questionnaires = await JsonQuestionnaireStore.open(join(root, 'questionnaires'));
+    const workflow = await workflows.create({
+      kind: 'team', name: '团队交付流水线', initiatorBotId: 'ceo', goal: '修复登录', stepIds: ['pm'],
+      message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt', senderOpenId: 'ou' },
+    });
+    await workflows.update(workflow.id, { status: 'executing' });
+    const cards: unknown[] = [];
+    const replies: string[] = [];
+    const pm = {
+      id: 'pm',
+      replyCard: async (_messageId: string, card: unknown) => { cards.push(card); return 'om-card'; },
+    } as any;
+    const ceo = {
+      id: 'ceo',
+      reply: async (_messageId: string, content: string) => { replies.push(content); return 'om-reply'; },
+    } as any;
+    const ctx = {
+      workflows,
+      specs,
+      questionnaires,
+      botsById: new Map([['pm', pm], ['ceo', ceo]]),
+    } as unknown as AppContext;
+
+    await assert.rejects(
+      () => completeProductStep(ctx, workflow.id, 0, pm, '## 需要确认\n1. 登录方式是什么？'),
+      /本次输出不会保存或显示确认卡/,
+    );
+    assert.equal(specs.findByWorkflowId(workflow.id), undefined);
+    assert.equal(workflows.get(workflow.id)?.status, 'executing');
+    assert.equal(cards.length, 0);
+    assert.equal(replies.length, 0);
+
+    await completeProductStep(ctx, workflow.id, 0, pm, '### RQ-001 登录\n- [ ] 可以成功登录');
+    assert.equal(specs.findByWorkflowId(workflow.id)?.status, 'pending_confirmation');
+    assert.equal(workflows.get(workflow.id)?.status, 'awaiting_spec_confirmation');
+    assert.equal(cards.length, 1);
+    assert.match(replies[0] ?? '', /产品 Spec 已生成/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('工作流支持在云文档评审节点暂停', async () => {
@@ -835,6 +941,35 @@ test('重启会补齐已批准 Spec 的 canonical 切换并直接恢复技术交
     assert.equal(specs.get(spec.id)?.canonical, true);
     assert.equal(workflows.get(workflow.id)?.status, 'ready');
     assert.equal(workflows.get(workflow.id)?.priorOutputs.pm, '### RQ-001 登录\n验收：成功进入首页');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('重启会把历史无效待确认 Spec 自动退回 PM，而不是继续展示可确认状态', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-invalid-pending-spec-reconcile-'));
+  try {
+    const workflows = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const specs = await JsonSpecStore.open(join(root, 'specs.json'));
+    const workflow = await workflows.create({
+      kind: 'team', name: '团队交付流水线', initiatorBotId: 'ceo', goal: '登录', stepIds: ['pm'],
+      message: { messageId: 'om-invalid-pending', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt', senderOpenId: 'ou' },
+    });
+    const spec = await specs.create({
+      title: '登录', content: '## 需要确认\n1. 登录方式是什么？', chatId: 'oc', topicId: 'omt',
+      messageId: 'om-invalid-pending', ownerOpenId: 'ou', botId: 'pm', workflowId: workflow.id,
+    });
+    await workflows.update(workflow.id, {
+      status: 'awaiting_spec_confirmation', nextStepIndex: 1, specId: spec.id,
+    });
+
+    await reconcileWorkflowSpecStates({ workflows, specs } as AppContext);
+
+    assert.equal(specs.get(spec.id)?.status, 'changes_requested');
+    assert.match(specs.get(spec.id)?.confirmationFeedback ?? '', /系统自动退回/);
+    assert.equal(workflows.get(workflow.id)?.status, 'ready');
+    assert.equal(workflows.get(workflow.id)?.nextStepIndex, 0);
+    assert.match(workflows.get(workflow.id)?.priorOutputs.confirmation_feedback ?? '', /propose_questions/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

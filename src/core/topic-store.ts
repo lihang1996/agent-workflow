@@ -2,25 +2,32 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { z } from 'zod';
+import type { CliId } from '../cli/types.js';
 
-export interface TopicProject {
+export interface TopicSettings {
   chatId: string;
   threadId: string;
-  workdir: string;
+  workdir?: string;
+  cliId?: CliId;
   updatedAt: string;
 }
 
 export interface TopicStore {
   getWorkdir(chatId: string, threadId: string): string | undefined;
-  setWorkdir(chatId: string, threadId: string, workdir: string): Promise<TopicProject>;
+  setWorkdir(chatId: string, threadId: string, workdir: string): Promise<TopicSettings>;
   clearWorkdir(chatId: string, threadId: string): Promise<void>;
+  getCliId(chatId: string, threadId: string): CliId | undefined;
+  setCliId(chatId: string, threadId: string, cliId: CliId): Promise<TopicSettings>;
 }
 
 const TopicSchema = z.object({
   chatId: z.string().min(1),
   threadId: z.string().min(1),
-  workdir: z.string().min(1),
+  workdir: z.string().min(1).optional(),
+  cliId: z.enum(['claude', 'codex']).optional(),
   updatedAt: z.iso.datetime(),
+}).refine((topic) => !!topic.workdir || !!topic.cliId, {
+  message: '话题设置必须至少包含 workdir 或 cliId',
 });
 
 /** 话题唯一键。 */
@@ -28,14 +35,14 @@ function topicKey(chatId: string, threadId: string): string {
   return `${chatId}:${threadId}`;
 }
 
-/** 话题级项目目录：同一话题下所有 Bot 共享。 */
+/** 话题级共享设置：同一话题下所有 Bot 共用项目目录与执行引擎。 */
 export class JsonTopicStore implements TopicStore {
-  private readonly topics = new Map<string, TopicProject>();
+  private readonly topics = new Map<string, TopicSettings>();
   private mutationQueue: Promise<void> = Promise.resolve();
 
   constructor(private readonly filePath: string) {}
 
-  /** 打开并加载话题目录表。 */
+  /** 打开并加载话题设置表。 */
   static async open(filePath: string): Promise<JsonTopicStore> {
     const store = new JsonTopicStore(filePath);
     await store.load();
@@ -51,12 +58,18 @@ export class JsonTopicStore implements TopicStore {
     return this.topics.get(topicKey(chatId, threadId))?.workdir;
   }
 
+  /** 读取话题统一执行引擎。 */
+  getCliId(chatId: string, threadId: string): CliId | undefined {
+    return this.topics.get(topicKey(chatId, threadId))?.cliId;
+  }
+
   /** 设置话题工作目录并落盘。 */
-  async setWorkdir(chatId: string, threadId: string, workdir: string): Promise<TopicProject> {
+  async setWorkdir(chatId: string, threadId: string, workdir: string): Promise<TopicSettings> {
     return this.enqueueMutation(async () => {
       const key = topicKey(chatId, threadId);
       const previous = this.topics.get(key);
       const project = TopicSchema.parse({
+        ...previous,
         chatId,
         threadId,
         workdir,
@@ -76,17 +89,53 @@ export class JsonTopicStore implements TopicStore {
     });
   }
 
+  /** 设置话题统一执行引擎，并保留已经绑定的项目目录。 */
+  async setCliId(chatId: string, threadId: string, cliId: CliId): Promise<TopicSettings> {
+    return this.enqueueMutation(async () => {
+      const key = topicKey(chatId, threadId);
+      const previous = this.topics.get(key);
+      const settings = TopicSchema.parse({
+        ...previous,
+        chatId,
+        threadId,
+        cliId,
+        updatedAt: new Date().toISOString(),
+      });
+      this.topics.set(key, settings);
+      try {
+        await this.persist();
+      } catch (error) {
+        if (this.topics.get(key) === settings) {
+          if (previous) this.topics.set(key, previous);
+          else this.topics.delete(key);
+        }
+        throw error;
+      }
+      return settings;
+    });
+  }
+
   /** 清除话题工作目录。 */
   async clearWorkdir(chatId: string, threadId: string): Promise<void> {
     return this.enqueueMutation(async () => {
       const key = topicKey(chatId, threadId);
       const previous = this.topics.get(key);
-      if (!previous) return;
-      this.topics.delete(key);
+      if (!previous?.workdir) return;
+      const next = previous.cliId
+        ? TopicSchema.parse({
+          ...previous,
+          workdir: undefined,
+          updatedAt: new Date().toISOString(),
+        })
+        : undefined;
+      if (next) this.topics.set(key, next);
+      else this.topics.delete(key);
       try {
         await this.persist();
       } catch (error) {
-        if (!this.topics.has(key)) this.topics.set(key, previous);
+        if (next ? this.topics.get(key) === next : !this.topics.has(key)) {
+          this.topics.set(key, previous);
+        }
         throw error;
       }
     });
@@ -122,7 +171,7 @@ export class JsonTopicStore implements TopicStore {
       }
       const key = topicKey(result.data.chatId, result.data.threadId);
       if (this.topics.has(key)) {
-        throw new Error(`话题文件包含重复目录绑定: ${result.data.chatId}/${result.data.threadId}`);
+        throw new Error(`话题文件包含重复设置: ${result.data.chatId}/${result.data.threadId}`);
       }
       this.topics.set(key, result.data);
     }

@@ -199,6 +199,7 @@ export function buildPipelineStepPrompt(
           '负责人退回意见：',
           priorOutputs.confirmation_feedback,
           '',
+          '若上一版其实是未完成的澄清问题，或仍缺少会影响范围、安全取舍或验收的答案，必须调用 MCP 工具 propose_questions 创建结构化问卷，然后停止等待；不得把问题正文再次当作 Spec 输出。',
           '请根据意见重写完整、可执行的产品 Spec，只输出新版正文。',
           '每条可交付需求必须单独以稳定 ID 开头（例如 `### RQ-001 登录`），并保留未被修改需求的原 ID。',
           CANONICAL_WAIVER_SPEC_INSTRUCTION,

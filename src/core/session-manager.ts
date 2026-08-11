@@ -30,6 +30,14 @@ export interface ResolvedSession {
   isNew: boolean;
 }
 
+export interface TopicCliUpdate {
+  matched: number;
+  updated: number;
+  clearedContexts: number;
+  updatedSessionIds: string[];
+  deferredBotIds: string[];
+}
+
 export interface SessionManagerOptions {
   now?: () => Date;
   createId?: () => string;
@@ -96,12 +104,30 @@ export class SessionManager {
   }
 
   /** 解析或创建「话题 + Bot」对应的会话。 */
-  async resolve(message: MessageAddress): Promise<ResolvedSession> {
+  async resolve(message: MessageAddress, preferredCliId?: CliId): Promise<ResolvedSession> {
     return this.enqueueMutation(async () => {
       const threadId = topicIdOf(message);
       const key = sessionKey(message.chatId, threadId, message.botId);
       const existing = this.sessions.get(key);
-      if (existing) return { session: existing, isNew: false };
+      if (existing) {
+        if (!preferredCliId || existing.cliId === preferredCliId || existing.status === 'active') {
+          return { session: existing, isNew: false };
+        }
+        const updated: Session = {
+          ...existing,
+          cliId: preferredCliId,
+          cliSessionId: undefined,
+          updatedAt: this.now().toISOString(),
+        };
+        this.sessions.set(key, updated);
+        try {
+          await this.persist();
+        } catch (error) {
+          if (this.sessions.get(key) === updated) this.sessions.set(key, existing);
+          throw error;
+        }
+        return { session: updated, isNew: false };
+      }
 
       const now = this.now().toISOString();
       const session: Session = {
@@ -109,7 +135,7 @@ export class SessionManager {
         botId: message.botId,
         threadId,
         chatId: message.chatId,
-        cliId: this.defaultCliId,
+        cliId: preferredCliId ?? this.defaultCliId,
         status: 'creating',
         createdAt: now,
         updatedAt: now,
@@ -203,6 +229,56 @@ export class SessionManager {
         throw error;
       }
       return updated;
+    });
+  }
+
+  /**
+   * 将同一话题下已经存在的所有角色统一到目标引擎。
+   * 正在执行的旧引擎任务不会被中途篡改，结束后会在下次 resolve 时自动对齐。
+   */
+  async setCliIdForTopic(chatId: string, threadId: string, cliId: CliId): Promise<TopicCliUpdate> {
+    return this.enqueueMutation(async () => {
+      const changes: Array<{ key: string; previous: Session; next: Session }> = [];
+      const deferredBotIds: string[] = [];
+      let matched = 0;
+      let clearedContexts = 0;
+      for (const [key, session] of this.sessions) {
+        if (session.chatId !== chatId || session.threadId !== threadId) continue;
+        matched += 1;
+        if (session.cliId === cliId) continue;
+        if (session.status === 'active') {
+          deferredBotIds.push(session.botId);
+          continue;
+        }
+        if (session.cliSessionId) clearedContexts += 1;
+        const next: Session = {
+          ...session,
+          cliId,
+          cliSessionId: undefined,
+          updatedAt: this.now().toISOString(),
+        };
+        changes.push({ key, previous: session, next });
+        this.sessions.set(key, next);
+      }
+      if (changes.length > 0) {
+        try {
+          await this.persist();
+        } catch (error) {
+          for (const change of changes) {
+            if (this.sessions.get(change.key) === change.next) {
+              this.sessions.set(change.key, change.previous);
+            }
+          }
+          throw error;
+        }
+      }
+      return {
+        matched,
+        updated: changes.length,
+        clearedContexts,
+        updatedSessionIds: changes.map((change) => change.next.id),
+        deferredBotIds,
+      };
     });
   }
 

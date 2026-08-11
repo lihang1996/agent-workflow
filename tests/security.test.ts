@@ -426,6 +426,10 @@ test('CLI 按普通、只读和已审批任务使用不同权限边界', () => {
     assert.ok(settings.permissions?.allow?.includes('Write'));
     assert.ok(settings.permissions?.allow?.includes('Edit'));
     assert.ok(settings.permissions?.allow?.some((rule) => rule.startsWith('Bash(pnpm')));
+    assert.ok(settings.permissions?.allow?.includes('mcp__agent-os-ask__propose_questions'));
+    assert.ok(settings.permissions?.allow?.includes('mcp__agent-os-ask__get_questionnaire'));
+    assert.equal(settings.permissions?.allow?.includes('mcp__agent-os-ask__record_answers'), false);
+    assert.equal(settings.permissions?.allow?.some((rule) => rule === 'mcp__*'), false);
     const readClaude = claude.buildArgs('分析日志', { executionPolicy: 'read-only' });
     assert.equal(readClaude[readClaude.indexOf('--tools') + 1], 'Read,Glob,Grep');
     assert.equal(readClaude.includes('--strict-mcp-config'), true);

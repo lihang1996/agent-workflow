@@ -16,7 +16,7 @@ function spec(status: ProductSpec['status']): ProductSpec {
   return {
     id: 'spec-1',
     title: '登录',
-    content: '可执行 Spec',
+    content: '### RQ-001 登录\n可执行 Spec',
     chatId: 'oc',
     topicId: 'omt',
     messageId: 'om',
@@ -69,6 +69,18 @@ test('含风险接受条款的 Spec 只能进入完整云文档评审', () => {
   const confirmedSerialized = JSON.stringify(confirmed);
   assert.match(confirmedSerialized, /publish_spec/);
   assert.doesNotMatch(confirmedSerialized, /confirm_spec_start/);
+});
+
+test('缺少稳定需求 ID 的历史待确认卡不显示任何确认入口', () => {
+  const card = buildSpecConfirmationCard({
+    ...spec('pending_confirmation'),
+    content: '## 需要确认\n1. 登录方式是什么？',
+  });
+  const serialized = JSON.stringify(card);
+  assert.doesNotMatch(serialized, /confirm_spec/);
+  assert.doesNotMatch(serialized, /confirm_spec_start/);
+  assert.match(serialized, /reject_spec/);
+  assert.match(serialized, /不提供确认入口/);
 });
 
 test('云文档标题会去掉换行并截断到飞书上限', () => {

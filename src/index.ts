@@ -74,7 +74,7 @@ const schedules = await JsonScheduleStore.open(join('data', 'schedules.json'));
 const approvals = await JsonApprovalStore.open(join('data', 'approvals.json'));
 const workflows = await JsonWorkflowStore.open(join('data', 'workflows.json'));
 console.log(
-  `[会话] 已恢复 ${sessions.size} 个会话，${topics.size} 个话题项目目录，${collabStore.size} 个协作轮次`,
+  `[会话] 已恢复 ${sessions.size} 个会话，${topics.size} 个话题设置，${collabStore.size} 个协作轮次`,
 );
 
 const app = createApp({

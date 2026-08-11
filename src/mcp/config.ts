@@ -16,6 +16,16 @@ export interface McpConfigFile {
   mcpServers: Record<string, McpStdioServer>;
 }
 
+/**
+ * Claude Code 在 non-interactive `dontAsk` 模式下不会仅因 MCP server 已配置就自动授权工具。
+ * 只预授权创建/读取当前工作流问卷；答案必须经飞书卡片的人类操作写入，
+ * 不把 record_answers 交给模型，避免模型替用户完成澄清。
+ */
+export const BUNDLED_ASK_MCP_PERMISSION_RULES = [
+  'mcp__agent-os-ask__propose_questions',
+  'mcp__agent-os-ask__get_questionnaire',
+] as const;
+
 const here = dirname(fileURLToPath(import.meta.url));
 export const AGENT_OS_ROOT = resolve(here, '../..');
 
@@ -88,7 +98,7 @@ export function logMcpStatus(): void {
     return;
   }
   console.log(
-    `[MCP] 已启用 server=agent-os-ask tools=propose_questions,record_answers,get_questionnaire strict=${isMcpStrict()}`,
+    `[MCP] 已启用 server=agent-os-ask tools=propose_questions,record_answers,get_questionnaire preauthorized=propose_questions,get_questionnaire answers=feishu-card strict=${isMcpStrict()}`,
   );
 }
 

@@ -112,6 +112,73 @@ test('内部触发消息沿用原话题会话而不是触发消息 ID', async ()
   assert.equal(second?.id, first?.id);
 });
 
+test('话题统一引擎会让尚未创建的角色直接使用 Codex', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-topic-engine-new-role-'));
+  try {
+    const topics = await JsonTopicStore.open(join(root, 'topics.json'));
+    await topics.setCliId('oc', 'omt', 'codex');
+    const sessions = new SessionManager({
+      createId: () => 'pm-codex-session',
+      defaultCliId: 'claude',
+    });
+    const ctx = { sessions, topics } as unknown as AppContext;
+    const bot = { id: 'pm' } as Bot;
+    const session = await ensureRunnableSession(ctx, bot, {
+      messageId: 'om-1', topicId: 'omt', chatId: 'oc', chatType: 'p2p', messageType: 'text',
+      text: '', rootId: '', threadId: '', senderOpenId: 'ou', senderType: 'user', mentions: [], rawContent: '{}',
+    });
+
+    assert.equal(session?.cliId, 'codex');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('话题引擎批量切换现有角色并清空旧引擎上下文', async () => {
+  const sessions = new SessionManager({
+    createId: (() => {
+      let value = 0;
+      return () => `topic-session-${++value}`;
+    })(),
+    defaultCliId: 'claude',
+  });
+  const address = (botId: string, topicId = 'omt') => ({
+    messageId: `om-${botId}`, chatId: 'oc', threadId: topicId, rootId: '', botId,
+  });
+  const ceo = (await sessions.resolve(address('ceo'))).session;
+  const pm = (await sessions.resolve(address('pm'))).session;
+  const otherTopic = (await sessions.resolve(address('dev', 'omt-other'))).session;
+  await sessions.setCliSessionId(ceo.id, 'claude-ceo-context');
+  await sessions.setCliSessionId(pm.id, 'claude-pm-context');
+
+  const result = await sessions.setCliIdForTopic('oc', 'omt', 'codex');
+
+  assert.equal(result.matched, 2);
+  assert.equal(result.updated, 2);
+  assert.equal(result.clearedContexts, 2);
+  assert.deepEqual(new Set(result.updatedSessionIds), new Set([ceo.id, pm.id]));
+  assert.equal(sessions.get(ceo.id)?.cliId, 'codex');
+  assert.equal(sessions.get(ceo.id)?.cliSessionId, undefined);
+  assert.equal(sessions.get(pm.id)?.cliId, 'codex');
+  assert.equal(sessions.get(pm.id)?.cliSessionId, undefined);
+  assert.equal(sessions.get(otherTopic.id)?.cliId, 'claude');
+});
+
+test('正在执行的旧引擎角色延后到下次解析时对齐', async () => {
+  const sessions = new SessionManager({ createId: () => 'active-pm', defaultCliId: 'claude' });
+  const address = { messageId: 'om', chatId: 'oc', threadId: 'omt', rootId: '', botId: 'pm' };
+  const pm = (await sessions.resolve(address)).session;
+  await sessions.transition(pm.id, 'active');
+
+  const update = await sessions.setCliIdForTopic('oc', 'omt', 'codex');
+  assert.deepEqual(update.deferredBotIds, ['pm']);
+  assert.equal(sessions.get(pm.id)?.cliId, 'claude');
+
+  await sessions.transition(pm.id, 'idle');
+  const resolved = await sessions.resolve(address, 'codex');
+  assert.equal(resolved.session.cliId, 'codex');
+});
+
 test('新话题首条帮助命令结束后会话可继续执行任务', async () => {
   const sessions = new SessionManager({ createId: () => 'help-session' });
   const senderOpenId = process.env.OWNER_OPEN_ID?.trim()
@@ -242,6 +309,74 @@ test('话题目录落盘失败时回滚内存绑定', async () => {
     assert.equal(store.getWorkdir('oc', 'omt'), undefined);
   } finally {
     await rm(`${root}.tmp`, { force: true });
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('话题引擎设置在绑定和清除项目目录后仍然保留', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-topic-engine-persist-'));
+  const path = join(root, 'topics.json');
+  try {
+    const topics = await JsonTopicStore.open(path);
+    await topics.setCliId('oc', 'omt', 'codex');
+    assert.equal(topics.getWorkdir('oc', 'omt'), undefined);
+    await topics.setWorkdir('oc', 'omt', '/tmp/project');
+    assert.equal(topics.getCliId('oc', 'omt'), 'codex');
+    await topics.clearWorkdir('oc', 'omt');
+    assert.equal(topics.getWorkdir('oc', 'omt'), undefined);
+    assert.equal(topics.getCliId('oc', 'omt'), 'codex');
+
+    const reopened = await JsonTopicStore.open(path);
+    assert.equal(reopened.getCliId('oc', 'omt'), 'codex');
+    assert.equal(reopened.getWorkdir('oc', 'omt'), undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('/engine codex 会统一切换同一话题的所有现有角色', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-engine-command-'));
+  try {
+    const topics = await JsonTopicStore.open(join(root, 'topics.json'));
+    const sessions = new SessionManager({
+      createId: (() => {
+        let value = 0;
+        return () => `engine-session-${++value}`;
+      })(),
+      defaultCliId: 'claude',
+    });
+    const pm = (await sessions.resolve({
+      messageId: 'om-pm', chatId: 'oc-engine', threadId: 'omt-engine', rootId: '', botId: 'pm',
+    })).session;
+    await sessions.transition(pm.id, 'idle');
+    const replies: string[] = [];
+    const bot = {
+      id: 'ceo', name: 'CEO', openId: 'ou_bot',
+      reply: async (_messageId: string, text: string) => { replies.push(text); },
+    } as unknown as Bot;
+    const senderOpenId = process.env.OWNER_OPEN_ID?.trim()
+      || process.env.AGENT_OS_ALLOWED_OPEN_IDS?.split(/[\s,]+/).find(Boolean)
+      || 'ou_owner';
+    const msg = {
+      messageId: 'om-engine', topicId: 'omt-engine', chatId: 'oc-engine', chatType: 'p2p',
+      messageType: 'text', text: '/engine codex', rawContent: '{"text":"/engine codex"}',
+      rootId: '', threadId: '', senderOpenId, senderType: 'user', mentions: [],
+    } satisfies IncomingMessage;
+    const ctx = {
+      sessions,
+      topics,
+      contextWindows: new Map(),
+    } as unknown as AppContext;
+
+    await handleMessage(ctx, msg, bot);
+
+    assert.equal(topics.getCliId(msg.chatId, msg.topicId), 'codex');
+    assert.equal(sessions.get(pm.id)?.cliId, 'codex');
+    assert.equal(sessions.listByTopic(msg.chatId, msg.topicId)
+      .find((candidate) => candidate.botId === 'ceo')?.cliId, 'codex');
+    assert.match(replies[0] ?? '', /本话题统一切换到 Codex/);
+    assert.match(replies[0] ?? '', /尚未创建的产品、架构、开发、评审、测试/);
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });

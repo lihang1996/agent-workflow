@@ -331,6 +331,7 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
       return;
     }
 
+    await ensureWorkflowTopicCliId(ctx, workflow, msg);
     const stepIndex = workflow.nextStepIndex;
     const step = steps[stepIndex];
     const stepLabel = `步骤 ${stepIndex + 1}/${steps.length} · ${step.title}`;
@@ -624,6 +625,35 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
   }
 }
 
+/**
+ * 话题引擎是流水线所有角色的单一事实来源。
+ * 升级前的话题没有该字段时，以发起角色当前引擎迁移，修复“CEO 已选 Codex、PM 又回落 Claude”。
+ */
+async function ensureWorkflowTopicCliId(
+  ctx: AppContext,
+  workflow: DeliveryWorkflow,
+  msg: IncomingMessage,
+): Promise<void> {
+  const topicId = topicIdOf(msg);
+  let cliId = ctx.topics.getCliId(msg.chatId, topicId);
+  if (!cliId) {
+    cliId = ctx.sessions.listByTopic(msg.chatId, topicId)
+      .find((session) => session.botId === workflow.initiatorBotId)?.cliId
+      ?? ctx.defaultCliId;
+    await ctx.topics.setCliId(msg.chatId, topicId, cliId);
+    console.log(
+      `[引擎] 工作流 ${workflow.id} 将旧话题迁移为统一引擎 ${cliId}`,
+    );
+  }
+  const update = await ctx.sessions.setCliIdForTopic(msg.chatId, topicId, cliId);
+  for (const sessionId of update.updatedSessionIds) ctx.contextWindows.delete(sessionId);
+  if (update.deferredBotIds.length > 0) {
+    console.log(
+      `[引擎] 工作流 ${workflow.id} 等待在途角色结束后对齐：${update.deferredBotIds.join('、')}`,
+    );
+  }
+}
+
 function assertExplicitSuccessfulStepResult(answer: string, stepId: PipelineStep['id']): void {
   if (!hasExplicitStepResult(answer)) {
     throw new Error(`流水线步骤 ${stepId} 缺少显式 [RESULT:done] 终态标记，不能按成功处理。`);
@@ -634,7 +664,7 @@ function assertExplicitSuccessfulStepResult(answer: string, stepId: PipelineStep
   }
 }
 
-async function completeProductStep(
+export async function completeProductStep(
   ctx: AppContext,
   workflowId: string,
   stepIndex: number,
@@ -664,6 +694,10 @@ async function completeProductStep(
     );
     return;
   }
+
+  // MCP 成功时上面的 questionnaire 分支会暂停流水线。没有问卷时，PM 输出必须已经是
+  // 可确认的完整 Spec；禁止把“工具不可用 + 内联澄清问题”误存为待确认方案。
+  assertProductStepSpecOutput(answer);
 
   const linkedById = workflow.specId ? ctx.specs.get(workflow.specId) : undefined;
   if (workflow.specId && !linkedById) {
@@ -1347,6 +1381,18 @@ function assertSpecRequirementIds(spec: Pick<ProductSpec, 'content'>): void {
   parseCanonicalSpecWaivers(spec.content);
 }
 
+/** PM 没有创建问卷时，其最终输出必须能直接进入人工确认。 */
+export function assertProductStepSpecOutput(answer: string): void {
+  try {
+    assertSpecRequirementIds({ content: answer });
+  } catch (error) {
+    throw new Error(
+      '产品经理未创建结构化问卷，且输出不是可确认的产品 Spec；本次输出不会保存或显示确认卡。'
+      + `若仍需澄清，请检查 MCP 权限；否则请修正 Spec 结构后重试。具体原因：${persistentErrorMessage(error, 2_000)}`,
+    );
+  }
+}
+
 function canonicalSpecWaiverContext(spec: ProductSpec): CanonicalSpecWaiverContext {
   if (!spec.contentHash || !spec.approvedAt) {
     throw new Error('canonical Spec 缺少 waiver 绑定所需的内容 hash 或批准时间');
@@ -1675,6 +1721,7 @@ async function activateApprovedSpecWorkflow(
 /** 服务重启后恢复尚未进入人工等待节点的流水线。 */
 export async function resumeRecoverableWorkflows(ctx: AppContext): Promise<void> {
   await reconcileWorkflowSchedules(ctx);
+  await reconcileWorkflowTopicCliIds(ctx);
   await reconcileWorkflowSpecStates(ctx);
   for (const workflow of ctx.workflows.listRecoverable()) {
     try {
@@ -1693,6 +1740,21 @@ export async function resumeRecoverableWorkflows(ctx: AppContext): Promise<void>
   }
 }
 
+/** 服务升级后，为所有尚未结束的旧工作流补齐话题级引擎并对齐已有角色。 */
+export async function reconcileWorkflowTopicCliIds(ctx: AppContext): Promise<void> {
+  const handledTopics = new Set<string>();
+  const workflows = ctx.workflows.list()
+    .filter((workflow) => workflow.status !== 'completed' && workflow.status !== 'failed')
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  for (const workflow of workflows) {
+    const msg = messageForWorkflow(ctx, workflow);
+    const key = `${msg.chatId}:${topicIdOf(msg)}`;
+    if (handledTopics.has(key)) continue;
+    await ensureWorkflowTopicCliId(ctx, workflow, msg);
+    handledTopics.add(key);
+  }
+}
+
 /** 修复 Spec 与工作流分文件写入之间的进程中断窗口。 */
 export async function reconcileWorkflowSpecStates(ctx: AppContext): Promise<void> {
   for (const workflow of ctx.workflows.list()) {
@@ -1701,6 +1763,27 @@ export async function reconcileWorkflowSpecStates(ctx: AppContext): Promise<void
       const spec = ctx.specs.get(workflow.specId);
       if (!spec || spec.workflowId !== workflow.id) {
         throw new Error(`工作流 ${workflow.id} 的 Spec 关联损坏。`);
+      }
+      // 兼容修复前已经落库的“伪 Spec”：这类内容通常是 MCP 被拒后由 PM 内联输出的
+      // 澄清问题。启动时自动退回同一个 PM 步骤；修订提示会要求重新创建结构化问卷，
+      // 不再让用户点击确认后才撞稳定需求 ID 门禁。
+      if (workflow.status === 'awaiting_spec_confirmation' && spec.status === 'pending_confirmation') {
+        let validationError: unknown;
+        try {
+          assertSpecRequirementIds(spec);
+        } catch (error) {
+          validationError = error;
+        }
+        if (validationError) {
+          const feedback = [
+            '系统自动退回：上一版内容不符合可确认产品 Spec 契约，不能进入人工确认。',
+            `校验原因：${persistentErrorMessage(validationError, 2_000)}`,
+            '如果上一版包含尚未回答的澄清问题，请使用 propose_questions 生成飞书结构化问卷；答案充分后再输出带稳定需求 ID 的完整 Spec。',
+          ].join('\n');
+          await rejectSpecConfirmation(ctx, spec.id, feedback);
+          console.warn(`[工作流] ${workflow.id} 已自动退回无效待确认 Spec ${spec.id} 给产品经理。`);
+          continue;
+        }
       }
       // 修复“Spec 已批准，但 canonical 切换或工作流推进尚未落盘”的崩溃窗口。
       // approved 已是人工决策终态，可安全幂等地补齐 canonical 并直接恢复技术交付。

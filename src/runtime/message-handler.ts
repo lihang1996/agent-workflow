@@ -95,14 +95,16 @@ export async function handleMessage(
 
   const resolved = resolveMentions(msg.text, msg.mentions);
   const hasThread = !!msg.threadId || !!msg.rootId;
+  const topicId = topicIdOf(msg);
+  const preferredCliId = ctx.topics?.getCliId?.(msg.chatId, topicId);
   let { session, isNew } = await ctx.sessions.resolve({
     messageId: msg.messageId,
-    topicId: topicIdOf(msg),
+    topicId,
     chatId: msg.chatId,
     threadId: msg.threadId,
     rootId: msg.rootId,
     botId: bot.id,
-  });
+  }, preferredCliId);
 
   console.log(`[收到] bot=${bot.id}(${bot.name}) chat=${msg.chatId} threadId=${msg.threadId} rootId=${msg.rootId} sender=${msg.senderOpenId}`);
   console.log(`  原文: ${sanitizeForLog(msg.text, 500)}`);
@@ -124,7 +126,6 @@ export async function handleMessage(
     return;
   }
   if (command?.name === 'workdir') {
-    const topicId = topicIdOf(msg);
     if (!command.arg) {
       const current = ctx.topics.getWorkdir(msg.chatId, topicId);
       const effective = workdirFor(ctx, session, bot, msg);
@@ -196,10 +197,13 @@ export async function handleMessage(
   }
   if (command?.name === 'engine') {
     if (!command.arg) {
+      const topicCliId = ctx.topics.getCliId(msg.chatId, topicId);
+      const effectiveCliId = topicCliId ?? session.cliId;
       await bot.reply(
         msg.messageId,
         [
-          `当前引擎：${getAdapter(session.cliId).displayName} (${session.cliId})`,
+          `本话题统一引擎：${getAdapter(effectiveCliId).displayName} (${effectiveCliId})`,
+          topicCliId ? '所有角色及后续新建角色都会继承此设置。' : '尚未保存话题级设置；当前仅显示本角色引擎。',
           '用法：/engine claude 或 /engine codex',
         ].join('\n'),
         hasThread,
@@ -212,12 +216,35 @@ export async function handleMessage(
       return;
     }
     try {
-      const prev = session.cliId;
-      const updated = await ctx.sessions.setCliId(session.id, next);
-      console.log(`[引擎] bot=${bot.id} session=${session.id} ${prev} → ${updated.cliId}`);
+      const blockingPeers = ctx.sessions.listByTopic(msg.chatId, topicId)
+        .filter((peer) => peer.status === 'active' && peer.cliId !== next);
+      if (blockingPeers.length > 0) {
+        await bot.reply(
+          msg.messageId,
+          `本话题仍有角色使用其他引擎执行任务（${blockingPeers.map((peer) => peer.botId).join('、')}），请任务结束后再统一切换。`,
+          hasThread,
+        );
+        return;
+      }
+      const previousTopicCliId = ctx.topics.getCliId(msg.chatId, topicId);
+      await ctx.topics.setCliId(msg.chatId, topicId, next);
+      const update = await ctx.sessions.setCliIdForTopic(msg.chatId, topicId, next);
+      for (const sessionId of update.updatedSessionIds) ctx.contextWindows.delete(sessionId);
+      session = ctx.sessions.get(session.id) ?? session;
+      console.log(
+        `[引擎] bot=${bot.id} chat=${msg.chatId} topic=${topicId} ${previousTopicCliId ?? '(未设置)'} → ${next}`
+        + ` updated=${update.updated} deferred=${update.deferredBotIds.join(',') || '(无)'}`,
+      );
       await bot.reply(
         msg.messageId,
-        `已切换到 ${getAdapter(updated.cliId).displayName}。CLI 上下文已清空，后续任务将使用该引擎。`,
+        [
+          `已将本话题统一切换到 ${getAdapter(next).displayName}。`,
+          `已更新 ${update.updated} 个现有角色会话，清空 ${update.clearedContexts} 个旧引擎上下文。`,
+          '尚未创建的产品、架构、开发、评审、测试等角色也会自动继承该引擎。',
+          update.deferredBotIds.length > 0
+            ? `仍在执行的角色将在任务结束后自动对齐：${update.deferredBotIds.join('、')}`
+            : '',
+        ].filter(Boolean).join('\n'),
         hasThread,
       );
     } catch (error) {
@@ -864,7 +891,7 @@ function buildHelpText(bot: Bot): string {
       '/handoff <角色> <任务> 只交给某一个角色',
       '/status 查看当前会话',
       '/workdir [路径] 查看/设置本话题项目目录（clear 清除）',
-      '/engine claude|codex 切换执行引擎',
+      '/engine claude|codex 统一切换本话题所有角色的执行引擎',
       '/review <任务> 只读独立审查（修复请进入 /squad）',
       '/reset /reopen /close /clean 会话管理',
       '执行中可点任务卡片「停止任务」（仅发起人）',
@@ -876,7 +903,7 @@ function buildHelpText(bot: Bot): string {
     '团队需求请先 @CEO助手；我适合承接本角色的具体任务。',
     '/status 查看当前会话',
     '/workdir [路径] 查看/设置本话题项目目录（clear 清除）',
-    '/engine claude|codex 切换执行引擎',
+    '/engine claude|codex 统一切换本话题所有角色的执行引擎',
     '/handoff <角色> <任务> 交接给同话题其他角色',
     '/review <任务> 只读独立审查（修复请进入 /squad）',
     '/squad <目标> 架构→开发→评审→QA→运行时审计→终审',
@@ -1066,15 +1093,18 @@ export async function handleCardAction(
         return { toast: { type: 'info' as const, content: `Spec 当前状态：${spec.status}` } };
       }
       const confirmed = action.value.action === 'confirm_spec';
-      const feedback = typeof action.formValue.confirmationFeedback === 'string'
-        ? action.formValue.confirmationFeedback.trim()
-        : '';
-      if (!confirmed && !feedback) {
-        return { toast: { type: 'warning' as const, content: '退回修改时请填写具体意见。' } };
+      let updated: Awaited<ReturnType<typeof confirmSpecForReview>>;
+      if (confirmed) {
+        updated = await confirmSpecForReview(ctx, spec.id);
+      } else {
+        const feedback = typeof action.formValue.confirmationFeedback === 'string'
+          ? action.formValue.confirmationFeedback.trim()
+          : '';
+        if (!feedback) {
+          return { toast: { type: 'warning' as const, content: '退回修改时请填写具体意见。' } };
+        }
+        updated = (await rejectSpecConfirmation(ctx, spec.id, feedback)).spec;
       }
-      const updated = confirmed
-        ? await confirmSpecForReview(ctx, spec.id)
-        : (await rejectSpecConfirmation(ctx, spec.id, feedback)).spec;
       if (!confirmed) {
         const workflowId = updated.workflowId;
         if (!workflowId) throw new Error(`Spec ${updated.id} 没有关联交付工作流。`);

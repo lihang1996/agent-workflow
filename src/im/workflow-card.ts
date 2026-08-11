@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { ApprovalRequest } from '../core/approval-store.js';
 import type { Questionnaire, Question } from '../core/questionnaire-store.js';
+import { extractRequirementIds } from '../core/requirement-ids.js';
 import type { ProductSpec } from '../core/spec-store.js';
 import { redactSecrets } from '../core/log-inspection.js';
 import type { CardJson } from './card.js';
@@ -146,6 +147,8 @@ export function buildQuestionnaireCard(questionnaire: Questionnaire): CardJson {
 export function buildSpecConfirmationCard(spec: ProductSpec): CardJson {
   const confirmed = spec.status === 'confirmed' || spec.status === 'published' || spec.status === 'in_review' || spec.status === 'approved';
   const requiresFullDocumentReview = spec.content.includes('[RISK_WAIVER]');
+  const hasStableRequirementIds = extractRequirementIds(spec.content).length > 0;
+  const invalidPendingSpec = spec.status === 'pending_confirmation' && !hasStableRequirementIds;
   return {
     schema: '2.0',
     config: { update_multi: true, summary: { content: `Spec 待确认：${spec.title}` } },
@@ -162,35 +165,40 @@ export function buildSpecConfirmationCard(spec: ProductSpec): CardJson {
               : '✅ 需求已确认。下一步可发布到飞书云文档评审，或直接开始技术交付。'
             : spec.status === 'changes_requested'
               ? `⛔ 已退回产品经理修改。${spec.confirmationFeedback ? `\n\n**退回意见**：${escapeCardMarkdown(spec.confirmationFeedback, 2_000)}` : ''}`
-              : requiresFullDocumentReview
-                ? '此 Spec 含风险接受条款；确认后必须发布到飞书云文档完成全文评审，不能从截断预览直接批准。'
-                : '确认方案后可选择发布到飞书云文档评审，或直接开始技术交付。',
+              : invalidPendingSpec
+                ? '⚠️ 当前内容不是可确认的产品 Spec（缺少以条目开头声明的稳定需求 ID）。系统恢复时会自动退回产品经理；此卡不提供确认入口。'
+                : requiresFullDocumentReview
+                  ? '此 Spec 含风险接受条款；确认后必须发布到飞书云文档完成全文评审，不能从截断预览直接批准。'
+                  : '确认方案后可选择发布到飞书云文档评审，或直接开始技术交付。',
         },
         // Schema 2.0 已废弃 tag=action 交互模块；按钮必须直接放进 body.elements（与审批卡一致）。
         ...(spec.status === 'pending_confirmation'
-          ? [{
-            tag: 'form',
-            name: `spec_confirmation_${spec.id}`.slice(0, 40),
-            elements: [
-              {
-                tag: 'input',
-                element_id: 'spec_feedback_input',
-                name: 'confirmationFeedback',
-                required: false,
-                input_type: 'multiline_text',
-                rows: 3,
-                // 飞书 input 默认 max_length 上限为 1000，超过会 400（code 230099 / 11310）
-                max_length: 1_000,
-                label: { tag: 'plain_text', content: '退回意见（退回修改时必填）' },
-                placeholder: { tag: 'plain_text', content: '请输入需要产品经理修改的内容' },
-              },
-              button('confirm_spec', { specId: spec.id, specVersion: spec.updatedAt }, '确认方案', 'primary', true),
-              button('reject_spec', { specId: spec.id, specVersion: spec.updatedAt }, '退回修改', 'danger', true),
-            ],
-          },
-            ...(requiresFullDocumentReview
-              ? []
-              : [button('confirm_spec_start', { specId: spec.id, specVersion: spec.updatedAt }, '确认并直接开始技术交付', 'primary')]),
+          ? [
+            ...(!invalidPendingSpec
+              ? [button('confirm_spec', { specId: spec.id, specVersion: spec.updatedAt }, '确认方案', 'primary')]
+              : []),
+            {
+              tag: 'form',
+              name: `spec_rejection_${spec.id}`.slice(0, 40),
+              elements: [
+                {
+                  tag: 'input',
+                  element_id: 'spec_feedback_input',
+                  name: 'confirmationFeedback',
+                  required: true,
+                  input_type: 'multiline_text',
+                  rows: 3,
+                  // 飞书 input 默认 max_length 上限为 1000，超过会 400（code 230099 / 11310）
+                  max_length: 1_000,
+                  label: { tag: 'plain_text', content: '修改意见（仅点击“退回修改”时提交）' },
+                  placeholder: { tag: 'plain_text', content: '请输入需要产品经理修改或补充的内容' },
+                },
+                button('reject_spec', { specId: spec.id, specVersion: spec.updatedAt }, '退回修改', 'danger', true),
+              ],
+            },
+            ...(!invalidPendingSpec && !requiresFullDocumentReview
+              ? [button('confirm_spec_start', { specId: spec.id, specVersion: spec.updatedAt }, '确认并直接开始技术交付', 'primary')]
+              : []),
           ]
           : spec.status === 'confirmed'
             ? requiresFullDocumentReview
