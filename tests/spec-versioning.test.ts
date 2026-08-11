@@ -67,7 +67,7 @@ test('同一项目的 Spec 具有版本链且同时只能有一个规范版本',
   }
 });
 
-test('旧版已批准 Spec 会确定性补齐控制器批准时间', async () => {
+test('旧版已批准 Spec 会补齐并持久化内容 hash 与控制器批准时间', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agent-os-spec-approved-at-'));
   const path = join(root, 'specs.json');
   try {
@@ -81,10 +81,38 @@ test('旧版已批准 Spec 会确定性补齐控制器批准时间', async () =>
     const rows = JSON.parse(await readFile(path, 'utf8')) as Array<Record<string, unknown>>;
     const legacyUpdatedAt = rows[0]?.updatedAt;
     delete rows[0]?.approvedAt;
+    delete rows[0]?.contentHash;
     await writeFile(path, JSON.stringify(rows));
 
     const reopened = await JsonSpecStore.open(path);
     assert.equal(reopened.get(spec.id)?.approvedAt, legacyUpdatedAt);
+    assert.match(reopened.get(spec.id)?.contentHash ?? '', /^[a-f0-9]{64}$/);
+    const persisted = JSON.parse(await readFile(path, 'utf8')) as Array<Record<string, unknown>>;
+    assert.equal(persisted[0]?.approvedAt, legacyUpdatedAt);
+    assert.equal(persisted[0]?.contentHash, reopened.get(spec.id)?.contentHash);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('旧版待确认 Spec 补齐 hash 后仍可正常批准', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-spec-pending-migration-'));
+  const path = join(root, 'specs.json');
+  try {
+    const store = await JsonSpecStore.open(path);
+    const spec = await store.create(input(
+      '/workspace/app',
+      '55555555-5555-4555-8555-555555555555',
+      'RQ-001 pending legacy',
+    ));
+    const rows = JSON.parse(await readFile(path, 'utf8')) as Array<Record<string, unknown>>;
+    delete rows[0]?.contentHash;
+    await writeFile(path, JSON.stringify(rows));
+
+    const reopened = await JsonSpecStore.open(path);
+    const approved = await reopened.update(spec.id, { status: 'approved' });
+    assert.match(approved.contentHash ?? '', /^[a-f0-9]{64}$/);
+    assert.match(approved.approvedAt ?? '', /^\d{4}-\d{2}-\d{2}T/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

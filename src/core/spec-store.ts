@@ -429,16 +429,11 @@ export class JsonSpecStore {
       throw new Error(`Spec 文件不是有效 JSON: ${this.filePath}`, { cause: error });
     }
     if (!Array.isArray(rows)) throw new Error(`Spec 文件格式错误: ${this.filePath}`);
+    let migratedLegacyData = false;
     for (const [index, row] of rows.entries()) {
-      // v1 记录没有 approvedAt；用当时已持久化的 updatedAt 做一次确定性迁移，
-      // 之后所有新批准都由状态机写入真实时间。
-      const migrated = row && typeof row === 'object' && !Array.isArray(row)
-        && ((row as Record<string, unknown>).status === 'approved'
-          || (row as Record<string, unknown>).canonical === true)
-        && !(row as Record<string, unknown>).approvedAt
-        ? { ...(row as Record<string, unknown>), approvedAt: (row as Record<string, unknown>).updatedAt }
-        : row;
-      const parsed = ProductSpecSchema.safeParse(migrated);
+      const migration = migrateLegacySpecRow(row);
+      migratedLegacyData ||= migration.changed;
+      const parsed = ProductSpecSchema.safeParse(migration.value);
       if (!parsed.success) {
         const issue = parsed.error.issues[0];
         throw new Error(
@@ -456,6 +451,9 @@ export class JsonSpecStore {
       }
       canonicalProjects.add(spec.projectId);
     }
+    // 一次性固化迁移结果。若只在内存补 hash，攻击者可在每次重启前改写旧正文，
+    // loader 又会为被改写内容生成新 hash，反而失去完整性保护。
+    if (migratedLegacyData) await this.persist();
   }
 
   private async persist(): Promise<void> {
@@ -476,6 +474,34 @@ export class JsonSpecStore {
     this.mutationQueue = run.then(() => undefined, () => undefined);
     return run;
   }
+}
+
+function migrateLegacySpecRow(row: unknown): { value: unknown; changed: boolean } {
+  if (!row || typeof row !== 'object' || Array.isArray(row)) {
+    return { value: row, changed: false };
+  }
+  const source = row as Record<string, unknown>;
+  let value = source;
+  let changed = false;
+  const assign = (key: string, next: unknown) => {
+    if (!changed) value = { ...source };
+    value[key] = next;
+    changed = true;
+  };
+
+  // v1/v2 记录没有 contentHash。所有可解析旧 Spec 都在首次启动时绑定当前正文，
+  // 不只处理 approved：否则旧 pending Spec 在之后批准时仍会被新 schema 阻断。
+  if (source.contentHash === undefined && typeof source.content === 'string') {
+    assign('contentHash', hashSpecContent(source.content.trim()));
+  }
+
+  // 旧批准记录没有 approvedAt；使用当时已持久化的 updatedAt 做确定性迁移。
+  // 明确存在但格式错误的字段不自动覆盖，继续由 schema fail closed。
+  const requiresApprovalBinding = source.status === 'approved' || source.canonical === true;
+  if (requiresApprovalBinding && source.approvedAt === undefined) {
+    assign('approvedAt', source.updatedAt);
+  }
+  return { value, changed };
 }
 
 function hashSpecContent(content: string): string {
