@@ -1,0 +1,6 @@
+interface:
+  display_name: "Design Risk-Aware Change"
+  short_description: "把并发、安全、兼容性、数据迁移和回滚风险写入可验证方案"
+  default_prompt: "使用 $design-risk-aware-change 为本次变更设计风险控制和验证方案。"
+policy:
+  allow_implicit_invocation: true

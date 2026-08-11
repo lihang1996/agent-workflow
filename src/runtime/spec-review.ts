@@ -213,7 +213,7 @@ async function approveSpecReviewUnlocked(ctx: AppContext, specId: string): Promi
   if (!approved) throw new Error(`当前 Spec 状态为 ${ctx.specs.get(spec.id)?.status ?? 'unknown'}，无法重复通过评审。`);
   try {
     await resumeWorkflowAfterProductReview(ctx, approved.id);
-    return approved;
+    return ctx.specs.get(approved.id) ?? approved;
   } catch (error) {
     if (ctx.workflows.get(workflow.id)?.status === 'awaiting_doc_review') {
       await ctx.specs.updateIfStatus(spec.id, 'approved', { status: 'in_review' });

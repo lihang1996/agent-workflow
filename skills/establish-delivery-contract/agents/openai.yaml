@@ -1,0 +1,6 @@
+interface:
+  display_name: "Establish Delivery Contract"
+  short_description: "在开发实施前统一需求来源、验收标准、项目环境和质量基线"
+  default_prompt: "使用 $establish-delivery-contract 统一本项目需求来源并生成可验证交付契约。"
+policy:
+  allow_implicit_invocation: true

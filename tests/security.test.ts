@@ -1,10 +1,17 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { isAuthorizedOperator } from '../src/core/access.js';
+import {
+  assertCanControlOwnedResource,
+  assertOwnedBy,
+  canControlOwnedResource,
+  isAuthorizedOperator,
+} from '../src/core/access.js';
+import { requestTaskAbort } from '../src/core/task-abort.js';
 import { JsonApprovalStore, type ApprovalRequest } from '../src/core/approval-store.js';
 import { SessionManager } from '../src/core/session-manager.js';
 import {
@@ -16,7 +23,7 @@ import {
   sanitizeForLog,
   summarizeLogSignals,
 } from '../src/core/log-inspection.js';
-import { highRiskToolCallReason, isHighRiskTask } from '../src/core/risk.js';
+import { highRiskClasses, highRiskToolCallReason, isHighRiskTask } from '../src/core/risk.js';
 import { assertWorkdir } from '../src/core/workdir.js';
 import { ClaudeAdapter } from '../src/cli/claude-adapter.js';
 import { CodexAdapter } from '../src/cli/codex-adapter.js';
@@ -50,6 +57,39 @@ test('群聊默认拒绝，配置 owner 后只允许 owner', () => {
   else process.env.OWNER_OPEN_ID = previousOwner;
   if (previousAllowed === undefined) delete process.env.AGENT_OS_ALLOWED_OPEN_IDS;
   else process.env.AGENT_OS_ALLOWED_OPEN_IDS = previousAllowed;
+});
+
+test('业务控制放行发起人与白名单；高风险审批在配置 OWNER 后只认当前负责人', () => {
+  const previousOwner = process.env.OWNER_OPEN_ID;
+  const previousAllowed = process.env.AGENT_OS_ALLOWED_OPEN_IDS;
+  try {
+    delete process.env.OWNER_OPEN_ID;
+    delete process.env.AGENT_OS_ALLOWED_OPEN_IDS;
+    assert.doesNotThrow(() => assertCanControlOwnedResource('ou_initiator', 'ou_initiator'));
+    assert.doesNotThrow(() => assertOwnedBy('ou_initiator', 'ou_initiator'));
+
+    process.env.OWNER_OPEN_ID = 'ou_owner';
+    process.env.AGENT_OS_ALLOWED_OPEN_IDS = 'ou_helper';
+    assert.equal(canControlOwnedResource('ou_initiator', 'ou_initiator'), true);
+    assert.equal(canControlOwnedResource('ou_initiator', 'ou_owner'), true);
+    assert.equal(canControlOwnedResource('ou_initiator', 'ou_helper'), true);
+    assert.equal(canControlOwnedResource('ou_initiator', 'ou_stranger'), false);
+    assert.throws(() => assertCanControlOwnedResource('ou_initiator', 'ou_stranger'), /任务发起人或授权用户/);
+    // 高风险：配置了 OWNER 后，发起人/白名单不能代替当前负责人拍板
+    assert.throws(() => assertOwnedBy('ou_initiator', 'ou_initiator'), /指定负责人/);
+    assert.throws(() => assertOwnedBy('ou_initiator', 'ou_helper'), /指定负责人/);
+    assert.doesNotThrow(() => assertOwnedBy('ou_initiator', 'ou_owner'));
+
+    const runs = new Map([
+      ['s1', { controller: new AbortController(), ownerOpenId: 'ou_initiator' }],
+    ]);
+    assert.equal(requestTaskAbort(runs, 's1', 'ou_helper'), 'stopped');
+  } finally {
+    if (previousOwner === undefined) delete process.env.OWNER_OPEN_ID;
+    else process.env.OWNER_OPEN_ID = previousOwner;
+    if (previousAllowed === undefined) delete process.env.AGENT_OS_ALLOWED_OPEN_IDS;
+    else process.env.AGENT_OS_ALLOWED_OPEN_IDS = previousAllowed;
+  }
 });
 
 test('启动恢复和停机期间拒绝新事件', async () => {
@@ -366,11 +406,26 @@ test('CLI 按普通、只读和已审批任务使用不同权限边界', () => {
     assert.match(approved.at(-1) ?? '', /只推送 main 分支/);
     assert.match(approved[approved.indexOf('-c') + 1], /developer_instructions=.*只推送 main 分支/);
 
+    delete process.env.CODEX_APPROVED_SANDBOX;
+    const defaultApproved = codex.buildArgs('git push', {
+      executionPolicy: 'approved',
+      approvedScope: '只推送 main 分支',
+    });
+    assert.equal(defaultApproved[defaultApproved.indexOf('--sandbox') + 1], 'workspace-write');
+    process.env.CODEX_APPROVED_SANDBOX = 'danger-full-access';
+
     const claude = new ClaudeAdapter();
     const normalClaude = claude.buildArgs('修改 README', { executionPolicy: 'standard' });
     assert.equal(normalClaude.includes('--dangerously-skip-permissions'), false);
     assert.equal(normalClaude[normalClaude.indexOf('--permission-mode') + 1], 'dontAsk');
     assert.equal(normalClaude.includes('--settings'), true);
+    const settingsPath = normalClaude[normalClaude.indexOf('--settings') + 1];
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf8')) as {
+      permissions?: { allow?: string[] };
+    };
+    assert.ok(settings.permissions?.allow?.includes('Write'));
+    assert.ok(settings.permissions?.allow?.includes('Edit'));
+    assert.ok(settings.permissions?.allow?.some((rule) => rule.startsWith('Bash(pnpm')));
     const readClaude = claude.buildArgs('分析日志', { executionPolicy: 'read-only' });
     assert.equal(readClaude[readClaude.indexOf('--tools') + 1], 'Read,Glob,Grep');
     assert.equal(readClaude.includes('--strict-mcp-config'), true);
@@ -384,7 +439,7 @@ test('CLI 按普通、只读和已审批任务使用不同权限边界', () => {
     assert.equal(inputClaude.includes('--strict-mcp-config'), true);
     const approvedClaude = claude.buildArgs('git push', { executionPolicy: 'approved', approvedScope: '只推送 main 分支' });
     assert.equal(approvedClaude.includes('--dangerously-skip-permissions'), true);
-    assert.equal(approvedClaude.includes('--settings'), false);
+    assert.equal(approvedClaude.includes('--settings'), true);
     assert.match(approvedClaude[approvedClaude.indexOf('--append-system-prompt') + 1], /只推送 main 分支/);
   } finally {
     if (previousMcp === undefined) delete process.env.MCP_ENABLED;
@@ -396,11 +451,19 @@ test('CLI 按普通、只读和已审批任务使用不同权限边界', () => {
   }
 });
 
-test('Claude PreToolUse 闸门阻止未审批危险命令，只放行本轮批准任务', async () => {
-  const runHook = (policy: 'standard' | 'approved', command: string) => new Promise<{ code: number | null; stderr: string }>((resolve, reject) => {
+test('Claude PreToolUse 闸门按风险类别约束本轮审批范围', async () => {
+  const runHook = (
+    policy: 'standard' | 'approved',
+    command: string,
+    approvedScope = '',
+  ) => new Promise<{ code: number | null; stderr: string }>((resolve, reject) => {
     const child = spawn(process.execPath, ['--import', 'tsx', 'src/hooks/approval-gate.ts'], {
       cwd: process.cwd(),
-      env: { ...process.env, AGENT_OS_EXECUTION_POLICY: policy },
+      env: {
+        ...process.env,
+        AGENT_OS_EXECUTION_POLICY: policy,
+        AGENT_OS_APPROVED_RISK_CLASSES: highRiskClasses(approvedScope).join(','),
+      },
       stdio: ['pipe', 'ignore', 'pipe'],
     });
     let stderr = '';
@@ -413,7 +476,12 @@ test('Claude PreToolUse 闸门阻止未审批危险命令，只放行本轮批�
   assert.equal(blocked.code, 2);
   assert.match(blocked.stderr, /\/approval/);
   assert.equal((await runHook('standard', 'pnpm test')).code, 0);
-  assert.equal((await runHook('approved', 'rm -rf ./data')).code, 0);
+  const outsideScope = await runHook('approved', 'rm -rf ./data', '只推送 main 分支');
+  assert.equal(outsideScope.code, 2);
+  assert.match(outsideScope.stderr, /超出本次审批范围/);
+  assert.equal((await runHook('approved', 'git push origin main', '只推送 main 分支')).code, 0);
+  assert.equal((await runHook('approved', 'rm -rf ./data', '删除 data 目录')).code, 0);
+  assert.equal((await runHook('approved', 'rm -rf ./data')).code, 2);
 });
 
 test('审批失败卡展示原因并只提供重试按钮', async () => {

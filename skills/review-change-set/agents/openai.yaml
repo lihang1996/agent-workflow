@@ -1,0 +1,6 @@
+interface:
+  display_name: "Review Change Set"
+  short_description: "在开发完成后审查完整变更范围、架构、安全与删除风险并阻断高危问题"
+  default_prompt: "使用 $review-change-set 审查当前实现变更并生成可验证的结构化结论。"
+policy:
+  allow_implicit_invocation: true

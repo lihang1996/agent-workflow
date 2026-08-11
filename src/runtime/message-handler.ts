@@ -8,9 +8,9 @@ import {
   resolveHandoffTarget,
 } from '../core/handoff.js';
 import { collabTopicKey } from '../core/collab.js';
-import { filterRunnableSteps } from '../core/pipeline.js';
 import { requestTaskAbort } from '../core/task-abort.js';
 import { assertWorkdir } from '../core/workdir.js';
+import { isDeliveryMutationTask } from '../core/delivery-policy.js';
 import {
   formatScheduleInterval,
   formatScheduleRunStatus,
@@ -24,7 +24,12 @@ import {
   sanitizeForLog,
 } from '../core/log-inspection.js';
 import { highRiskReason, isHighRiskTask } from '../core/risk.js';
-import { assertOwnedBy, isAuthorizedOperator } from '../core/access.js';
+import {
+  assertCanControlOwnedResource,
+  assertOwnedBy,
+  canControlOwnedResource,
+  isAuthorizedOperator,
+} from '../core/access.js';
 import { resolveMentions } from '../im/message-parser.js';
 import { isAddressedToBot, type Bot, type IncomingMessage } from '../im/lark.js';
 import {
@@ -41,12 +46,19 @@ import {
 } from './active-runs.js';
 import { startCliTask } from './cli-task.js';
 import { runCollabReview } from './collab-runner.js';
+import { rewindStepIdFromDriftMessage } from '../core/quality-gates.js';
+import { assertManualWorkflowRetryAllowed } from '../core/workflow-store.js';
 import {
+  abortBlockedWorkflow,
+  handOffBlockedWorkflowIfQualityFix,
+  resendBlockedCard,
   runDeliverySquad,
   runTeamPipeline,
   confirmSpecForReview,
+  confirmSpecAndStartDelivery,
   continueDeliveryWorkflow,
   rejectSpecConfirmation,
+  resumeBlockedWorkflowStep,
   resumeWorkflowAfterQuestionnaire,
 } from './pipeline-runner.js';
 import { approveSpecReview, publishSpecToDoc, requestSpecChangesFromCard } from './spec-review.js';
@@ -242,12 +254,16 @@ export async function handleMessage(
       return;
     }
     if (subcommand === 'show' && specId) {
-      const spec = ctx.specs.get(specId);
-      if (!spec || spec.chatId !== msg.chatId || spec.topicId !== topicIdOf(msg)) {
-        await bot.reply(msg.messageId, `找不到本话题 Spec：${specId}`, hasThread);
-        return;
+      try {
+        const spec = ctx.specs.get(specId);
+        if (!spec || spec.chatId !== msg.chatId || spec.topicId !== topicIdOf(msg)) {
+          await bot.reply(msg.messageId, `找不到本话题 Spec：${specId}`, hasThread);
+          return;
+        }
+        await bot.replyCard(msg.messageId, buildSpecStatusCard(spec), hasThread);
+      } catch (error) {
+        await bot.reply(msg.messageId, `展示 Spec 失败：${(error as Error).message}`, hasThread);
       }
-      await bot.replyCard(msg.messageId, buildSpecStatusCard(spec), hasThread);
       return;
     }
     if (subcommand === 'publish' && specId) {
@@ -290,6 +306,15 @@ export async function handleMessage(
     }
     if (target.id === bot.id) {
       await bot.reply(msg.messageId, '不能交接给自己。', hasThread);
+      return;
+    }
+
+    if (isDeliveryMutationTask(parsed.task)) {
+      await bot.reply(
+        msg.messageId,
+        '交接命令不能绕过交付门禁执行项目修改。请由 CEO 发起流水线，或由开发工程师使用 /squad <目标>。',
+        hasThread,
+      );
       return;
     }
 
@@ -346,8 +371,7 @@ export async function handleMessage(
         msg.messageId,
         [
           '用法：/review <任务>',
-          '流程：reviewer 评审 → 意见自动回传 dev 修改 → 未通过且未达上限则继续复审',
-          `当前最大轮次：${ctx.collabMaxRounds}（可用 COLLAB_MAX_ROUNDS 配置）`,
+          '流程：reviewer 做只读独立审查；不会在完整交付门禁外自动修改代码',
           '示例：/review 审查 README.md 是否完整准确',
         ].join('\n'),
         hasThread,
@@ -379,6 +403,7 @@ export async function handleMessage(
         msg,
         task: command.arg,
         round: 1,
+        allowFixes: false,
       });
     } catch (error) {
       await bot.reply(msg.messageId, (error as Error).message, hasThread);
@@ -395,15 +420,13 @@ export async function handleMessage(
       return;
     }
     if (!command.arg) {
-      const preview = filterRunnableSteps(ctx.pipelineSteps, new Set(ctx.botsById.keys()))
-        .map((s) => s.title)
-        .join(' → ');
+      const preview = ctx.pipelineSteps.map((s) => s.title).join(' → ');
       await bot.reply(
         msg.messageId,
         [
           '用法：/pipeline <目标>',
           `当前步骤：${preview || '(无可用步骤)'}`,
-          '可用 PIPELINE_STEPS 定制，例如：pm,architect,dev,review,qa,summary',
+          'PIPELINE_STEPS 仅允许声明完整固定顺序，质量门禁不可裁剪或重排。',
           '示例：/pipeline 给 README 补一节快速开始说明',
         ].join('\n'),
         hasThread,
@@ -437,7 +460,7 @@ export async function handleMessage(
       return;
     }
     if (!command.arg) {
-      await bot.reply(msg.messageId, '用法：/squad <目标>\n步骤：架构 → 开发 → 评审 → QA', hasThread);
+      await bot.reply(msg.messageId, '用法：/squad <目标>\n步骤：架构 → 开发 → 评审 → QA → 运行时审计 → 最终审查', hasThread);
       return;
     }
     if (isHighRiskTask(command.arg)) {
@@ -466,12 +489,17 @@ export async function handleMessage(
       await bot.reply(msg.messageId, '用法：/approval <高风险任务>。批准后才会执行。', hasThread);
       return;
     }
+    const deliveryMutation = isDeliveryMutationTask(command.arg);
+    if (deliveryMutation && bot.id !== 'ceo' && bot.id !== 'dev') {
+      await bot.reply(msg.messageId, '高风险交付请由 CEO 或开发工程师发起，确保审批后仍进入完整门禁。', hasThread);
+      return;
+    }
     try {
       await requestHighRiskApproval(ctx, {
         bot,
         msg,
         prompt: command.arg,
-        action: 'task',
+        action: deliveryMutation ? (bot.id === 'ceo' ? 'pipeline' : 'squad') : 'task',
         reason: '用户显式要求审批',
       });
     } catch (error) {
@@ -520,7 +548,7 @@ export async function handleMessage(
         return;
       }
       try {
-        assertOwnedBy(job.ownerOpenId, msg.senderOpenId);
+        assertCanControlOwnedResource(job.ownerOpenId, msg.senderOpenId);
         if (operation === 'remove') {
           if (job.lastStatus === 'running') throw new Error('定时任务正在执行，请等待本轮结束或先停止对应任务卡片。');
           await ctx.schedules.remove(job.id);
@@ -555,6 +583,14 @@ export async function handleMessage(
         await bot.reply(msg.messageId, (error as Error).message, hasThread);
         return;
       }
+    }
+    if (operation === 'every' && isDeliveryMutationTask(prompt)) {
+      await bot.reply(
+        msg.messageId,
+        '会修改项目的定时任务不能使用普通 task。请由 CEO 使用 /schedule pipeline <间隔> <目标>。',
+        hasThread,
+      );
+      return;
     }
     const kind = operation === 'pipeline' ? 'pipeline' : operation === 'logs' ? 'log_inspection' : 'task';
     try {
@@ -616,6 +652,74 @@ export async function handleMessage(
       removed > 0
         ? `已清理 ${removed} 条已关闭会话记录。`
         : '没有可清理的已关闭会话。',
+      hasThread,
+    );
+    return;
+  }
+  if (command?.name === 'workflow') {
+    const [subcommand = '', ...rest] = (command.arg?.trim().split(/\s+/) ?? []);
+    const workflowId = rest[0]?.trim();
+    if (subcommand === 'retry' && workflowId) {
+      try {
+        const workflow = ctx.workflows.get(workflowId);
+        if (!workflow) throw new Error(`工作流不存在: ${workflowId}`);
+        assertCanControlOwnedResource(workflow.message.senderOpenId, msg.senderOpenId);
+        if (workflow.status === 'failed') {
+          assertManualWorkflowRetryAllowed(workflow);
+          const rewindTo = rewindStepIdFromDriftMessage(workflow.error);
+          const nextStepIndex = rewindTo && workflow.stepIds.includes(rewindTo)
+            ? workflow.stepIds.indexOf(rewindTo)
+            : workflow.nextStepIndex;
+          const restored = await ctx.workflows.updateIfStatus(workflowId, 'failed', {
+            status: 'ready',
+            error: undefined,
+            nextStepIndex,
+            ...(rewindTo ? {
+              priorOutputs: {
+                ...workflow.priorOutputs,
+                fingerprint_drift: workflow.error ?? `退回 ${rewindTo} 重建证据`,
+              },
+            } : {}),
+          });
+          if (!restored) throw new Error(`工作流当前状态为 ${ctx.workflows.get(workflowId)?.status ?? 'unknown'}，无法重试。`);
+          const stepName = restored.stepIds[restored.nextStepIndex] ?? '(结束)';
+          const hint = rewindTo
+            ? `（检测到证据指纹漂移，已退回 ${rewindTo} 重建后再继续）`
+            : '';
+          await bot.reply(
+            msg.messageId,
+            `工作流已从失败恢复，正在从步骤 ${stepName} 继续…${hint}`,
+            hasThread,
+          );
+          void continueDeliveryWorkflow(ctx, workflowId).catch(async (error) => {
+            const message = (error as Error).message;
+            console.error(`[工作流] retry 续跑失败:`, message);
+            await bot.reply(msg.messageId, `续跑失败：${message}`, hasThread).catch(() => undefined);
+          });
+          return;
+        }
+        if (await handOffBlockedWorkflowIfQualityFix(ctx, workflowId)) {
+          await bot.reply(
+            msg.messageId,
+            '当前阻塞实为代码缺陷（非目录问题），已记录并转交开发/架构修复，正在续跑…',
+            hasThread,
+          );
+          return;
+        }
+        await resendBlockedCard(ctx, workflowId);
+        await bot.reply(msg.messageId, `已重新发送阻塞卡，请在新卡片上操作。`, hasThread);
+      } catch (error) {
+        await bot.reply(msg.messageId, (error as Error).message, hasThread);
+      }
+      return;
+    }
+    await bot.reply(
+      msg.messageId,
+      [
+        '用法：',
+        '/workflow retry <工作流ID> — 失败工作流从当前步骤重试，或重新发送阻塞卡',
+        '工作流 ID 可在终端日志或 data/workflows.json 中查找。',
+      ].join('\n'),
       hasThread,
     );
     return;
@@ -697,16 +801,43 @@ export async function handleMessage(
 
   if (isHighRiskTask(resolved)) {
     session = await releaseCreatingSession(ctx, session);
+    if (isDeliveryMutationTask(resolved) && bot.id !== 'dev') {
+      await bot.reply(
+        msg.messageId,
+        '该高风险交付请求必须同时经过审批与完整门禁。请改由 @CEO助手 发起。',
+        hasThread,
+      );
+      return;
+    }
     try {
       await requestHighRiskApproval(ctx, {
         bot,
         msg,
         prompt: resolved,
-        action: 'task',
+        action: isDeliveryMutationTask(resolved) ? 'squad' : 'task',
         reason: highRiskReason(resolved),
       });
     } catch (error) {
       await bot.reply(msg.messageId, (error as Error).message, hasThread);
+    }
+    return;
+  }
+
+  // 会产生项目改动的自然语言任务不能绕过结构化交付门禁。
+  if (isDeliveryMutationTask(resolved)) {
+    session = await releaseCreatingSession(ctx, session);
+    if (bot.id === 'dev') {
+      try {
+        await runDeliverySquad(ctx, { initiator: bot, msg, goal: resolved.trim() });
+      } catch (error) {
+        await bot.reply(msg.messageId, (error as Error).message, hasThread);
+      }
+    } else {
+      await bot.reply(
+        msg.messageId,
+        '该请求会产生项目交付物，不能绕过质量门禁。请 @CEO助手 描述目标，或由开发工程师使用 /squad <目标>。',
+        hasThread,
+      );
     }
     return;
   }
@@ -725,7 +856,7 @@ function buildHelpText(bot: Bot): string {
   if (bot.id === 'ceo') {
     return [
       `我是 ${bot.name}（${bot.id}）· 团队统一入口`,
-      '直接描述目标 → 启动交付流水线（PM→架构→开发→评审→测试→汇总）',
+      '直接描述目标 → 启动交付流水线（PM→架构→开发→评审→测试→运行时审计→终审→汇总）',
       '/pipeline <目标> 显式启动流水线',
       '/squad <目标> 启动开发内部交付小队',
       '/schedule … 创建/管理定时任务',
@@ -734,7 +865,7 @@ function buildHelpText(bot: Bot): string {
       '/status 查看当前会话',
       '/workdir [路径] 查看/设置本话题项目目录（clear 清除）',
       '/engine claude|codex 切换执行引擎',
-      '/review <任务> 评审→开发协作（意见自动回传，可多轮）',
+      '/review <任务> 只读独立审查（修复请进入 /squad）',
       '/reset /reopen /close /clean 会话管理',
       '执行中可点任务卡片「停止任务」（仅发起人）',
     ].join('\n');
@@ -747,8 +878,8 @@ function buildHelpText(bot: Bot): string {
     '/workdir [路径] 查看/设置本话题项目目录（clear 清除）',
     '/engine claude|codex 切换执行引擎',
     '/handoff <角色> <任务> 交接给同话题其他角色',
-    '/review <任务> 评审→开发协作（意见自动回传，可多轮）',
-    '/squad <目标> 架构→开发→评审→QA 内部交付小队',
+    '/review <任务> 只读独立审查（修复请进入 /squad）',
+    '/squad <目标> 架构→开发→评审→QA→运行时审计→终审',
     '/schedule … 创建/管理定时任务',
     '/approval <任务> 发起高风险操作审批',
     '/reset /reopen /close /clean 会话管理',
@@ -844,11 +975,11 @@ export async function handleCardAction(
     try {
       const spec = ctx.specs.get(specId);
       if (!spec) throw new Error('Spec 不存在或已被删除。');
-      assertSpecOwner(spec.ownerOpenId, action.operatorOpenId);
       assertCurrentSpecCard(spec, action.value);
       if (spec.status !== 'in_review') throw new Error(`当前 Spec 状态为 ${spec.status}，无法处理评审。`);
 
       if (action.value.action === 'approve_spec_review') {
+        assertSpecApprovalAuthority(spec, action.operatorOpenId);
         const approved = await approveSpecReview(ctx, spec.id);
         return {
           toast: { type: 'success' as const, content: '产品评审已通过，内部交付小队开始执行。' },
@@ -856,6 +987,7 @@ export async function handleCardAction(
         };
       }
 
+      assertSpecOwner(spec.ownerOpenId, action.operatorOpenId);
       const comment = typeof action.formValue.reviewComment === 'string'
         ? action.formValue.reviewComment.trim()
         : '';
@@ -874,6 +1006,29 @@ export async function handleCardAction(
       return { toast: { type: 'error' as const, content: (error as Error).message } };
     }
   }
+  if (action.value.action === 'confirm_spec_start') {
+    const specId = typeof action.value.specId === 'string' ? action.value.specId : '';
+    if (!specId) return { toast: { type: 'error' as const, content: 'Spec ID 缺失。' } };
+    try {
+      const spec = ctx.specs.get(specId);
+      if (!spec) throw new Error('Spec 不存在或已被删除。');
+      assertSpecApprovalAuthority(spec, action.operatorOpenId);
+      assertCurrentSpecCard(spec, action.value);
+      await confirmSpecAndStartDelivery(ctx, spec.id);
+      const latest = ctx.specs.get(specId);
+      if (!latest) throw new Error('Spec 确认后读取失败。');
+      return {
+        toast: { type: 'success' as const, content: '方案已确认并直接开始技术交付。' },
+        card: { type: 'raw' as const, data: buildSpecStatusCard(latest) },
+      };
+    } catch (error) {
+      const latest = specId ? ctx.specs.get(specId) : undefined;
+      return {
+        toast: { type: 'error' as const, content: (error as Error).message },
+        ...(latest ? { card: { type: 'raw' as const, data: buildSpecStatusCard(latest) } } : {}),
+      };
+    }
+  }
   if (action.value.action === 'publish_spec') {
     const specId = typeof action.value.specId === 'string' ? action.value.specId : '';
     try {
@@ -887,7 +1042,12 @@ export async function handleCardAction(
         card: { type: 'raw' as const, data: buildSpecReviewCard(published) },
       };
     } catch (error) {
-      return { toast: { type: 'error' as const, content: (error as Error).message } };
+      // 半成功写入会更新 docId/updatedAt；必须刷新卡片，否则旧卡按钮立刻「已过期」。
+      const latest = specId ? ctx.specs.get(specId) : undefined;
+      return {
+        toast: { type: 'error' as const, content: (error as Error).message },
+        ...(latest ? { card: { type: 'raw' as const, data: buildSpecStatusCard(latest) } } : {}),
+      };
     }
   }
   if (action.value.action === 'confirm_spec' || action.value.action === 'reject_spec') {
@@ -896,7 +1056,11 @@ export async function handleCardAction(
     try {
       const spec = ctx.specs.get(specId);
       if (!spec) throw new Error('Spec 不存在或已被删除。');
-      assertSpecOwner(spec.ownerOpenId, action.operatorOpenId);
+      if (action.value.action === 'confirm_spec') {
+        assertSpecApprovalAuthority(spec, action.operatorOpenId);
+      } else {
+        assertSpecOwner(spec.ownerOpenId, action.operatorOpenId);
+      }
       assertCurrentSpecCard(spec, action.value);
       if (spec.status !== 'pending_confirmation') {
         return { toast: { type: 'info' as const, content: `Spec 当前状态：${spec.status}` } };
@@ -965,6 +1129,75 @@ export async function handleCardAction(
       return { toast: { type: 'error' as const, content: (error as Error).message } };
     }
   }
+  if (
+    action.value.action === 'retry_blocked_step'
+    || action.value.action === 'retry_blocked_step_with_workdir'
+    || action.value.action === 'abort_blocked_workflow'
+  ) {
+    const workflowId = typeof action.value.workflowId === 'string' ? action.value.workflowId : '';
+    if (!workflowId) return { toast: { type: 'error' as const, content: '工作流 ID 缺失。' } };
+    try {
+      const workflow = ctx.workflows.get(workflowId);
+      if (!workflow) throw new Error('工作流不存在或已被删除。');
+      assertCanControlOwnedResource(workflow.message.senderOpenId, action.operatorOpenId);
+
+      // 防止旧阻塞卡重放到新阻塞步骤：必须携带 stepId + blockVersion 且与当前一致
+      const cardStepId = typeof action.value.stepId === 'string' ? action.value.stepId : '';
+      const cardBlockVersion = typeof action.value.blockVersion === 'string' ? action.value.blockVersion : '';
+      if (!cardStepId || !cardBlockVersion) {
+        throw new Error('这张阻塞卡缺少版本信息，请重新触发阻塞或联系管理员。');
+      }
+      if (workflow.status === 'awaiting_step_unblock') {
+        const currentStepId = workflow.stepIds[workflow.nextStepIndex];
+        if (cardStepId !== currentStepId || cardBlockVersion !== workflow.updatedAt) {
+          throw new Error('这张阻塞卡已过期，流水线当前阻塞步骤与卡片不匹配。');
+        }
+      }
+
+      if (action.value.action === 'abort_blocked_workflow') {
+        await abortBlockedWorkflow(ctx, workflowId);
+        return { toast: { type: 'info' as const, content: '已终止阻塞中的流水线。' } };
+      }
+
+      // 代码缺陷误进绑目录卡：点「重试」也改为记 bug 并移交开发/架构
+      if (await handOffBlockedWorkflowIfQualityFix(ctx, workflowId)) {
+        return {
+          toast: {
+            type: 'info' as const,
+            content: '这是代码缺陷而非目录问题，已转交开发/架构修复。',
+          },
+        };
+      }
+
+      const workdir = action.value.action === 'retry_blocked_step_with_workdir'
+        ? (typeof action.value.workdir === 'string' && action.value.workdir.trim()
+          ? action.value.workdir.trim()
+          : workflow.priorOutputs.blocked_workdir)
+        : undefined;
+      const initiator = ctx.botsById.get(workflow.initiatorBotId);
+      runWorkflowContinuation(
+        resumeBlockedWorkflowStep(ctx, workflowId, workdir ? { workdir } : undefined),
+        `重试阻塞步骤 workflow=${workflowId}`,
+        (error) => {
+          // 异步失败时通知飞书用户，避免只写终端
+          initiator?.reply(
+            action.messageId,
+            `重试阻塞步骤失败：${error.message}`,
+            true,
+          ).catch(() => undefined);
+        },
+      );
+      return {
+        toast: {
+          type: 'info' as const,
+          content: workdir ? `已绑定 ${workdir}，正在重试当前步骤…` : '正在按当前话题目录重试当前步骤…',
+        },
+      };
+    } catch (error) {
+      return { toast: { type: 'error' as const, content: (error as Error).message } };
+    }
+  }
+
   if (action.value.action !== 'abort_task') return {};
 
   const sessionId =
@@ -977,8 +1210,8 @@ export async function handleCardAction(
   if (!run) {
     return { toast: { type: 'info' as const, content: '任务已经结束，无需再次停止。' } };
   }
-  if (action.operatorOpenId !== run.ownerOpenId) {
-    return { toast: { type: 'warning' as const, content: '只有任务发起人可以停止它。' } };
+  if (!canControlOwnedResource(run.ownerOpenId, action.operatorOpenId)) {
+    return { toast: { type: 'warning' as const, content: '只有任务发起人或授权用户可以停止它。' } };
   }
   if (run.controller.signal.aborted) {
     freezeRunCard(run);
@@ -1004,7 +1237,19 @@ export async function handleCardAction(
 
 /** 指定负责人优先；未指定时由提出需求的人确认。 */
 function assertSpecOwner(specOwnerOpenId: string, operatorOpenId: string): void {
-  assertOwnedBy(specOwnerOpenId, operatorOpenId);
+  assertCanControlOwnedResource(specOwnerOpenId, operatorOpenId);
+}
+
+/** 含风险接受条款的 Spec 与高风险执行使用同一负责人边界，普通白名单不能代拍板。 */
+function assertSpecApprovalAuthority(
+  spec: import('../core/spec-store.js').ProductSpec,
+  operatorOpenId: string,
+): void {
+  if (spec.content.includes('[RISK_WAIVER]')) {
+    assertOwnedBy(spec.ownerOpenId, operatorOpenId);
+    return;
+  }
+  assertSpecOwner(spec.ownerOpenId, operatorOpenId);
 }
 
 async function releaseCreatingSession(
@@ -1033,7 +1278,7 @@ function assertQuestionnaireAccess(
   chatId?: string,
   topicId?: string,
 ): void {
-  assertOwnedBy(questionnaire.ownerOpenId ?? '', operatorOpenId);
+  assertCanControlOwnedResource(questionnaire.ownerOpenId ?? '', operatorOpenId);
   if (chatId && questionnaire.chatId && questionnaire.chatId !== chatId) {
     throw new Error('问卷不属于当前会话。');
   }
@@ -1054,8 +1299,14 @@ function assertCurrentQuestionnaireCard(
   }
 }
 
-function runWorkflowContinuation(task: Promise<void>, label: string): void {
+function runWorkflowContinuation(
+  task: Promise<unknown>,
+  label: string,
+  onError?: (error: Error) => void,
+): void {
   void task.catch((error) => {
-    console.error(`[工作流] ${label}失败:`, sanitizeErrorForLog(error));
+    const err = error instanceof Error ? error : new Error(String(error));
+    console.error(`[工作流] ${label}失败:`, sanitizeErrorForLog(err));
+    onError?.(err);
   });
 }

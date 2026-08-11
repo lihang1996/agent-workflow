@@ -7,11 +7,13 @@
     "dev": "pnpm start",
     "start": "tsx watch --include .env src/index.ts",
     "start:once": "tsx src/index.ts",
+    "start:prod": "pnpm build && pnpm verify:dist-contract && node dist/index.js",
     "probe": "tsx src/probe-lark.ts",
     "build": "tsc",
     "probe:cli": "tsx src/probe-cli.ts",
     "mcp:server": "tsx src/mcp/ask-server.ts",
-    "test": "node --import tsx --test tests/**/*.test.ts"
+    "verify:dist-contract": "node scripts/verify-dist-contract.mjs",
+    "test": "node --import tsx --test --test-concurrency=1 --experimental-test-isolation=none tests/**/*.test.ts"
   },
   "engines": {
     "node": ">=22"

@@ -52,13 +52,15 @@ export function codexSandboxFor(policy: CliExecutionPolicy): CodexSandbox {
   if (policy === 'read-only' || policy === 'input-only') return 'read-only';
   if (policy === 'approved') {
     const configured = process.env.CODEX_APPROVED_SANDBOX?.trim();
-    if (!configured) return 'danger-full-access';
+    // 人工批准的是一个动作范围，不等于默认授予整个主机权限。
+    // 确实需要网络/工作区外写入时，管理员必须显式配置 danger-full-access。
+    if (!configured) return 'workspace-write';
     if (isCodexSandbox(configured)) return configured;
     if (!warnedApprovedSandbox) {
       warnedApprovedSandbox = true;
-      console.warn(`[配置] CODEX_APPROVED_SANDBOX=${configured} 非法，回退到 danger-full-access`);
+      console.warn(`[配置] CODEX_APPROVED_SANDBOX=${configured} 非法，回退到 workspace-write`);
     }
-    return 'danger-full-access';
+    return 'workspace-write';
   }
 
   const configured = process.env.CODEX_SANDBOX?.trim() || 'workspace-write';

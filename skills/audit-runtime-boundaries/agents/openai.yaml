@@ -1,0 +1,6 @@
+interface:
+  display_name: "Audit Runtime Boundaries"
+  short_description: "验证真实运行时中的交互、安全、缓存、可访问性和浏览器兼容边界"
+  default_prompt: "使用 $audit-runtime-boundaries 审计本次交付的真实运行时边界。"
+policy:
+  allow_implicit_invocation: true

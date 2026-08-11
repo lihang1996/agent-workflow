@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { ClaudeAdapter } from '../src/cli/claude-adapter.js';
 import { CodexAdapter } from '../src/cli/codex-adapter.js';
-import { runCli } from '../src/cli/runner.js';
+import { resolveCliIdleTimeoutMs, resolveCliTimeoutMs, runCli } from '../src/cli/runner.js';
 import type { CliAdapter, CliEvent } from '../src/cli/types.js';
 
 class NodeScriptAdapter implements CliAdapter {
@@ -53,7 +53,9 @@ test('CLI 事件处理器异常会安全终止子进程', async () => {
 test('CLI 超时和预先取消均不会留下运行任务', async () => {
   const adapter = new NodeScriptAdapter('setInterval(()=>{},1000)');
   await assert.rejects(
-    () => runCli({ adapter, prompt: 'test', cwd: process.cwd(), timeoutMs: 30 }),
+    () => runCli({
+      adapter, prompt: 'test', cwd: process.cwd(), timeoutMs: 30, idleTimeoutMs: 0,
+    }),
     /执行超时/,
   );
   const controller = new AbortController();
@@ -62,6 +64,37 @@ test('CLI 超时和预先取消均不会留下运行任务', async () => {
     () => runCli({ adapter, prompt: 'test', cwd: process.cwd(), signal: controller.signal }),
     /执行已取消/,
   );
+});
+
+test('CLI 空闲超时：有输出会续命，长时间无输出才终止', async () => {
+  const script = [
+    `console.log(JSON.stringify({type:'assistant',text:'tick'}));`,
+    `setInterval(()=>{},1000);`,
+  ].join('');
+  await assert.rejects(
+    () => runCli({
+      adapter: new NodeScriptAdapter(script),
+      prompt: 'test',
+      cwd: process.cwd(),
+      timeoutMs: 10_000,
+      idleTimeoutMs: 80,
+    }),
+    /无输出，疑似卡住/,
+  );
+});
+
+test('CLI_TIMEOUT_MS 环境变量可覆盖默认超时', () => {
+  assert.equal(resolveCliTimeoutMs(undefined, '120000'), 120_000);
+  assert.equal(resolveCliTimeoutMs(5_000, '120000'), 5_000);
+  assert.equal(resolveCliTimeoutMs(undefined, '1'), 60_000);
+  assert.equal(resolveCliTimeoutMs(undefined, 'not-a-number'), 6 * 60 * 60 * 1000);
+});
+
+test('CLI_IDLE_TIMEOUT_MS 支持关闭与环境覆盖', () => {
+  assert.equal(resolveCliIdleTimeoutMs(0), 0);
+  assert.equal(resolveCliIdleTimeoutMs(undefined, '0'), 0);
+  assert.equal(resolveCliIdleTimeoutMs(undefined, '900000'), 900_000);
+  assert.equal(resolveCliIdleTimeoutMs(3_000, '900000'), 3_000);
 });
 
 test('仅输入分析不会恢复或返回持久会话', async () => {

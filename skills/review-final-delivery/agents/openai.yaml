@@ -1,0 +1,6 @@
+interface:
+  display_name: "Review Final Delivery"
+  short_description: "基于最终项目快照、需求追踪和完整证据链执行独立交付审查"
+  default_prompt: "使用 $review-final-delivery 审查最终快照并给出可验证交付结论。"
+policy:
+  allow_implicit_invocation: true

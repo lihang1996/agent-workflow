@@ -5,6 +5,55 @@ import type { ProductSpec } from '../core/spec-store.js';
 import { redactSecrets } from '../core/log-inspection.js';
 import type { CardJson } from './card.js';
 
+/** 流水线步骤 [RESULT:blocked] 后的人工纠正卡。 */
+export function buildStepBlockedCard(options: {
+  workflowId: string;
+  stepId: string;
+  stepTitle: string;
+  reason: string;
+  suggestedWorkdir?: string;
+  /** 阻塞版本号（workflow.updatedAt），防止旧卡重放到新阻塞步骤 */
+  blockVersion: string;
+}): CardJson {
+  const value = {
+    workflowId: options.workflowId,
+    stepId: options.stepId,
+    blockVersion: options.blockVersion,
+    ...(options.suggestedWorkdir ? { workdir: options.suggestedWorkdir } : {}),
+  };
+  return {
+    schema: '2.0',
+    config: { update_multi: true, summary: { content: `流水线已阻塞：${options.stepTitle}` } },
+    header: {
+      template: 'orange',
+      title: { tag: 'plain_text', content: `流水线已阻塞 · ${options.stepTitle}` },
+    },
+    body: {
+      direction: 'vertical',
+      vertical_spacing: '12px',
+      elements: [
+        {
+          tag: 'markdown',
+          content: [
+            `**步骤**：${escapeCardMarkdown(options.stepTitle, 80)}`,
+            `**原因**：${escapeCardMarkdown(options.reason, 800)}`,
+            options.suggestedWorkdir
+              ? `**建议目录**：\`${escapeCardMarkdown(options.suggestedWorkdir, 300)}\``
+              : '可先用 `/workdir <绝对路径>` 绑定话题目录，再点重试。',
+            '',
+            '流水线已暂停，不会继续评审/测试。纠正后可重跑**同一步**。',
+          ].join('\n'),
+        },
+        ...(options.suggestedWorkdir
+          ? [button('retry_blocked_step_with_workdir', value, '绑定建议目录并重试', 'primary')]
+          : []),
+        button('retry_blocked_step', value, '按当前话题目录重试', 'default'),
+        button('abort_blocked_workflow', value, '终止流水线', 'danger'),
+      ],
+    },
+  };
+}
+
 function button(
   action: string,
   value: Record<string, string>,
@@ -18,7 +67,10 @@ function button(
     name: `${action}_submit`.slice(0, 20),
     text: { tag: 'plain_text', content: text },
     type,
-    ...(formSubmit ? { action_type: 'form_submit' } : {}),
+    // CLAUDE.md 错题本实战记录：form_action_type: "submit" 必须有（否则 300123）。
+    // 官方文档写的 behaviors 数组 form_action 方式实际 API 报 "unknown behavior type" 400。
+    // 以实战经验为准。
+    ...(formSubmit ? { form_action_type: 'submit' } : {}),
     behaviors: [{ type: 'callback', value: { action, ...value } }],
   };
 }
@@ -93,6 +145,7 @@ export function buildQuestionnaireCard(questionnaire: Questionnaire): CardJson {
 
 export function buildSpecConfirmationCard(spec: ProductSpec): CardJson {
   const confirmed = spec.status === 'confirmed' || spec.status === 'published' || spec.status === 'in_review' || spec.status === 'approved';
+  const requiresFullDocumentReview = spec.content.includes('[RISK_WAIVER]');
   return {
     schema: '2.0',
     config: { update_multi: true, summary: { content: `Spec 待确认：${spec.title}` } },
@@ -104,11 +157,16 @@ export function buildSpecConfirmationCard(spec: ProductSpec): CardJson {
         {
           tag: 'markdown',
           content: confirmed
-            ? '✅ 需求已确认。下一步可发布到飞书云文档。'
+            ? requiresFullDocumentReview
+              ? '✅ 需求已确认。此 Spec 含风险接受条款，必须发布到飞书云文档完成全文评审后才能开始技术交付。'
+              : '✅ 需求已确认。下一步可发布到飞书云文档评审，或直接开始技术交付。'
             : spec.status === 'changes_requested'
               ? `⛔ 已退回产品经理修改。${spec.confirmationFeedback ? `\n\n**退回意见**：${escapeCardMarkdown(spec.confirmationFeedback, 2_000)}` : ''}`
-              : '确认后会进入飞书云文档发布流程。',
+              : requiresFullDocumentReview
+                ? '此 Spec 含风险接受条款；确认后必须发布到飞书云文档完成全文评审，不能从截断预览直接批准。'
+                : '确认方案后可选择发布到飞书云文档评审，或直接开始技术交付。',
         },
+        // Schema 2.0 已废弃 tag=action 交互模块；按钮必须直接放进 body.elements（与审批卡一致）。
         ...(spec.status === 'pending_confirmation'
           ? [{
             tag: 'form',
@@ -121,16 +179,26 @@ export function buildSpecConfirmationCard(spec: ProductSpec): CardJson {
                 required: false,
                 input_type: 'multiline_text',
                 rows: 3,
-                max_length: 4_000,
+                // 飞书 input 默认 max_length 上限为 1000，超过会 400（code 230099 / 11310）
+                max_length: 1_000,
                 label: { tag: 'plain_text', content: '退回意见（退回修改时必填）' },
                 placeholder: { tag: 'plain_text', content: '请输入需要产品经理修改的内容' },
               },
               button('confirm_spec', { specId: spec.id, specVersion: spec.updatedAt }, '确认方案', 'primary', true),
               button('reject_spec', { specId: spec.id, specVersion: spec.updatedAt }, '退回修改', 'danger', true),
             ],
-          }]
+          },
+            ...(requiresFullDocumentReview
+              ? []
+              : [button('confirm_spec_start', { specId: spec.id, specVersion: spec.updatedAt }, '确认并直接开始技术交付', 'primary')]),
+          ]
           : spec.status === 'confirmed'
-            ? [button('publish_spec', { specId: spec.id, specVersion: spec.updatedAt }, '发布到飞书云文档', 'primary')]
+            ? requiresFullDocumentReview
+              ? [button('publish_spec', { specId: spec.id, specVersion: spec.updatedAt }, '发布到飞书云文档并评审', 'primary')]
+              : [
+                button('publish_spec', { specId: spec.id, specVersion: spec.updatedAt }, '发布到飞书云文档', 'default'),
+                button('confirm_spec_start', { specId: spec.id, specVersion: spec.updatedAt }, '直接开始技术交付', 'primary'),
+              ]
             : []),
       ],
     },
@@ -168,7 +236,8 @@ export function buildSpecReviewCard(spec: ProductSpec): CardJson {
                   required: false,
                   input_type: 'multiline_text',
                   rows: 3,
-                  max_length: 4_000,
+                  // 飞书 input 默认 max_length 上限为 1000，超过会 400（code 230099 / 11310）
+                  max_length: 1_000,
                   label: { tag: 'plain_text', content: '修改意见（要求修改时必填）' },
                   placeholder: { tag: 'plain_text', content: '请输入需要产品经理处理的意见' },
                 },

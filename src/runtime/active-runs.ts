@@ -9,7 +9,7 @@ import { markSessionIdle } from './sessions.js';
 export function snapshotActiveRuns(ctx: AppContext): PersistedActiveRun[] {
   const now = new Date().toISOString();
   return [...ctx.activeRuns.entries()]
-    .filter(([, run]) => run.terminalStatus !== 'success')
+    .filter(([, run]) => !run.terminalStatus)
     .map(([sessionId, run]) => {
       const snap = run.tracker.snapshot();
       return {
@@ -63,7 +63,7 @@ export function interruptedCard(run: ActiveRun, detail: string) {
 
 /** 把进行中任务卡片刷成取消；已成功的跳过。 */
 export async function finishInterruptedRun(run: ActiveRun, detail: string): Promise<void> {
-  if (run.terminalStatus === 'success') return;
+  if (run.terminalStatus) return;
   run.terminalStatus = 'interrupted';
   try {
     await run.cardUpdater.finish(interruptedCard(run, detail));
@@ -122,9 +122,9 @@ export async function shutdownActiveRuns(ctx: AppContext, reason: string): Promi
     return;
   }
 
-  const toInterrupt = entries.filter(([, run]) => run.terminalStatus !== 'success');
+  const toInterrupt = entries.filter(([, run]) => !run.terminalStatus);
   console.log(
-    `[任务] 停机收尾：共 ${entries.length} 个任务，中断 ${toInterrupt.length} 个（已成功 ${entries.length - toInterrupt.length} 个跳过）`,
+    `[任务] 停机收尾：共 ${entries.length} 个任务，中断 ${toInterrupt.length} 个（已有终态 ${entries.length - toInterrupt.length} 个跳过）`,
   );
   for (const [, run] of toInterrupt) {
     run.interruptReason = reason;
@@ -138,7 +138,7 @@ export async function shutdownActiveRuns(ctx: AppContext, reason: string): Promi
 
   for (const [sessionId, run] of entries) {
     if (run.heartbeat) clearInterval(run.heartbeat);
-    if (run.terminalStatus !== 'success') {
+    if (!run.terminalStatus) {
       await finishInterruptedRun(run, reason);
     }
     ctx.activeRuns.delete(sessionId);

@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { z } from 'zod';
@@ -41,8 +41,15 @@ export const ProductSpecSchema = z.object({
   botId: z.string().trim().min(1).max(100),
   questionnaireId: z.string().trim().min(1).max(100).optional(),
   workflowId: z.string().uuid().optional(),
+  projectId: z.string().trim().min(1).max(4_000).optional(),
+  version: z.number().int().min(1).default(1),
+  supersedesSpecId: z.string().trim().min(1).max(64).optional(),
+  canonical: z.boolean().default(false),
+  contentHash: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   confirmationFeedback: z.string().trim().min(1).max(4_000).optional(),
   status: SpecStatusSchema,
+  /** 由本地状态机在人工确认成功时写入；不得取 Agent 输出中的时间。 */
+  approvedAt: z.iso.datetime().optional(),
   docId: z.string().trim().min(1).max(500).optional(),
   docUrl: z.url().refine(isFeishuDocumentUrl, '云文档地址必须是飞书 Docx HTTPS 地址').optional(),
   comments: z.array(SpecCommentSchema).max(2_000).default([]),
@@ -70,10 +77,22 @@ export const ProductSpecSchema = z.object({
   if (spec.docUrl && !spec.docId) {
     ctx.addIssue({ code: 'custom', path: ['docUrl'], message: '存在云文档地址时必须同时保存 docId' });
   }
+  if (spec.canonical && !spec.projectId) {
+    ctx.addIssue({ code: 'custom', path: ['projectId'], message: '规范 Spec 必须绑定项目标识' });
+  }
+  if ((spec.canonical || spec.status === 'approved') && !spec.contentHash) {
+    ctx.addIssue({ code: 'custom', path: ['contentHash'], message: '已批准或 canonical Spec 必须包含内容 hash' });
+  }
+  if ((spec.canonical || spec.status === 'approved') && !spec.approvedAt) {
+    ctx.addIssue({ code: 'custom', path: ['approvedAt'], message: '已批准或 canonical Spec 必须包含控制器批准时间' });
+  }
+  if (spec.contentHash && spec.contentHash !== hashSpecContent(spec.content)) {
+    ctx.addIssue({ code: 'custom', path: ['contentHash'], message: 'Spec 内容与 contentHash 不一致' });
+  }
 });
 export type ProductSpec = z.infer<typeof ProductSpecSchema>;
 
-type SpecPatch = Partial<Omit<ProductSpec, 'id' | 'createdAt'>>;
+type SpecPatch = Partial<Omit<ProductSpec, 'id' | 'createdAt' | 'approvedAt'>>;
 
 /** 产品 Spec 的本地事实源；飞书云文档仅作为发布副本。 */
 export class JsonSpecStore {
@@ -96,6 +115,10 @@ export class JsonSpecStore {
     return [...this.specs.values()]
       .filter((spec) => spec.workflowId === workflowId)
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
+  }
+
+  findCanonical(projectId: string): ProductSpec | undefined {
+    return [...this.specs.values()].find((spec) => spec.projectId === projectId && spec.canonical);
   }
 
   listByTopic(chatId: string, topicId: string): ProductSpec[] {
@@ -128,15 +151,40 @@ export class JsonSpecStore {
       .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
   }
 
-  async create(input: Omit<ProductSpec, 'id' | 'status' | 'comments' | 'createdAt' | 'updatedAt'>): Promise<ProductSpec> {
+  async create(input: Omit<
+    ProductSpec,
+    | 'id'
+    | 'status'
+    | 'comments'
+    | 'createdAt'
+    | 'updatedAt'
+    | 'version'
+    | 'canonical'
+    | 'contentHash'
+    | 'supersedesSpecId'
+  > & {
+    version?: number;
+    canonical?: boolean;
+    contentHash?: string;
+    supersedesSpecId?: string;
+  }): Promise<ProductSpec> {
     return this.enqueueMutation(async () => {
       if (input.workflowId && this.findByWorkflowId(input.workflowId)) {
         throw new Error(`工作流 ${input.workflowId} 已经关联产品 Spec`);
       }
       const now = new Date().toISOString();
+      const projectId = input.projectId ?? `${input.chatId}:${input.topicId}`;
+      const previous = [...this.specs.values()]
+        .filter((candidate) => candidate.projectId === projectId)
+        .sort((left, right) => right.version - left.version || right.updatedAt.localeCompare(left.updatedAt))[0];
       const spec = ProductSpecSchema.parse({
         ...input,
+        projectId,
         id: randomUUID(),
+        version: input.version ?? (previous?.version ?? 0) + 1,
+        supersedesSpecId: input.supersedesSpecId ?? previous?.id,
+        canonical: input.canonical ?? false,
+        contentHash: input.contentHash ?? hashSpecContent(input.content),
         status: 'pending_confirmation',
         comments: [],
         createdAt: now,
@@ -150,11 +198,65 @@ export class JsonSpecStore {
   async update(id: string, patch: SpecPatch): Promise<ProductSpec> {
     return this.enqueueMutation(async () => {
       const current = this.require(id);
+      const now = new Date().toISOString();
+      const contentChanged = patch.content !== undefined && patch.content !== current.content;
+      const status = contentChanged && patch.status === undefined
+        ? 'changes_requested'
+        : (patch.status ?? current.status);
+      if (contentChanged && status === 'approved') {
+        throw new Error('Spec 正文变更与人工批准不能在同一次状态变更中完成');
+      }
       const next = ProductSpecSchema.parse({
         ...current,
         ...patch,
-        updatedAt: new Date().toISOString(),
+        status,
+        approvedAt: status === 'approved'
+          ? (current.status === 'approved' ? current.approvedAt : now)
+          : undefined,
+        ...(contentChanged ? {
+          version: current.version + 1,
+          contentHash: hashSpecContent(patch.content as string),
+          canonical: false,
+        } : {}),
+        updatedAt: now,
       });
+      await this.replaceAndPersist(id, next);
+      return next;
+    });
+  }
+
+  async markCanonical(id: string): Promise<ProductSpec> {
+    return this.enqueueMutation(async () => {
+      const selected = this.require(id);
+      if (!selected.projectId) throw new Error(`Spec ${id} 缺少项目标识，不能设为规范版本`);
+      if (selected.status !== 'approved') throw new Error(`Spec ${id} 尚未批准，不能设为规范版本`);
+      const previous = new Map(this.specs);
+      const now = new Date().toISOString();
+      for (const [specId, spec] of this.specs) {
+        if (spec.projectId !== selected.projectId) continue;
+        this.specs.set(specId, ProductSpecSchema.parse({
+          ...spec,
+          canonical: specId === id,
+          approvedAt: specId === id ? (spec.approvedAt ?? now) : spec.approvedAt,
+          updatedAt: specId === id ? now : spec.updatedAt,
+        }));
+      }
+      try {
+        await this.persist();
+      } catch (error) {
+        this.specs.clear();
+        for (const [specId, spec] of previous) this.specs.set(specId, spec);
+        throw error;
+      }
+      return this.require(id);
+    });
+  }
+
+  async clearCanonical(id: string): Promise<ProductSpec> {
+    return this.enqueueMutation(async () => {
+      const current = this.require(id);
+      if (!current.canonical) return current;
+      const next = ProductSpecSchema.parse({ ...current, canonical: false, updatedAt: new Date().toISOString() });
       await this.replaceAndPersist(id, next);
       return next;
     });
@@ -170,10 +272,27 @@ export class JsonSpecStore {
       const current = this.require(id);
       const allowed = Array.isArray(expected) ? expected : [expected];
       if (!allowed.includes(current.status)) return undefined;
+      const now = new Date().toISOString();
+      const contentChanged = patch.content !== undefined && patch.content !== current.content;
+      const status = contentChanged && patch.status === undefined
+        ? 'changes_requested'
+        : (patch.status ?? current.status);
+      if (contentChanged && status === 'approved') {
+        throw new Error('Spec 正文变更与人工批准不能在同一次状态变更中完成');
+      }
       const next = ProductSpecSchema.parse({
         ...current,
         ...patch,
-        updatedAt: new Date().toISOString(),
+        status,
+        approvedAt: status === 'approved'
+          ? (current.status === 'approved' ? current.approvedAt : now)
+          : undefined,
+        ...(contentChanged ? {
+          version: current.version + 1,
+          contentHash: hashSpecContent(patch.content as string),
+          canonical: false,
+        } : {}),
+        updatedAt: now,
       });
       await this.replaceAndPersist(id, next);
       return next;
@@ -311,7 +430,15 @@ export class JsonSpecStore {
     }
     if (!Array.isArray(rows)) throw new Error(`Spec 文件格式错误: ${this.filePath}`);
     for (const [index, row] of rows.entries()) {
-      const parsed = ProductSpecSchema.safeParse(row);
+      // v1 记录没有 approvedAt；用当时已持久化的 updatedAt 做一次确定性迁移，
+      // 之后所有新批准都由状态机写入真实时间。
+      const migrated = row && typeof row === 'object' && !Array.isArray(row)
+        && ((row as Record<string, unknown>).status === 'approved'
+          || (row as Record<string, unknown>).canonical === true)
+        && !(row as Record<string, unknown>).approvedAt
+        ? { ...(row as Record<string, unknown>), approvedAt: (row as Record<string, unknown>).updatedAt }
+        : row;
+      const parsed = ProductSpecSchema.safeParse(migrated);
       if (!parsed.success) {
         const issue = parsed.error.issues[0];
         throw new Error(
@@ -320,6 +447,14 @@ export class JsonSpecStore {
       }
       if (this.specs.has(parsed.data.id)) throw new Error(`Spec 文件包含重复 ID: ${parsed.data.id}`);
       this.specs.set(parsed.data.id, parsed.data);
+    }
+    const canonicalProjects = new Set<string>();
+    for (const spec of this.specs.values()) {
+      if (!spec.canonical || !spec.projectId) continue;
+      if (canonicalProjects.has(spec.projectId)) {
+        throw new Error(`Spec 文件包含多个规范版本: ${spec.projectId}`);
+      }
+      canonicalProjects.add(spec.projectId);
     }
   }
 
@@ -341,6 +476,10 @@ export class JsonSpecStore {
     this.mutationQueue = run.then(() => undefined, () => undefined);
     return run;
   }
+}
+
+function hashSpecContent(content: string): string {
+  return createHash('sha256').update(content).digest('hex');
 }
 
 function isFeishuDocumentUrl(value: string): boolean {

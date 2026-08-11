@@ -8,7 +8,7 @@ import type {
 } from "../core/task-progress.js";
 
 export type CardJson = Record<string, unknown>;
-export type TaskStatus = "running" | "success" | "failed" | "cancelled";
+export type TaskStatus = "running" | "success" | "blocked" | "failed" | "cancelled";
 
 export interface TaskCardOptions {
   title: string;
@@ -25,6 +25,7 @@ export interface TaskCardOptions {
 const STATUS_STYLE = {
   running: { template: "blue", label: "执行中" },
   success: { template: "green", label: "已完成" },
+  blocked: { template: "orange", label: "已阻塞" },
   failed: { template: "red", label: "执行失败" },
   cancelled: { template: "grey", label: "已取消" },
 } as const;
@@ -58,6 +59,7 @@ function formatDuration(durationMs: number): string {
 }
 
 function formatCount(value: number): string {
+  if (value >= 1_000_000) return `${Math.round(value / 100_000) / 10}M`;
   return value >= 1_000 ? `${Math.round(value / 100) / 10}k` : String(value);
 }
 
@@ -247,7 +249,13 @@ function buildFinishedElements(
   const meta = [executionMeta, usageMeta].filter(Boolean).join("\n\n");
   const elements: Record<string, unknown>[] = [];
 
-  if (options.status === "success") {
+  if (options.status === "success" || options.status === "blocked") {
+    if (options.status === "blocked") {
+      elements.push({
+        tag: "markdown",
+        content: `**已阻塞**：${escapeFeishuMarkdown(options.detail)}`,
+      });
+    }
     const answer = options.answer || options.detail;
     if (answer.length <= COMPACT_ANSWER_LENGTH) {
       elements.push({ tag: "markdown", content: escapeFeishuMarkdown(answer) });

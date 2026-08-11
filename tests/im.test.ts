@@ -8,7 +8,85 @@ import {
   resolveMentions,
 } from '../src/im/message-parser.js';
 import { parseCommand } from '../src/core/command-parser.js';
-import { resourceLocalName } from '../src/im/lark.js';
+import { documentClientToken, resourceLocalName, sanitizeDocumentTitle } from '../src/im/lark.js';
+import { buildSpecConfirmationCard } from '../src/im/workflow-card.js';
+import type { ProductSpec } from '../src/core/spec-store.js';
+
+function spec(status: ProductSpec['status']): ProductSpec {
+  return {
+    id: 'spec-1',
+    title: '登录',
+    content: '可执行 Spec',
+    chatId: 'oc',
+    topicId: 'omt',
+    messageId: 'om',
+    botId: 'pm',
+    ownerOpenId: 'ou',
+    workflowId: 'wf-1',
+    status,
+    version: 1,
+    contentHash: 'a'.repeat(64),
+    canonical: false,
+    comments: [],
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+}
+
+test('Spec 确认卡在待确认状态同时提供云文档评审与直接开始两个入口', () => {
+  const card = buildSpecConfirmationCard(spec('pending_confirmation'));
+  const serialized = JSON.stringify(card);
+  assert.match(serialized, /confirm_spec/);
+  assert.match(serialized, /confirm_spec_start/);
+  assert.match(serialized, /确认并直接开始技术交付/);
+  // Schema 2.0 禁止 tag=action；按钮应直接出现在 body.elements
+  assert.doesNotMatch(serialized, /"tag":"action"/);
+  const elements = (card as { body: { elements: Array<{ tag?: string }> } }).body.elements;
+  assert.ok(elements.some((el) => el.tag === 'button'));
+});
+
+test('Spec 确认卡在已确认状态保留发布按钮并允许直接开始技术交付', () => {
+  const card = buildSpecConfirmationCard(spec('confirmed'));
+  const serialized = JSON.stringify(card);
+  assert.match(serialized, /publish_spec/);
+  assert.match(serialized, /confirm_spec_start/);
+  assert.match(serialized, /直接开始技术交付/);
+  assert.doesNotMatch(serialized, /"tag":"action"/);
+});
+
+test('含风险接受条款的 Spec 只能进入完整云文档评审', () => {
+  const riskyContent = [
+    '### RQ-001 登录',
+    '[RISK_WAIVER] {"findingId":"FIND-1","owner":"owner","reason":"known risk","scope":"one route","compensatingControl":"monitor","expiresAt":"2099-01-01T00:00:00.000Z"}',
+  ].join('\n');
+  const pending = buildSpecConfirmationCard({ ...spec('pending_confirmation'), content: riskyContent });
+  const pendingSerialized = JSON.stringify(pending);
+  assert.match(pendingSerialized, /confirm_spec/);
+  assert.doesNotMatch(pendingSerialized, /confirm_spec_start/);
+  assert.match(pendingSerialized, /必须发布到飞书云文档完成全文评审/);
+
+  const confirmed = buildSpecConfirmationCard({ ...spec('confirmed'), content: riskyContent });
+  const confirmedSerialized = JSON.stringify(confirmed);
+  assert.match(confirmedSerialized, /publish_spec/);
+  assert.doesNotMatch(confirmedSerialized, /confirm_spec_start/);
+});
+
+test('云文档标题会去掉换行并截断到飞书上限', () => {
+  assert.equal(
+    sanitizeDocumentTitle('产品 Spec · 目标\n第二行还有很多字'),
+    '产品 Spec · 目标 第二行还有很多字',
+  );
+  assert.equal(sanitizeDocumentTitle('   '), '产品 Spec');
+  assert.equal(sanitizeDocumentTitle('a'.repeat(801)).length, 800);
+  assert.match(sanitizeDocumentTitle('a'.repeat(801)), /…$/);
+});
+
+test('飞书 client_token 使用 UUID 形态且同一步幂等', () => {
+  const token = documentClientToken('doc:initial', 'insert:0');
+  assert.match(token, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  assert.equal(token, documentClientToken('doc:initial', 'insert:0'));
+  assert.notEqual(token, documentClientToken('doc:initial', 'insert:1'));
+});
 
 test('畸形飞书消息不会打断解析', () => {
   assert.equal(extractMessageText('text', '{bad json'), '');

@@ -14,6 +14,8 @@ import type { Bot, IncomingMessage } from '../im/lark.js';
 import type { Session } from '../core/session-manager.js';
 import { TaskProgressTracker } from '../core/task-progress.js';
 import { sanitizeErrorForLog, sanitizeForLog } from '../core/log-inspection.js';
+import { hasExplicitStepResult, parseStepResult } from '../core/step-result.js';
+import { displayAgentOutput } from '../core/agent-output.js';
 import { assertWorkdir } from '../core/workdir.js';
 import type { AppContext } from './app-context.js';
 import type { ActiveRun } from './types.js';
@@ -36,7 +38,15 @@ export async function startCliTask(
     workflowId?: string;
     executionPolicy?: CliExecutionPolicy;
     approvedScope?: string;
+    /** 是否解析 [RESULT:done|blocked|failed] 标记；仅流水线非 PM 步骤启用 */
+    resultProtocol?: boolean;
+    /** 是否在卡片/续发文本中隐藏 RESULT、GATE_RESULT、DSML 等机器协议。 */
+    hideProtocolOutput?: boolean;
+    /** 在成功卡变绿前执行语义/门禁校验；抛错会落失败卡并进入 onFailure。 */
+    validateSuccess?: (answer: string) => Promise<void>;
     onSuccess?: (answer: string) => Promise<void>;
+    /** 当前任务终态卡已经提交且会话已释放后执行；适合启动同一 Bot 的下一流水线步骤。 */
+    afterSuccess?: (answer: string) => Promise<void>;
     onFailure?: (error: Error) => Promise<void>;
   },
 ): Promise<void> {
@@ -51,7 +61,11 @@ export async function startCliTask(
     workflowId,
     executionPolicy = 'standard',
     approvedScope,
+    resultProtocol = false,
+    hideProtocolOutput = resultProtocol,
+    validateSuccess,
     onSuccess,
+    afterSuccess,
     onFailure,
   } = options;
   let taskPrompt = options.prompt.trim();
@@ -308,17 +322,48 @@ export async function startCliTask(
       if (executionPolicy !== 'input-only' && result.stats?.contextWindowTokens) {
         ctx.contextWindows.set(session.id, result.stats.contextWindowTokens);
       }
-      // 先标记成功，防止停机逻辑把绿卡盖成红卡。
-      activeRun.terminalStatus = 'success';
+      // 仅流水线非 PM 步骤解析 RESULT 标记（resultProtocol=true 时）；
+      // PM 产出的是 Spec 正文，普通聊天/handoff/定时/巡检也不解析，
+      // 避免 Agent 在回答中举例 [RESULT:failed] 被误判为任务失败。
+      const stepResult = resultProtocol ? parseStepResult(result.answer) : { kind: 'done' as const };
+      if (resultProtocol && !hasExplicitStepResult(result.answer)) {
+        throw new Error('流水线步骤缺少显式 [RESULT:done|blocked|failed] 终态标记，不能按成功处理。');
+      }
+      const visibleAnswer = hideProtocolOutput ? displayAgentOutput(result.answer) : result.answer;
+      // CLI exit 0 只代表进程完成；结构化门禁也通过后，卡片才允许显示绿色成功。
+      if (stepResult.kind === 'done' && validateSuccess) {
+        await validateSuccess(result.answer);
+      }
       if (activeRun.heartbeat) clearInterval(activeRun.heartbeat);
+      if (!ctx.shuttingDown) {
+        if (stepResult.kind !== 'failed' && onSuccess) {
+          // 先原子提交业务/工作流终态；提交失败时不能显示绿色成功卡。
+          await onSuccess(result.answer);
+        }
+      }
+
+      // 只有语义校验与控制器提交均成功后，才渲染最终颜色。
+      const cardStatus = stepResult.kind === 'blocked'
+        ? 'blocked' as const
+        : stepResult.kind === 'failed'
+          ? 'failed' as const
+          : 'success' as const;
+      const cardDetail = stepResult.kind === 'blocked'
+        ? (stepResult.reason || '任务阻塞，等待人工处理')
+        : stepResult.kind === 'failed'
+          ? (stepResult.reason || '步骤报告失败')
+          : '执行完成';
       const finalCard = buildTaskCard({
         title: cardTitle,
-        status: 'success',
-        detail: '执行完成',
+        status: cardStatus,
+        detail: cardDetail,
         progress: activeRun.tracker.snapshot(),
-        answer: result.answer,
+        answer: visibleAnswer,
         stats: result.stats,
         recipientOpenId: msg.senderOpenId,
+        ...(cardStatus === 'failed' && stepResult.reason
+          ? { technicalDetail: stepResult.reason }
+          : {}),
       });
       let cardDelivered = false;
       try {
@@ -333,42 +378,44 @@ export async function startCliTask(
           console.error(`[卡片] bot=${bot.id} 重试成功终态失败:`, safeErrorMessage(retryError));
         }
       }
+      const fallbackPrefix = cardStatus === 'blocked'
+        ? `⏸️ ${cardTitle} 已阻塞`
+        : cardStatus === 'failed'
+          ? `❌ ${cardTitle} 步骤失败`
+          : `✅ ${cardTitle} 执行完成`;
       if (!cardDelivered) {
-        for (const chunk of splitLongText(`✅ ${cardTitle} 执行完成\n\n${result.answer}`)) {
+        for (const chunk of splitLongText(`${fallbackPrefix}\n\n${visibleAnswer}`)) {
           await bot.reply(msg.messageId, chunk, hasThread).catch((error) => {
             console.error(`[卡片] bot=${bot.id} 文本兜底发送失败:`, safeErrorMessage(error));
             return undefined;
           });
         }
-      } else if (answerNeedsContinuation(result.answer)) {
-        for (const chunk of splitLongText(answerContinuation(result.answer))) {
+      } else if (answerNeedsContinuation(visibleAnswer)) {
+        for (const chunk of splitLongText(answerContinuation(visibleAnswer))) {
           await bot.reply(msg.messageId, chunk, hasThread).catch((error) => {
             console.error(`[卡片] bot=${bot.id} 长回答续发失败:`, safeErrorMessage(error));
             return undefined;
           });
         }
       }
-      console.log(`[CLI:${bot.id}/${adapter.id}] 完成 session_id=${result.sessionId ?? '(无)'}`);
-      // CLI 成功后仍保留运行登记，直到 onSuccess 工作流续跑完成；停机时才能等待跨存储状态写完。
-      // 快照会过滤 terminalStatus=success，因此这里落盘不会遗留一张误报中断的成功卡片。
+      activeRun.terminalStatus = cardStatus === 'failed' ? 'failed' : 'success';
       await flushPersistActiveRunsSafely(ctx);
-      try {
-        await markSessionIdle(ctx, session.id);
-      } catch (error) {
-        console.error('[会话] 保存空闲状态失败:', safeErrorMessage(error));
-      }
-      // 停机中禁止协作续跑，避免与收尾打架。
-      if (!ctx.shuttingDown && onSuccess) {
+      await markSessionIdle(ctx, session.id);
+      if (!ctx.shuttingDown && stepResult.kind === 'failed') {
+        // 先落失败卡并释放会话，再允许失败回调启动返工；否则旧任务可能把新任务写回 idle。
+        await reportFailure(new Error(stepResult.reason || '步骤报告 [RESULT:failed]'));
+      } else if (!ctx.shuttingDown && afterSuccess) {
+        // 下一任务已经越过本任务的提交边界。此处异常不得反向覆盖已经成功提交的终态；
+        // 续跑方应自行持久化恢复状态，服务重启也会继续拾取 ready 工作流。
         try {
-          await onSuccess(result.answer);
+          await afterSuccess(result.answer);
         } catch (error) {
-          const callbackError = new Error(safeErrorMessage(error));
-          console.error('[工作流] 成功后的续跑失败:', callbackError.message);
-          await reportFailure(callbackError);
-          await bot.reply(msg.messageId, `任务本身已完成，但后续工作流失败：${callbackError.message}`, hasThread)
-            .catch(() => undefined);
+          console.error('[任务] 成功后的续跑动作异常:', safeErrorMessage(error));
         }
       }
+      console.log(
+        `[CLI:${bot.id}/${adapter.id}] 完成 session_id=${result.sessionId ?? '(无)'} result=${stepResult.kind}`,
+      );
     })
     .catch(async (error) => {
       if (activeRun.heartbeat) clearInterval(activeRun.heartbeat);
@@ -400,16 +447,25 @@ export async function startCliTask(
         console.error(`[卡片] bot=${bot.id} 写入失败终态异常:`, safeErrorMessage(cardError));
         await bot.reply(msg.messageId, `❌ ${cardTitle} 执行失败：${message}`, hasThread).catch(() => undefined);
       }
+      // 失败回调可能立即把 runtime_audit 退回同一个 qa Bot 重跑；必须先释放旧会话，
+      // 否则续跑会把“会话仍 active”误判成永久工作流失败。finally 用所有权检查避免覆盖新任务。
+      await markSessionIdle(ctx, session.id).catch((stateError) => {
+        console.error('[会话] 释放失败任务会话异常:', safeErrorMessage(stateError));
+      });
       await reportFailure(safeError);
     })
     .finally(async () => {
       if (activeRun.heartbeat) clearInterval(activeRun.heartbeat);
-      if (ctx.activeRuns.get(session.id) === activeRun) ctx.activeRuns.delete(session.id);
+      const stillOwnsSession = ctx.activeRuns.get(session.id) === activeRun;
+      if (stillOwnsSession) ctx.activeRuns.delete(session.id);
       await flushPersistActiveRunsSafely(ctx);
-      try {
-        await markSessionIdle(ctx, session.id);
-      } catch (error) {
-        console.error('[会话] 保存空闲状态失败:', safeErrorMessage(error));
+      // onSuccess 可能已经让同一 Bot 启动下一步骤；旧任务不得把新任务的 active 状态覆盖成 idle。
+      if (stillOwnsSession) {
+        try {
+          await markSessionIdle(ctx, session.id);
+        } catch (error) {
+          console.error('[会话] 保存空闲状态失败:', safeErrorMessage(error));
+        }
       }
       resolveDone();
     })

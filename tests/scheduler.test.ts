@@ -11,6 +11,7 @@ import {
 } from '../src/core/schedule-store.js';
 import { JsonApprovalStore } from '../src/core/approval-store.js';
 import { JsonWorkflowStore } from '../src/core/workflow-store.js';
+import { DEFAULT_PIPELINE_STEPS } from '../src/core/pipeline.js';
 import type { AppContext } from '../src/runtime/app-context.js';
 import {
   finishApprovalExecution,
@@ -337,7 +338,15 @@ test('定时流水线按工作流真实终态结算并可跨重启修复', async
   }
 });
 
-test('定时团队流水线把运行轮次写入持久化工作流', async () => {
+test('定时团队流水线把运行轮次写入持久化工作流', async (t) => {
+  const projectRoot = await mkdtemp(join(tmpdir(), 'agent-os-scheduled-pipeline-'));
+  const previousAllowedRoots = process.env.AGENT_OS_ALLOWED_ROOTS;
+  process.env.AGENT_OS_ALLOWED_ROOTS = projectRoot;
+  t.after(() => rm(projectRoot, { recursive: true, force: true }));
+  t.after(() => {
+    if (previousAllowedRoots === undefined) delete process.env.AGENT_OS_ALLOWED_ROOTS;
+    else process.env.AGENT_OS_ALLOWED_ROOTS = previousAllowedRoots;
+  });
   let createdInput: Record<string, unknown> | undefined;
   const workflow = {
     id: '6b4ca8b5-b1f3-48e4-839f-9007ce250aa1',
@@ -350,6 +359,9 @@ test('定时团队流水线把运行轮次写入持久化工作流', async () =>
     priorOutputs: {},
     status: 'ready' as const,
     executionPolicy: 'standard' as const,
+    qualityPolicy: 'gated' as const,
+    projectRoot,
+    gateRuns: [],
     scheduleJobId: 'job-pipeline',
     scheduleRunCount: 3,
     message: message(),
@@ -370,10 +382,13 @@ test('定时团队流水线把运行轮次写入持久化工作流', async () =>
     name: 'CEO助手',
     reply: async () => { throw new Error('停止在工作流创建之后'); },
   };
+  const botsById = new Map<string, typeof ceo>();
+  for (const botId of ['ceo', 'pm', 'architect', 'dev', 'reviewer', 'qa']) botsById.set(botId, ceo);
   const ctx = {
     shuttingDown: false,
-    pipelineSteps: [{ id: 'summary', botId: 'ceo', title: '交付汇总' }],
-    botsById: new Map([['ceo', ceo]]),
+    pipelineSteps: DEFAULT_PIPELINE_STEPS,
+    botsById,
+    topics: { getWorkdir: () => projectRoot },
     workflows,
     schedules: { get: () => undefined },
   } as unknown as AppContext;

@@ -139,7 +139,11 @@ interface ConvertedBlock {
   block_id?: string;
   children?: string[];
   block_type: number;
-  table?: Record<string, unknown> & { merge_info?: unknown };
+  /** 飞书 Table 块；`property.merge_info` 为只读，写入前必须剔除。 */
+  table?: Record<string, unknown> & {
+    merge_info?: unknown;
+    property?: Record<string, unknown> & { merge_info?: unknown };
+  };
   [key: string]: unknown;
 }
 
@@ -177,6 +181,19 @@ function isRateLimited(value: unknown): boolean {
   return apiStatus(value) === 429 || directCode === 99991400 || responseCode === 99991400;
 }
 
+function formatFeishuError(label: string, error: unknown): Error {
+  const response = (error as { response?: { data?: { code?: unknown; msg?: unknown } } })?.response?.data;
+  const code = typeof response?.code === 'number' ? response.code : undefined;
+  const msg = typeof response?.msg === 'string' ? response.msg : undefined;
+  if (code !== undefined || msg) {
+    return Object.assign(
+      new Error(`${label}失败${code !== undefined ? `（${code}）` : ''}：${msg || (error as Error).message}`),
+      { code, cause: error },
+    );
+  }
+  return error instanceof Error ? error : new Error(`${label}失败：${String(error)}`);
+}
+
 async function withFeishuRetry<T>(label: string, operation: () => Promise<T>): Promise<T> {
   let lastError: unknown;
   for (let attempt = 0; attempt <= FEISHU_RETRY_DELAYS_MS.length; attempt += 1) {
@@ -193,8 +210,8 @@ async function withFeishuRetry<T>(label: string, operation: () => Promise<T>): P
       }
       return result;
     } catch (error) {
-      lastError = error;
-      if (!isRateLimited(error) || attempt === FEISHU_RETRY_DELAYS_MS.length) throw error;
+      lastError = formatFeishuError(label, error);
+      if (!isRateLimited(error) || attempt === FEISHU_RETRY_DELAYS_MS.length) throw lastError;
       await sleep(FEISHU_RETRY_DELAYS_MS[attempt]);
     }
   }
@@ -207,13 +224,46 @@ export function normalizeDocumentMarkdown(markdown: string): string {
     `[${alt.trim() || '图片'}](${target})`);
 }
 
-/** 移除转换接口返回的只读表格合并信息。 */
+/**
+ * 飞书文档 title 只支持纯文本（1～800 字）。
+ * 流水线常把用户多行目标塞进 Spec.title，含换行会触发 1770001 invalid param。
+ */
+export function sanitizeDocumentTitle(title: string, maxLength = 800): string {
+  const cleaned = title
+    .replace(/[\u0000-\u001F\u007F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const text = cleaned || '产品 Spec';
+  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
+}
+
+/**
+ * 移除转换接口返回的只读表格合并信息。
+ * 飞书文档明确：`merge_info` 在 `table.property` 下，创建嵌套块时传入会 1770001。
+ * 同时兼容错误挂在 `table.merge_info` 顶层的返回值。
+ */
 export function sanitizeConvertedBlocks(blocks: ConvertedBlock[]): ConvertedBlock[] {
   return blocks.map((block) => {
-    if (!block.table || !Object.prototype.hasOwnProperty.call(block.table, 'merge_info')) return block;
+    if (!block.table) return block;
     const table = { ...block.table };
-    delete table.merge_info;
-    return { ...block, table };
+    let changed = false;
+    if (Object.prototype.hasOwnProperty.call(table, 'merge_info')) {
+      delete table.merge_info;
+      changed = true;
+    }
+    const property = table.property;
+    if (
+      property
+      && typeof property === 'object'
+      && !Array.isArray(property)
+      && Object.prototype.hasOwnProperty.call(property, 'merge_info')
+    ) {
+      const nextProperty = { ...property };
+      delete nextProperty.merge_info;
+      table.property = nextProperty;
+      changed = true;
+    }
+    return changed ? { ...block, table } : block;
   });
 }
 
@@ -363,8 +413,19 @@ async function replaceDocumentMarkdown(client: Lark.Client, documentId: string, 
   }
 }
 
-function documentClientToken(operationToken: string, step: string): string {
-  return createHash('sha256').update(`${operationToken}\0${step}`).digest('hex');
+/**
+ * 飞书 client_token 需为 UUID 形态；64 位 hex 会直接 1770001 invalid param。
+ * 用哈希派生，保证同一步重试幂等。
+ */
+export function documentClientToken(operationToken: string, step: string): string {
+  const hex = createHash('sha256').update(`${operationToken}\0${step}`).digest('hex');
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    hex.slice(12, 16),
+    hex.slice(16, 20),
+    hex.slice(20, 32),
+  ].join('-');
 }
 
 /** 兼容 Headers / 普通对象取响应头。 */
@@ -493,9 +554,10 @@ export async function startBot(opts: BotOptions): Promise<Bot> {
     /** 创建飞书云文档，并把 Markdown 转换为文档块写入根节点。 */
     async createDocument(title, markdown) {
       if (!markdown.trim()) throw new Error('飞书云文档内容不能为空');
+      const safeTitle = sanitizeDocumentTitle(title);
       const batches = await convertDocumentMarkdown(client, markdown);
       const created = await withFeishuRetry('创建飞书云文档', () => client.docx.v1.document.create({
-        data: { title },
+        data: { title: safeTitle },
       }));
       const documentId = created.data?.document?.document_id;
       if (typeof documentId !== 'string' || !documentId) {

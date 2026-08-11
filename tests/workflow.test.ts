@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -12,7 +12,7 @@ import {
 import { JsonQuestionnaireStore, questionnaireMatchesContext } from '../src/core/questionnaire-store.js';
 import { JsonApprovalStore } from '../src/core/approval-store.js';
 import { JsonSpecStore } from '../src/core/spec-store.js';
-import { JsonWorkflowStore } from '../src/core/workflow-store.js';
+import { assertManualWorkflowRetryAllowed, JsonWorkflowStore } from '../src/core/workflow-store.js';
 import { CreatedDocumentWriteError, normalizeDocumentMarkdown, partitionConvertedBlocks } from '../src/im/lark.js';
 import {
   buildQuestionnaireCard,
@@ -22,9 +22,12 @@ import {
 } from '../src/im/workflow-card.js';
 import {
   confirmSpecForReview,
+  confirmSpecAndStartDelivery,
+  ensureCanonicalSpecSnapshotFile,
   reconcileWorkflowSpecStates,
   rejectSpecConfirmation,
   runDeliverySquad,
+  runTeamPipeline,
 } from '../src/runtime/pipeline-runner.js';
 import {
   approveSpecReview,
@@ -38,6 +41,20 @@ import {
 import { reconcileApprovalExecutions } from '../src/runtime/approval-status.js';
 import type { AppContext } from '../src/runtime/app-context.js';
 import { handleCardAction } from '../src/runtime/message-handler.js';
+
+test('手工工作流重试不能复用旧审批授权或重放定时轮次', () => {
+  assert.throws(
+    () => assertManualWorkflowRetryAllowed({ executionPolicy: 'approved', approvalId: 'approval', scheduleJobId: undefined }),
+    /不能用 \/workflow retry 复用旧授权/,
+  );
+  assert.throws(
+    () => assertManualWorkflowRetryAllowed({ executionPolicy: 'standard', approvalId: undefined, scheduleJobId: 'job' }),
+    /不能手工重放本轮/,
+  );
+  assert.doesNotThrow(() => assertManualWorkflowRetryAllowed({
+    executionPolicy: 'standard', approvalId: undefined, scheduleJobId: undefined,
+  }));
+});
 
 test('问卷带工作流作用域并可持久化答案', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agent-os-questionnaire-'));
@@ -458,7 +475,7 @@ test('问卷、Spec 确认和产品评审均使用飞书 form_submit', () => {
   const questionCard = buildQuestionnaireCard(questionnaire) as any;
   const questionForm = questionCard.body.elements.find((item: any) => item.tag === 'form');
   assert.ok(questionForm);
-  assert.equal(questionForm.elements.at(-1).action_type, 'form_submit');
+  assert.equal(questionForm.elements.at(-1).form_action_type, 'submit');
   assert.equal(
     questionForm.elements.at(-1).behaviors[0].value.questionnaireVersion,
     questionnaire.updatedAt,
@@ -471,7 +488,7 @@ test('问卷、Spec 确认和产品评审均使用飞书 form_submit', () => {
   const confirmationForm = confirmationCard.body.elements.find((item: any) => item.tag === 'form');
   assert.ok(confirmationForm);
   const confirmationButtons = confirmationForm.elements.filter((item: any) => item.tag === 'button');
-  assert.equal(confirmationButtons.every((item: any) => item.action_type === 'form_submit'), true);
+  assert.equal(confirmationButtons.every((item: any) => item.form_action_type === 'submit'), true);
   assert.equal(confirmationButtons.every((item: any) =>
     item.behaviors[0].value.specVersion === spec.updatedAt), true);
   const reviewCard = buildSpecReviewCard({ ...spec, status: 'in_review', docId: 'doc', docUrl: 'https://feishu.cn/docx/doc' }) as any;
@@ -545,6 +562,36 @@ test('旧版 Spec 卡片不能确认最新版方案', async () => {
   }
 });
 
+test('普通白名单不能代替负责人批准含风险接受条款的 Spec', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-spec-waiver-owner-'));
+  const previousOwner = process.env.OWNER_OPEN_ID;
+  const previousAllowed = process.env.AGENT_OS_ALLOWED_OPEN_IDS;
+  process.env.OWNER_OPEN_ID = 'ou_owner';
+  process.env.AGENT_OS_ALLOWED_OPEN_IDS = 'ou_helper';
+  try {
+    const specs = await JsonSpecStore.open(join(root, 'specs.json'));
+    const spec = await specs.create({
+      title: '登录风险',
+      content: '### RQ-001 登录\n[RISK_WAIVER] {"findingId":"FIND-1","owner":"ou_owner","reason":"兼容窗口","scope":"旧路由","compensatingControl":"监控","expiresAt":"2099-01-01T00:00:00.000Z"}',
+      chatId: 'oc', topicId: 'omt', messageId: 'om', ownerOpenId: 'ou_requester', botId: 'pm',
+    });
+    const response = await handleCardAction({ specs } as unknown as AppContext, {
+      operatorOpenId: 'ou_helper',
+      messageId: 'om-card',
+      value: { action: 'confirm_spec', specId: spec.id, specVersion: spec.updatedAt },
+      formValue: {},
+    });
+    assert.match(response.toast?.content ?? '', /只有指定负责人/);
+    assert.equal(specs.get(spec.id)?.status, 'pending_confirmation');
+  } finally {
+    if (previousOwner === undefined) delete process.env.OWNER_OPEN_ID;
+    else process.env.OWNER_OPEN_ID = previousOwner;
+    if (previousAllowed === undefined) delete process.env.AGENT_OS_ALLOWED_OPEN_IDS;
+    else process.env.AGENT_OS_ALLOWED_OPEN_IDS = previousAllowed;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('PM 在澄清完成后输出可执行 Spec，退回后输出修订版', () => {
   const pm = DEFAULT_PIPELINE_STEPS[0];
   const clarified = buildPipelineStepPrompt(pm, '登录', { clarification: '- 登录方式：验证码' });
@@ -578,6 +625,132 @@ test('工作流支持在云文档评审节点暂停', async () => {
   }
 });
 
+test('确认方案并直接开始技术交付，跳过飞书文档发布', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-spec-start-direct-'));
+  try {
+    const workflows = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const specs = await JsonSpecStore.open(join(root, 'specs.json'));
+    const workflow = await workflows.create({
+      kind: 'team', name: '团队交付流水线', initiatorBotId: 'ceo', goal: '登录', stepIds: ['pm'],
+      message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt', senderOpenId: 'ou' },
+    });
+    const spec = await specs.create({
+      title: '登录', content: '### RQ-001 登录\n可执行 Spec', chatId: 'oc', topicId: 'omt', messageId: 'om',
+      ownerOpenId: 'ou', botId: 'pm', workflowId: workflow.id,
+    });
+    await workflows.update(workflow.id, {
+      status: 'awaiting_spec_confirmation', nextStepIndex: 1, specId: spec.id,
+    });
+    const ctx = {
+      workflows,
+      specs,
+      botsById: new Map([['ceo', { reply: async () => 'card' }]]),
+    } as unknown as AppContext;
+    await confirmSpecAndStartDelivery(ctx, spec.id);
+    assert.equal(specs.get(spec.id)?.status, 'approved');
+    assert.equal(specs.get(spec.id)?.canonical, true);
+    assert.equal(workflows.get(workflow.id)?.status, 'completed');
+    assert.match(workflows.get(workflow.id)?.priorOutputs.pm ?? '', /可执行 Spec/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('含风险接受条款的 Spec 不能从截断确认卡直接批准', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-spec-waiver-full-review-'));
+  try {
+    const workflows = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const specs = await JsonSpecStore.open(join(root, 'specs.json'));
+    const workflow = await workflows.create({
+      kind: 'team', name: '团队交付流水线', initiatorBotId: 'ceo', goal: '登录', stepIds: ['pm'],
+      message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt', senderOpenId: 'ou' },
+    });
+    const waiver = {
+      findingId: 'FIND-001',
+      owner: '负责人',
+      reason: '兼容窗口',
+      scope: '仅旧登录路由',
+      compensatingControl: '监控并保留回滚开关',
+      expiresAt: '2099-01-01T00:00:00.000Z',
+    };
+    const spec = await specs.create({
+      title: '登录',
+      content: `### RQ-001 登录\n${'正文'.repeat(3_000)}\n[RISK_WAIVER] ${JSON.stringify(waiver)}`,
+      chatId: 'oc', topicId: 'omt', messageId: 'om', ownerOpenId: 'ou', botId: 'pm', workflowId: workflow.id,
+    });
+    await workflows.update(workflow.id, {
+      status: 'awaiting_spec_confirmation', nextStepIndex: 1, specId: spec.id,
+    });
+    const ctx = { workflows, specs, botsById: new Map() } as unknown as AppContext;
+    await assert.rejects(
+      confirmSpecAndStartDelivery(ctx, spec.id),
+      /必须发布到飞书云文档完成全文评审/,
+    );
+    assert.equal(specs.get(spec.id)?.status, 'pending_confirmation');
+    assert.equal(workflows.get(workflow.id)?.status, 'awaiting_spec_confirmation');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('缺少稳定需求 ID 的 Spec 不能越过人工确认直接进入技术交付', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-spec-missing-requirement-id-'));
+  try {
+    const workflows = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const specs = await JsonSpecStore.open(join(root, 'specs.json'));
+    const workflow = await workflows.create({
+      kind: 'team', name: '团队交付流水线', initiatorBotId: 'ceo', goal: '登录', stepIds: ['pm'],
+      message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt', senderOpenId: 'ou' },
+    });
+    const spec = await specs.create({
+      title: '登录', content: '这里仅举例请使用 RQ-001，但没有需求条目',
+      chatId: 'oc', topicId: 'omt', messageId: 'om', ownerOpenId: 'ou', botId: 'pm', workflowId: workflow.id,
+    });
+    await workflows.update(workflow.id, {
+      status: 'awaiting_spec_confirmation', nextStepIndex: 1, specId: spec.id,
+    });
+    await assert.rejects(
+      confirmSpecAndStartDelivery({ workflows, specs } as AppContext, spec.id),
+      /缺少以条目开头声明的稳定需求 ID/,
+    );
+    assert.equal(specs.get(spec.id)?.status, 'pending_confirmation');
+    assert.equal(workflows.get(workflow.id)?.status, 'awaiting_spec_confirmation');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('已确认但未发布的 Spec 可跳过云文档直接进入技术交付', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-spec-start-confirmed-'));
+  try {
+    const workflows = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const specs = await JsonSpecStore.open(join(root, 'specs.json'));
+    const workflow = await workflows.create({
+      kind: 'team', name: '团队交付流水线', initiatorBotId: 'ceo', goal: '登录', stepIds: ['pm'],
+      message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt', senderOpenId: 'ou' },
+    });
+    const spec = await specs.create({
+      title: '登录', content: '### RQ-001 登录\n可执行 Spec', chatId: 'oc', topicId: 'omt', messageId: 'om',
+      ownerOpenId: 'ou', botId: 'pm', workflowId: workflow.id,
+    });
+    await workflows.update(workflow.id, {
+      status: 'awaiting_doc_review', nextStepIndex: 1, specId: spec.id,
+    });
+    await specs.update(spec.id, { status: 'confirmed' });
+    const ctx = {
+      workflows,
+      specs,
+      botsById: new Map([['ceo', { reply: async () => 'card' }]]),
+    } as unknown as AppContext;
+    await confirmSpecAndStartDelivery(ctx, spec.id);
+    assert.equal(specs.get(spec.id)?.status, 'approved');
+    assert.equal(specs.get(spec.id)?.canonical, true);
+    assert.equal(workflows.get(workflow.id)?.status, 'completed');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('方案确认与退回并发时只能有一个状态生效', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agent-os-spec-confirm-race-'));
   try {
@@ -588,7 +761,7 @@ test('方案确认与退回并发时只能有一个状态生效', async () => {
       message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt', senderOpenId: 'ou' },
     });
     const spec = await specs.create({
-      title: '登录', content: '可执行 Spec', chatId: 'oc', topicId: 'omt', messageId: 'om',
+      title: '登录', content: '### RQ-001 登录\n可执行 Spec', chatId: 'oc', topicId: 'omt', messageId: 'om',
       ownerOpenId: 'ou', botId: 'pm', workflowId: workflow.id,
     });
     await workflows.update(workflow.id, {
@@ -639,6 +812,104 @@ test('方案退回意见持久化并可在中断后恢复工作流', async () =>
   }
 });
 
+test('重启会补齐已批准 Spec 的 canonical 切换并直接恢复技术交付', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-approved-spec-reconcile-'));
+  try {
+    const workflows = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const specs = await JsonSpecStore.open(join(root, 'specs.json'));
+    const workflow = await workflows.create({
+      kind: 'team', name: '团队交付流水线', initiatorBotId: 'ceo', goal: '登录', stepIds: ['pm'],
+      message: { messageId: 'om-approved', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt', senderOpenId: 'ou' },
+    });
+    const spec = await specs.create({
+      title: '登录', content: '### RQ-001 登录\n验收：成功进入首页',
+      chatId: 'oc', topicId: 'omt', messageId: 'om-approved', ownerOpenId: 'ou', botId: 'pm', workflowId: workflow.id,
+    });
+    await specs.update(spec.id, { status: 'approved' });
+    await workflows.update(workflow.id, {
+      status: 'awaiting_spec_confirmation', nextStepIndex: 1, specId: spec.id,
+    });
+
+    await reconcileWorkflowSpecStates({ workflows, specs } as AppContext);
+
+    assert.equal(specs.get(spec.id)?.canonical, true);
+    assert.equal(workflows.get(workflow.id)?.status, 'ready');
+    assert.equal(workflows.get(workflow.id)?.priorOutputs.pm, '### RQ-001 登录\n验收：成功进入首页');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('坏 Spec 只会隔离对应工作流，不会阻断其他工作流恢复', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-spec-reconcile-isolation-'));
+  try {
+    const workflows = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const specs = await JsonSpecStore.open(join(root, 'specs.json'));
+    const message = {
+      messageId: 'om-reconcile', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt', senderOpenId: 'ou',
+    };
+    const invalidWorkflow = await workflows.create({
+      kind: 'team', name: '坏规格', initiatorBotId: 'ceo', goal: '旧需求', stepIds: ['pm'], message,
+    });
+    const invalidSpec = await specs.create({
+      title: '旧规格', content: '没有稳定需求编号', chatId: 'oc', topicId: 'omt',
+      messageId: 'om-reconcile', ownerOpenId: 'ou', botId: 'pm', workflowId: invalidWorkflow.id,
+    });
+    await specs.update(invalidSpec.id, { status: 'approved' });
+    await workflows.update(invalidWorkflow.id, {
+      status: 'awaiting_spec_confirmation', nextStepIndex: 1, specId: invalidSpec.id,
+    });
+
+    const validWorkflow = await workflows.create({
+      kind: 'team', name: '健康规格', initiatorBotId: 'ceo', goal: '新需求', stepIds: ['pm'],
+      message: { ...message, messageId: 'om-reconcile-valid' },
+    });
+    const validSpec = await specs.create({
+      title: '新规格', content: '### RQ-001 登录\n验收：成功进入首页', chatId: 'oc', topicId: 'omt',
+      messageId: 'om-reconcile-valid', ownerOpenId: 'ou', botId: 'pm', workflowId: validWorkflow.id,
+    });
+    await specs.update(validSpec.id, { status: 'approved' });
+    await workflows.update(validWorkflow.id, {
+      status: 'awaiting_spec_confirmation', nextStepIndex: 1, specId: validSpec.id,
+    });
+
+    await reconcileWorkflowSpecStates({ workflows, specs, botsById: new Map() } as AppContext);
+
+    assert.equal(workflows.get(invalidWorkflow.id)?.status, 'failed');
+    assert.match(workflows.get(invalidWorkflow.id)?.error ?? '', /缺少.*稳定需求 ID/);
+    assert.equal(workflows.get(validWorkflow.id)?.status, 'ready');
+    assert.equal(specs.get(validSpec.id)?.canonical, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('canonical Spec 快照保留完整正文并拒绝被 Agent 改写', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-canonical-spec-snapshot-'));
+  try {
+    const specs = await JsonSpecStore.open(join(root, 'specs.json'));
+    const content = `### RQ-001 长规格\n${'完整要求'.repeat(8_000)}`;
+    const created = await specs.create({
+      title: '长规格', content, projectId: root,
+      chatId: 'oc', topicId: 'omt', messageId: 'om', ownerOpenId: 'ou', botId: 'pm',
+    });
+    await specs.update(created.id, { status: 'approved' });
+    const canonical = await specs.markCanonical(created.id);
+
+    const reference = await ensureCanonicalSpecSnapshotFile(root, canonical);
+    assert.equal(await readFile(reference.path, 'utf8'), content);
+    assert.equal(reference.sha256, canonical.contentHash);
+
+    await writeFile(reference.path, 'tampered');
+    await assert.rejects(
+      ensureCanonicalSpecSnapshotFile(root, canonical),
+      /被改写或已过期/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('同一工作流步骤只能被一个并发执行者认领', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agent-os-workflow-claim-'));
   try {
@@ -655,9 +926,53 @@ test('同一工作流步骤只能被一个并发执行者认领', async () => {
   }
 });
 
+test('同一项目只能原子激活一条技术交付，避免跨话题代码与证据污染', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-project-lease-'));
+  try {
+    const store = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const stepIds = DEFAULT_PIPELINE_STEPS.map((step) => step.id);
+    const message = {
+      messageId: 'om-lease-a', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt-a', senderOpenId: 'ou',
+    };
+    const first = await store.create({
+      kind: 'team', name: '交付 A', initiatorBotId: 'ceo', goal: 'A', stepIds,
+      qualityPolicy: 'gated', projectRoot: '/project/shared', message,
+    });
+    const second = await store.create({
+      kind: 'team', name: '交付 B', initiatorBotId: 'ceo', goal: 'B', stepIds,
+      qualityPolicy: 'gated', projectRoot: '/project/shared',
+      message: { ...message, messageId: 'om-lease-b', threadId: 'omt-b' },
+    });
+    await store.update(first.id, { status: 'awaiting_spec_confirmation', nextStepIndex: 1 });
+    await store.update(second.id, { status: 'awaiting_doc_review', nextStepIndex: 1 });
+
+    const callbacks: string[] = [];
+    const activations = await Promise.allSettled([
+      store.activateTechnicalDelivery(first.id, 'awaiting_spec_confirmation', {}, async () => {
+        callbacks.push(first.id);
+      }),
+      store.activateTechnicalDelivery(second.id, 'awaiting_doc_review', {}, async () => {
+        callbacks.push(second.id);
+      }),
+    ]);
+
+    assert.equal(activations.filter((result) => result.status === 'fulfilled').length, 1);
+    assert.equal(activations.filter((result) => result.status === 'rejected').length, 1);
+    const rejected = activations.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+    assert.match(String(rejected?.reason), /已有技术交付工作流/);
+    assert.equal(callbacks.length, 1);
+    assert.equal([store.get(first.id), store.get(second.id)].filter((item) => item?.status === 'ready').length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('内部交付小队固定完整角色且不会被流水线配置裁剪', async () => {
-  assert.deepEqual(DELIVERY_SQUAD_STEPS.map((step) => step.id), ['architect', 'dev', 'review', 'qa']);
-  assert.deepEqual(parsePipelineSteps('dev,dev,unknown,review,qa').map((step) => step.id), ['dev', 'review', 'qa']);
+  assert.deepEqual(DELIVERY_SQUAD_STEPS.map((step) => step.id), [
+    'architect', 'dev', 'review', 'qa', 'runtime_audit', 'final_review',
+  ]);
+  assert.throws(() => parsePipelineSteps('dev,dev,unknown,review,qa'), /未知步骤|重复步骤/);
+  assert.deepEqual(parsePipelineSteps(undefined), DEFAULT_PIPELINE_STEPS);
   const dev = { id: 'dev' } as any;
   await assert.rejects(
     () => runDeliverySquad({
@@ -670,6 +985,29 @@ test('内部交付小队固定完整角色且不会被流水线配置裁剪', as
       goal: '修复登录问题',
     }),
     /缺少已连接角色：architect、reviewer、qa/,
+  );
+});
+
+test('门禁流水线不从目标文本或 Bot 默认目录隐式绑定项目', async () => {
+  const ceo = { id: 'ceo', name: 'CEO', workdir: '/tmp/implicit-project' } as any;
+  const botsById = new Map<string, any>();
+  for (const id of ['ceo', 'pm', 'architect', 'dev', 'reviewer', 'qa']) botsById.set(id, ceo);
+  const ctx = {
+    shuttingDown: false,
+    pipelineSteps: DEFAULT_PIPELINE_STEPS,
+    botsById,
+    topics: { getWorkdir: () => undefined },
+  } as AppContext;
+  await assert.rejects(
+    () => runTeamPipeline(ctx, {
+      ceo,
+      msg: {
+        messageId: 'om', topicId: 'omt', chatId: 'oc', chatType: 'group', rootId: '', threadId: '',
+        senderOpenId: 'ou', messageType: 'text', text: '', senderType: 'user', mentions: [], rawContent: '{}',
+      },
+      goal: '优化 /tmp/implicit-project 的代码',
+    }),
+    /必须先绑定真实项目目录/,
   );
 });
 
@@ -741,12 +1079,21 @@ test('飞书 Markdown 转换保留图片链接并按完整子树分批', () => {
     'root-2',
   ], [
     { block_id: 'root-1', block_type: 3, children: ['child-1'] },
-    { block_id: 'child-1', block_type: 31, table: { merge_info: [{ row_span: 2 }] } },
+    {
+      block_id: 'child-1',
+      block_type: 31,
+      table: {
+        merge_info: [{ row_span: 2 }],
+        property: { row_size: 1, column_size: 1, merge_info: [{ row_span: 1, col_span: 1 }] },
+      },
+    },
     { block_id: 'root-2', block_type: 2 },
   ], 2);
   assert.equal(batches.length, 2);
   assert.deepEqual(batches.map((batch) => batch.childrenIds), [['root-1'], ['root-2']]);
-  assert.equal(Object.hasOwn(batches[0].blocks[1].table ?? {}, 'merge_info'), false);
+  const table = batches[0].blocks[1].table ?? {};
+  assert.equal(Object.hasOwn(table, 'merge_info'), false);
+  assert.equal(Object.hasOwn((table.property as object) ?? {}, 'merge_info'), false);
 });
 
 test('Spec 修订发布覆盖原云文档且不创建新链接', async () => {
@@ -890,7 +1237,7 @@ test('产品评审通过后恢复内部交付工作流', async () => {
     });
     const spec = await specs.create({
       title: '登录',
-      content: '最终 Spec',
+      content: '### RQ-001 登录\n最终 Spec',
       chatId: 'oc',
       topicId: 'omt',
       messageId: 'om',
@@ -917,7 +1264,7 @@ test('产品评审通过后恢复内部交付工作流', async () => {
     } as AppContext, spec.id);
     assert.equal(approved.status, 'approved');
     assert.equal(workflows.get(workflow.id)?.status, 'completed');
-    assert.equal(workflows.get(workflow.id)?.priorOutputs.pm, '最终 Spec');
+    assert.equal(workflows.get(workflow.id)?.priorOutputs.pm, '### RQ-001 登录\n最终 Spec');
     assert.match(replies[0], /全部完成/);
   } finally {
     await rm(root, { recursive: true, force: true });

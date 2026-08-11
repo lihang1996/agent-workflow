@@ -8,7 +8,12 @@ import { SessionManager, type Session } from '../src/core/session-manager.js';
 import { JsonSessionStore, type SessionStore } from '../src/core/session-store.js';
 import { JsonTopicStore } from '../src/core/topic-store.js';
 import type { AppContext } from '../src/runtime/app-context.js';
-import { persistActiveRuns, reconcileOrphanedCards, shutdownActiveRuns } from '../src/runtime/active-runs.js';
+import {
+  persistActiveRuns,
+  reconcileOrphanedCards,
+  shutdownActiveRuns,
+  snapshotActiveRuns,
+} from '../src/runtime/active-runs.js';
 import { ensureRunnableSession } from '../src/runtime/sessions.js';
 import { handleMessage } from '../src/runtime/message-handler.js';
 import type { Bot, IncomingMessage } from '../src/im/lark.js';
@@ -202,14 +207,13 @@ test('遗留任务卡刷新失败时保留快照供下次重试', async () => {
   }
 });
 
-test('停机收尾会等待成功任务的工作流续跑完成', async () => {
+test('停机收尾等待终态任务续跑，但不会把失败终态重绘为取消', async () => {
   let resolveDone = () => {};
   const done = new Promise<void>((resolve) => { resolveDone = resolve; });
-  const activeRuns = new Map([['session-success', {
-    terminalStatus: 'success' as const,
-    done,
-    resolveDone,
-  }]]);
+  const activeRuns = new Map([
+    ['session-success', { terminalStatus: 'success' as const, done, resolveDone }],
+    ['session-failed', { terminalStatus: 'failed' as const, done, resolveDone }],
+  ]);
   const ctx = {
     shuttingDown: false,
     activeRuns,
@@ -217,6 +221,7 @@ test('停机收尾会等待成功任务的工作流续跑完成', async () => {
     sessions: new SessionManager(),
     activeRunStore: { clear: async () => undefined },
   } as unknown as AppContext;
+  assert.deepEqual(snapshotActiveRuns(ctx), []);
   let settled = false;
   const shutdown = shutdownActiveRuns(ctx, '测试停机').then(() => { settled = true; });
 

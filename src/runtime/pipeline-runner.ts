@@ -1,15 +1,55 @@
+import { lstat, mkdir, readFile, realpath, rename, unlink, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
+import { fileURLToPath } from 'node:url';
 import {
   DEFAULT_PIPELINE_STEPS,
   DELIVERY_SQUAD_STEPS,
   buildPipelineStepPrompt,
-  filterRunnableSteps,
   missingBotIdsForSteps,
   type PipelineStep,
 } from '../core/pipeline.js';
+import {
+  assertEvidenceChainComplete,
+  assertFindingContinuity,
+  assertGateWaiversBoundToCanonicalSpec,
+  assertGateAttemptBudget,
+  assertGateChecksBelongToAttempt,
+  assertGateLineage,
+  assertOutstandingFindingsCarriedForward,
+  assertPlannedFindingsClosed,
+  buildEvidenceChainManifest,
+  bindGateWaiversToCanonicalSpec,
+  createGateRun,
+  consolidateLatestGateFindings,
+  FingerprintDriftError,
+  gateIdForStep,
+  isFingerprintDriftError,
+  latestGateRuns,
+  parseGateResult,
+  parseCanonicalSpecWaivers,
+  rewindStepIdFromDriftMessage,
+  validateGatePass,
+  verifyGateArtifacts,
+  type CanonicalSpecWaiverContext,
+  type GateRun,
+} from '../core/quality-gates.js';
+import { compactAgentOutput } from '../core/agent-output.js';
+import { fingerprintProject } from '../core/project-snapshot.js';
+import { extractRequirementIds } from '../core/requirement-ids.js';
 import type { DeliveryWorkflow } from '../core/workflow-store.js';
 import type { ProductSpec } from '../core/spec-store.js';
 import { redactSecrets, sanitizeErrorForLog, sanitizeForLog } from '../core/log-inspection.js';
-import { buildQuestionnaireCard, buildSpecConfirmationCard } from '../im/workflow-card.js';
+import {
+  extractAbsolutePathCandidates,
+  handoffStepIdFromQualityMessage,
+  hasExplicitStepResult,
+  parseStepResult,
+  resolveQualityHandoffTarget,
+} from '../core/step-result.js';
+import { assertWorkdir } from '../core/workdir.js';
+import { buildQuestionnaireCard, buildSpecConfirmationCard, buildStepBlockedCard } from '../im/workflow-card.js';
 import type { Bot, IncomingMessage } from '../im/lark.js';
 import type { AppContext } from './app-context.js';
 import { runCollabReview } from './collab-runner.js';
@@ -29,6 +69,13 @@ interface WorkflowStepExpectation {
   stepIndex: number;
   stepId: PipelineStep['id'];
 }
+
+const FINGERPRINT_SCRIPT_PATH = fileURLToPath(
+  new URL('../../scripts/fingerprint-project.mjs', import.meta.url),
+);
+const HASH_PATH_SCRIPT_PATH = fileURLToPath(
+  new URL('../../scripts/hash-path.mjs', import.meta.url),
+);
 
 /** CEO 团队交付流水线：按步骤串联各角色，关键人工节点会持久化暂停。 */
 export async function runTeamPipeline(
@@ -98,22 +145,61 @@ async function createAndStartWorkflow(
   if ((scheduleJobId && !scheduleRunCount) || (!scheduleJobId && scheduleRunCount)) {
     throw new Error('定时工作流缺少完整的任务编号或运行轮次。');
   }
-  const steps = filterRunnableSteps(requestedSteps, new Set(ctx.botsById.keys()));
-  if (steps.length === 0) throw new Error('没有可执行的流水线步骤，请检查 Bot 配置');
+  const missingBotIds = missingBotIdsForSteps(requestedSteps, new Set(ctx.botsById.keys()));
+  if (missingBotIds.length > 0) {
+    throw new Error('交付流水线缺少已连接角色：' + missingBotIds.join('、'));
+  }
+  const steps = requestedSteps;
+  const topicId = topicIdOf(msg);
+  const configuredWorkdir = ctx.topics.getWorkdir(msg.chatId, topicId);
+  if (!configuredWorkdir) {
+    throw new Error('门禁交付必须先绑定真实项目目录：请使用 /workdir <绝对路径> 后重试。');
+  }
+  const projectRoot = await assertWorkdir(configuredWorkdir);
 
-  const workflow = await ctx.workflows.create({
+  const canonicalSpec = kind === 'squad' ? ctx.specs.findCanonical(projectRoot) : undefined;
+  if (kind === 'squad' && (!canonicalSpec || canonicalSpec.status !== 'approved')) {
+    throw new Error('内部交付小队需要当前项目已批准的 canonical Spec；请先由 CEO 完成需求与产品评审。');
+  }
+  if (canonicalSpec) assertSpecRequirementIds(canonicalSpec);
+
+  let workflow = await ctx.workflows.create({
     kind,
     name,
     initiatorBotId: initiator.id,
     goal,
     stepIds: steps.map((step) => step.id),
     executionPolicy,
+    qualityPolicy: 'gated',
+    projectRoot,
+    specId: canonicalSpec?.id,
     approvalId,
     approvalAttempt,
     scheduleJobId,
     scheduleRunCount,
     message: storedMessage(msg),
   });
+  if (canonicalSpec && Object.keys(workflow.priorOutputs).length === 0) {
+    workflow = await ctx.workflows.update(workflow.id, {
+      priorOutputs: {
+        pm: canonicalSpec.content,
+        canonical_spec: JSON.stringify({
+          id: canonicalSpec.id,
+          version: canonicalSpec.version,
+          sha256: canonicalSpec.contentHash,
+        }),
+      },
+    });
+  }
+  try {
+    await prepareEvidenceRoot(workflow);
+  } catch (error) {
+    await ctx.workflows.update(workflow.id, {
+      status: 'failed',
+      error: `创建门禁证据目录失败：${persistentErrorMessage(error, 2_000)}`,
+    });
+    throw error;
+  }
   if (approvalId && approvalAttempt) {
     try {
       await ctx.approvals.attachWorkflow(approvalId, approvalAttempt, workflow.id);
@@ -127,9 +213,17 @@ async function createAndStartWorkflow(
   }
   console.log(`[${name}] workflow=${workflow.id} 目标=${truncate(sanitizeForLog(goal, 120), 60)} 步骤=${workflow.stepIds.join(' → ')}`);
   try {
+    const boundWorkdir = workflow.projectRoot;
     await initiator.reply(
       msg.messageId,
-      [`已启动${name}。`, `目标：${goal}`, `步骤：${steps.map((s, i) => `${i + 1}.${s.title}`).join(' → ')}`].join('\n'),
+      [
+        `已启动${name}。`,
+        `目标：${goal}`,
+        `步骤：${steps.map((s, i) => `${i + 1}.${s.title}`).join(' → ')}`,
+        boundWorkdir
+          ? `话题目录：${boundWorkdir}`
+          : '话题目录：未绑定',
+      ].join('\n'),
       hasThread(msg),
     );
     await continueDeliveryWorkflow(ctx, workflow.id);
@@ -142,22 +236,96 @@ async function createAndStartWorkflow(
 /** 从持久化状态执行一个步骤；异步 CLI 完成后由回调推进下一步。 */
 export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: string): Promise<void> {
   if (ctx.shuttingDown) return;
-  const workflow = await ctx.workflows.claimReady(workflowId);
-  if (!workflow) return;
-  const msg = messageForWorkflow(ctx, workflow);
-  const initiator = ctx.botsById.get(workflow.initiatorBotId);
+  let claimedWorkflow: DeliveryWorkflow | undefined;
   try {
+    const workflow = await ctx.workflows.claimReady(workflowId);
+    if (!workflow) return;
+    claimedWorkflow = workflow;
+    const msg = messageForWorkflow(ctx, workflow);
+    const initiator = ctx.botsById.get(workflow.initiatorBotId);
     if (!initiator) throw new Error(`发起 Bot 未连接：${workflow.initiatorBotId}`);
+    if (workflow.qualityPolicy === 'gated') {
+      const bound = ctx.topics.getWorkdir(msg.chatId, topicIdOf(msg));
+      if (!bound || bound !== workflow.projectRoot) {
+        throw new Error('工作流执行期间项目目录发生变化；为防止跨项目证据污染，请按新目录重新发起交付。');
+      }
+      if (workflow.stepIds[workflow.nextStepIndex] !== 'pm') assertCanonicalWorkflowSpec(ctx, workflow);
+    }
     const steps = stepsFor(workflow);
     if (workflow.nextStepIndex >= steps.length) {
+      let completionDisposition: DeliveryWorkflow['completionDisposition'] = 'clean';
+      let completionDetail = '';
+      if (workflow.qualityPolicy === 'gated') {
+        if (!workflow.projectRoot) throw new Error('门禁工作流缺少项目根目录');
+        const snapshot = await fingerprintProject(workflow.projectRoot);
+        await assertControllerEvidenceChainUnmodified(workflow, snapshot.fingerprint);
+        // 只校验各 gate 最新一次结果：历史 attempt 引用的同名证据文件常被后续轮次覆盖，
+        // 用旧 hash 去对当前磁盘会误报「artifact hash 不匹配」。
+        const latest = latestGateRuns(workflow.gateRuns);
+        const canonicalSpec = assertCanonicalWorkflowSpec(ctx, workflow);
+        const waiverContext = canonicalSpecWaiverContext(canonicalSpec);
+        await verifyCanonicalSpecSnapshotFile(evidenceRootFor(workflow), canonicalSpec);
+        for (const run of latest.values()) {
+          await verifyGateArtifacts(evidenceRootFor(workflow), run.result, {
+            projectRoot: workflow.projectRoot,
+          });
+          if (!run.projectFingerprint) throw new Error(`门禁 ${run.gateId} 缺少项目 fingerprint`);
+          const runIndex = workflow.gateRuns.findIndex((candidate) => candidate.id === run.id);
+          await assertGateLineage(run.stepId as PipelineStep['id'], run.result, {
+            canonicalSpecHash: canonicalSpec.contentHash!,
+            canonicalRequirementIds: extractRequirementIds(canonicalSpec.content),
+            projectFingerprint: run.projectFingerprint,
+            stepStartFingerprint: run.stepStartFingerprint,
+            previousRuns: runIndex >= 0 ? workflow.gateRuns.slice(0, runIndex) : [],
+          });
+          assertFindingContinuity(
+            runIndex >= 0 ? workflow.gateRuns.slice(0, runIndex) : [],
+            run.result,
+          );
+          assertGateWaiversBoundToCanonicalSpec(run.result, waiverContext);
+          validateGatePass(run.stepId as PipelineStep['id'], run.result);
+        }
+        const implementation = latest.get('implementation');
+        if (implementation) {
+          assertPlannedFindingsClosed('dev', workflow.gateRuns, implementation.result);
+        }
+        const finalReview = latest.get('final-review');
+        if (finalReview) {
+          assertOutstandingFindingsCarriedForward(workflow.gateRuns, finalReview.result);
+        }
+        assertEvidenceChainComplete(workflow.stepIds, workflow.gateRuns, snapshot.fingerprint);
+        const findings = consolidateLatestGateFindings(workflow.gateRuns);
+        const waivedIds = findings
+          .filter((finding) => finding.status === 'waived')
+          .map((finding) => finding.id);
+        const openResidualIds = findings
+          .filter((finding) => finding.status === 'open'
+            && (finding.severity === 'P2' || finding.severity === 'P3'))
+          .map((finding) => finding.id);
+        const optionalGapIds = [...latest.values()].flatMap((run) => run.result.checks
+          .filter((check) => !check.required && check.status !== 'pass')
+          .map((check) => `${run.gateId}/${check.id}`));
+        if (waivedIds.length > 0 || openResidualIds.length > 0 || optionalGapIds.length > 0) {
+          completionDisposition = 'conditional';
+          completionDetail = [
+            waivedIds.length > 0 ? `${waivedIds.length} 项有效 waiver` : '',
+            openResidualIds.length > 0 ? `${openResidualIds.length} 项开放 P2/P3` : '',
+            optionalGapIds.length > 0 ? `${optionalGapIds.length} 项可选检查未完成` : '',
+          ].filter(Boolean).join('、');
+        }
+      }
       const completed = await ctx.workflows.updateIfStatus(workflow.id, 'executing', {
         status: 'completed',
+        completionDisposition,
         error: undefined,
       });
       if (!completed) return;
       await settleWorkflowApproval(ctx, completed, 'succeeded');
       await settleWorkflowSchedule(ctx, completed, 'succeeded');
-      await initiator.reply(msg.messageId, `${workflow.name}已全部完成。`, hasThread(msg)).catch((error) => {
+      const completionMessage = completionDisposition === 'conditional'
+        ? `${workflow.name}已在披露残余风险的前提下有条件完成（${completionDetail}），请以最终汇总中的风险清单为准。`
+        : `${workflow.name}已全部完成，未发现开放 finding、waiver 或未完成检查。`;
+      await initiator.reply(msg.messageId, completionMessage, hasThread(msg)).catch((error) => {
         console.error(`[${workflow.name}] 完成通知发送失败:`, sanitizeErrorForLog(error));
       });
       return;
@@ -166,16 +334,74 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
     const stepIndex = workflow.nextStepIndex;
     const step = steps[stepIndex];
     const stepLabel = `步骤 ${stepIndex + 1}/${steps.length} · ${step.title}`;
+    if (workflow.qualityPolicy === 'gated') {
+      assertGateAttemptBudget(step.id, workflow.gateRuns);
+    }
+    if (workflow.qualityPolicy === 'gated' && step.id === 'final_review') {
+      await writeControllerEvidenceChain(ctx, workflow);
+    }
     if (step.id === 'review') {
+      const promptOutputs = await priorOutputsForPrompt(ctx, workflow);
+      let reviewCompletion: { gateRun: GateRun; projectFingerprint: string } | undefined;
+      let fixStepStartFingerprint: string | undefined;
       await initiator.reply(msg.messageId, `${stepLabel}：启动评审协作。`, hasThread(msg));
       await runCollabReview(ctx, {
         initiator,
         msg,
-        task: buildPipelineStepPrompt(step, workflow.goal, workflow.priorOutputs),
+        task: buildPipelineStepPrompt(step, workflow.goal, promptOutputs),
         round: 1,
         executionPolicy: workflow.executionPolicy,
         approvedScope: workflow.executionPolicy === 'approved' ? workflow.goal : undefined,
+        resultProtocol: workflow.qualityPolicy === 'gated',
         stateKey: `workflow:${workflow.id}`,
+        fixInstruction: workflow.qualityPolicy === 'gated'
+          ? async () => {
+            const currentWorkflow = requireWorkflow(ctx, workflow.id);
+            const fixOutputs = await priorOutputsForPrompt(ctx, currentWorkflow);
+            fixStepStartFingerprint = stepStartFingerprintFromPrompt(fixOutputs);
+            return buildPipelineStepPrompt(
+              { id: 'dev', botId: 'dev', title: '开发实现' },
+              workflow.goal,
+              fixOutputs,
+            );
+          }
+          : undefined,
+        validateFix: workflow.qualityPolicy === 'gated'
+          ? async (answer) => {
+            assertExplicitSuccessfulStepResult(answer, 'dev');
+            const completion = await buildGateCompletion(
+              ctx,
+              workflow.id,
+              stepIndex,
+              'dev',
+              answer,
+              {
+                recordAttemptStepId: step.id,
+                stepStartFingerprint: fixStepStartFingerprint,
+              },
+            );
+            const recorded = await ctx.workflows.recordGateAttempt(
+              workflow.id,
+              stepIndex,
+              step.id,
+              completion.gateRun,
+              completion.projectFingerprint,
+            );
+            if (!recorded) throw new Error('修复后的实现证据未能写入当前 review 步骤');
+          }
+          : undefined,
+        validateApproval: workflow.qualityPolicy === 'gated'
+          ? async (answer) => {
+            assertExplicitSuccessfulStepResult(answer, 'review');
+            reviewCompletion = await buildGateCompletion(
+              ctx,
+              workflow.id,
+              stepIndex,
+              step.id,
+              answer,
+            );
+          }
+          : undefined,
         onComplete: async ({ approved, answer }) => {
           if (!approved) {
             await failWorkflow(
@@ -186,14 +412,47 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
             );
             return;
           }
-          await completeRegularStep(ctx, workflow.id, stepIndex, step.id, answer);
+          if (workflow.qualityPolicy === 'gated' && !reviewCompletion) {
+            throw new Error('代码评审缺少已验证的结构化门禁结果');
+          }
+          await completeRegularStep(
+            ctx,
+            workflow.id,
+            stepIndex,
+            step.id,
+            answer,
+            reviewCompletion,
+            false,
+          );
         },
-        onFailure: async (error) => failWorkflow(
-          ctx,
-          workflow.id,
-          error.message,
-          { stepIndex, stepId: step.id },
-        ),
+        afterComplete: async () => {
+          const committed = ctx.workflows.get(workflow.id);
+          if (committed?.status === 'ready') {
+            await continueDeliveryWorkflow(ctx, committed.id);
+          }
+        },
+        onBlocked: async ({ answer, reason }) => {
+          await pauseWorkflowForStepBlock(
+            ctx,
+            workflow.id,
+            stepIndex,
+            step.id,
+            step.title,
+            answer,
+            reason,
+          );
+        },
+        onFailure: async (error) => {
+          if (await tryRewindForFingerprintDrift(ctx, workflow.id, error, { stepIndex, stepId: step.id })) {
+            return;
+          }
+          await failWorkflow(
+            ctx,
+            workflow.id,
+            error.message,
+            { stepIndex, stepId: step.id },
+          );
+        },
       });
       return;
     }
@@ -204,33 +463,174 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
     if (!actorSession) throw new Error(`${actor.name} 正忙，请稍后重新发起。`);
 
     await initiator.reply(msg.messageId, `${stepLabel}：交给 ${actor.name}。`, hasThread(msg));
+    let preparedGateCompletion: { gateRun: GateRun; projectFingerprint: string } | undefined;
+    const promptOutputs = await priorOutputsForPrompt(ctx, workflow);
+    const stepStartFingerprint = stepStartFingerprintFromPrompt(promptOutputs);
     await startCliTask(ctx, {
       bot: actor,
       msg,
       session: actorSession,
-      prompt: buildPipelineStepPrompt(step, workflow.goal, workflow.priorOutputs),
+      prompt: buildPipelineStepPrompt(step, workflow.goal, promptOutputs),
       workflowId: workflow.id,
       executionPolicy: workflow.executionPolicy,
       approvedScope: workflow.executionPolicy === 'approved' ? workflow.goal : undefined,
+      // PM 步骤产出 Spec 正文，不解析 RESULT 标记
+      resultProtocol: step.id !== 'pm',
+      validateSuccess: workflow.qualityPolicy === 'gated' && gateIdForStep(step.id)
+        ? async (answer) => {
+          preparedGateCompletion = await buildGateCompletion(
+            ctx,
+            workflow.id,
+            stepIndex,
+            step.id,
+            answer,
+            { stepStartFingerprint },
+          );
+        }
+        : undefined,
       onSuccess: async (answer) => {
-        if (step.id === 'pm') await completeProductStep(ctx, workflow.id, stepIndex, actor, answer);
-        else await completeRegularStep(ctx, workflow.id, stepIndex, step.id, answer);
+        // PM 的 Spec 正文不应夹 RESULT 标记；其余步骤按显式标记决定推进/暂停/失败。
+        if (step.id !== 'pm') {
+          const stepResult = parseStepResult(answer);
+          if (stepResult.kind === 'failed') {
+            const handoff = resolveQualityHandoffTarget(step.id, stepResult.reason || '');
+            if (handoff) {
+              await handOffQualityFix(
+                ctx,
+                workflow.id,
+                {
+                  fromStepId: step.id,
+                  fromStepIndex: stepIndex,
+                  targetStepId: handoff,
+                  reason: stepResult.reason || '质量步骤报告失败，需修复后重跑',
+                  answer,
+                },
+                false,
+              );
+              return;
+            }
+            await failWorkflow(
+              ctx,
+              workflow.id,
+              stepResult.reason || '步骤报告失败',
+              { stepIndex, stepId: step.id },
+            );
+            return;
+          }
+          if (stepResult.kind === 'blocked') {
+            const handoff = resolveQualityHandoffTarget(step.id, stepResult.reason || '');
+            if (handoff) {
+              await handOffQualityFix(
+                ctx,
+                workflow.id,
+                {
+                  fromStepId: step.id,
+                  fromStepIndex: stepIndex,
+                  targetStepId: handoff,
+                  reason: stepResult.reason || '质量步骤发现需修复的缺陷',
+                  answer,
+                },
+                false,
+              );
+              return;
+            }
+            await pauseWorkflowForStepBlock(
+              ctx,
+              workflow.id,
+              stepIndex,
+              step.id,
+              step.title,
+              answer,
+              stepResult.reason,
+            );
+            return;
+          }
+        }
+        if (step.id === 'pm') {
+          await completeProductStep(ctx, workflow.id, stepIndex, actor, answer);
+          return;
+        }
+        const completion = workflow.qualityPolicy === 'gated' && gateIdForStep(step.id)
+          ? preparedGateCompletion
+            ?? await buildGateCompletion(
+              ctx,
+              workflow.id,
+              stepIndex,
+              step.id,
+              answer,
+              { stepStartFingerprint },
+            )
+          : undefined;
+        await completeRegularStep(ctx, workflow.id, stepIndex, step.id, answer, completion, false);
       },
-      onFailure: async (error) => failWorkflow(
-        ctx,
-        workflow.id,
-        error.message,
-        { stepIndex, stepId: step.id },
-      ),
+      afterSuccess: async () => {
+        const committed = ctx.workflows.get(workflow.id);
+        if (committed?.status === 'ready') {
+          await continueDeliveryWorkflow(ctx, committed.id);
+        }
+      },
+      onFailure: async (error) => {
+        if (await tryRewindForFingerprintDrift(ctx, workflow.id, error, { stepIndex, stepId: step.id })) {
+          return;
+        }
+        const handoff = resolveQualityHandoffTarget(step.id, error.message)
+          ?? ( /未处理 P0\/P1|仍有未处理 P0\/P1/.test(error.message)
+            && !/与审查 artifact 不一致|findings 集合不一致|格式错误/.test(error.message)
+            && (step.id === 'qa' || step.id === 'runtime_audit' || step.id === 'final_review' || step.id === 'review')
+            ? 'dev' as const
+            : undefined);
+        if (handoff) {
+          await handOffQualityFix(
+            ctx,
+            workflow.id,
+            {
+              fromStepId: step.id,
+              fromStepIndex: stepIndex,
+              targetStepId: handoff,
+              reason: error.message,
+            },
+          );
+          return;
+        }
+        await failWorkflow(
+          ctx,
+          workflow.id,
+          error.message,
+          { stepIndex, stepId: step.id },
+        );
+      },
     });
   } catch (error) {
+    const workflow = claimedWorkflow ?? ctx.workflows.get(workflowId);
+    if (!workflow) throw error;
     const currentStepId = workflow.stepIds[workflow.nextStepIndex];
+    const expectedStep = workflow.status === 'executing' && currentStepId
+      ? { stepIndex: workflow.nextStepIndex, stepId: currentStepId }
+      : undefined;
+    if (await tryRewindForFingerprintDrift(
+      ctx,
+      workflow.id,
+      error,
+      expectedStep,
+    )) {
+      return;
+    }
     await failWorkflow(
       ctx,
       workflow.id,
       (error as Error).message,
-      currentStepId ? { stepIndex: workflow.nextStepIndex, stepId: currentStepId } : undefined,
+      expectedStep,
     );
+  }
+}
+
+function assertExplicitSuccessfulStepResult(answer: string, stepId: PipelineStep['id']): void {
+  if (!hasExplicitStepResult(answer)) {
+    throw new Error(`流水线步骤 ${stepId} 缺少显式 [RESULT:done] 终态标记，不能按成功处理。`);
+  }
+  const result = parseStepResult(answer);
+  if (result.kind !== 'done') {
+    throw new Error(`流水线步骤 ${stepId} 报告 [RESULT:${result.kind}]，不能提交成功门禁${result.reason ? `：${result.reason}` : ''}`);
   }
 }
 
@@ -302,6 +702,7 @@ async function completeProductStep(
     : await ctx.specs.create({
       title: workflow.goal.slice(0, 80),
       content: answer,
+      projectId: workflow.projectRoot ?? `${msg.chatId}:${topicIdOf(msg)}`,
       chatId: msg.chatId,
       topicId: topicIdOf(msg),
       messageId: msg.messageId,
@@ -363,10 +764,675 @@ async function completeRegularStep(
   stepIndex: number,
   stepId: PipelineStep['id'],
   answer: string,
+  options?: { gateRun: GateRun; projectFingerprint: string },
+  continueAfterCommit = true,
 ): Promise<void> {
-  const advanced = await ctx.workflows.completeCurrentStep(workflowId, stepIndex, stepId, answer);
+  const contextAnswer = compactAgentOutput(answer, stepId === 'summary' ? 12_000 : 6_000);
+  const advanced = await ctx.workflows.completeCurrentStep(
+    workflowId,
+    stepIndex,
+    stepId,
+    contextAnswer,
+    options,
+  );
   if (!advanced) return;
-  await continueDeliveryWorkflow(ctx, advanced.id);
+  if (continueAfterCommit) await continueDeliveryWorkflow(ctx, advanced.id);
+}
+
+async function buildGateCompletion(
+  ctx: AppContext,
+  workflowId: string,
+  stepIndex: number,
+  stepId: PipelineStep['id'],
+  answer: string,
+  options: {
+    recordAttemptStepId?: PipelineStep['id'];
+    stepStartFingerprint?: string;
+  } = {},
+): Promise<{ gateRun: GateRun; projectFingerprint: string }> {
+  const workflow = requireWorkflow(ctx, workflowId);
+  if (!workflow.projectRoot) throw new Error('门禁步骤缺少项目根目录');
+  const evidenceRoot = await prepareEvidenceRoot(workflow);
+  const parsedResult = await parseGateResult(answer, stepId, { evidenceRoot });
+  const snapshot = await fingerprintProject(workflow.projectRoot);
+  if ((stepId === 'architect' || stepId === 'dev')
+    && !/^[a-f0-9]{64}$/.test(options.stepStartFingerprint ?? '')) {
+    throw new Error(`${stepId} 门禁缺少控制器捕获的步骤启动 fingerprint`);
+  }
+  let result = parsedResult;
+  let gateRun = createGateRun(
+    stepId,
+    result,
+    workflow.gateRuns,
+    snapshot.fingerprint,
+    options.stepStartFingerprint,
+  );
+  try {
+    const canonicalSpec = assertCanonicalWorkflowSpec(ctx, workflow);
+    const waiverContext = canonicalSpecWaiverContext(canonicalSpec);
+    result = bindGateWaiversToCanonicalSpec(parsedResult, waiverContext);
+    gateRun = createGateRun(
+      stepId,
+      result,
+      workflow.gateRuns,
+      snapshot.fingerprint,
+      options.stepStartFingerprint,
+    );
+    await verifyGateArtifacts(evidenceRoot, result, { projectRoot: workflow.projectRoot });
+    await verifyCanonicalSpecSnapshotFile(evidenceRoot, canonicalSpec);
+    const currentOrder = workflow.stepIds.indexOf(stepId);
+    const upstreamRuns = [...latestGateRuns(workflow.gateRuns).values()]
+      .filter((run) => {
+        const runOrder = workflow.stepIds.indexOf(run.stepId as PipelineStep['id']);
+        return runOrder >= 0 && runOrder < currentOrder;
+      });
+    // 每个下游门禁先重验最新上游 artifact，尽早发现跨角色覆盖、过期 waiver
+    // 或历史证据被改写，避免一直跑到终审才暴露断链。
+    for (const run of upstreamRuns) {
+      await verifyGateArtifacts(evidenceRoot, run.result, { projectRoot: workflow.projectRoot });
+      if (!run.projectFingerprint) throw new Error(`门禁 ${run.gateId} 缺少项目 fingerprint`);
+      const runIndex = workflow.gateRuns.findIndex((candidate) => candidate.id === run.id);
+      await assertGateLineage(run.stepId as PipelineStep['id'], run.result, {
+        canonicalSpecHash: canonicalSpec.contentHash!,
+        canonicalRequirementIds: extractRequirementIds(canonicalSpec.content),
+        projectFingerprint: run.projectFingerprint,
+        stepStartFingerprint: run.stepStartFingerprint,
+        previousRuns: runIndex >= 0 ? workflow.gateRuns.slice(0, runIndex) : [],
+      });
+      assertFindingContinuity(
+        runIndex >= 0 ? workflow.gateRuns.slice(0, runIndex) : [],
+        run.result,
+      );
+      assertGateWaiversBoundToCanonicalSpec(run.result, waiverContext);
+      validateGatePass(run.stepId as PipelineStep['id'], run.result);
+      if (run.stepId === 'dev') {
+        assertPlannedFindingsClosed('dev', workflow.gateRuns.slice(0, Math.max(0, runIndex)), run.result);
+      }
+    }
+    await assertGateLineage(stepId, result, {
+      canonicalSpecHash: canonicalSpec.contentHash!,
+      canonicalRequirementIds: extractRequirementIds(canonicalSpec.content),
+      projectFingerprint: snapshot.fingerprint,
+      stepStartFingerprint: options.stepStartFingerprint,
+      previousRuns: workflow.gateRuns,
+    });
+    assertFindingContinuity(workflow.gateRuns, result);
+    assertGateWaiversBoundToCanonicalSpec(result, waiverContext);
+    validateGatePass(stepId, result);
+    assertGateChecksBelongToAttempt(result, workflow.updatedAt);
+    assertPlannedFindingsClosed(stepId, workflow.gateRuns, result);
+    const latest = latestGateRuns(workflow.gateRuns);
+    if (stepId === 'review') {
+      const implementation = latest.get('implementation');
+      if (!implementation || implementation.projectFingerprint !== snapshot.fingerprint) {
+        throw new FingerprintDriftError(
+          'implementation',
+          'dev',
+          '当前变更快照与最新 implementation gate 不一致，必须先重建实现证据',
+        );
+      }
+    }
+    if (stepId === 'qa') {
+      const changeReview = latest.get('change-review');
+      if (!changeReview || changeReview.projectFingerprint !== snapshot.fingerprint) {
+        throw new FingerprintDriftError(
+          'change-review',
+          'review',
+          'QA 执行时项目快照已偏离 change-review，必须重新评审',
+        );
+      }
+    }
+    if (stepId === 'runtime_audit') {
+      const verification = latest.get('verification');
+      if (!verification || verification.projectFingerprint !== snapshot.fingerprint) {
+        throw new FingerprintDriftError(
+          'verification',
+          'qa',
+          '运行时审计快照已偏离 QA 验证快照，必须重新验证',
+        );
+      }
+    }
+    if (stepId === 'final_review') {
+      const latest = latestGateRuns(workflow.gateRuns);
+      for (const run of latest.values()) {
+        if (run.gateId === 'final-review') continue;
+        await verifyGateArtifacts(evidenceRoot, run.result, { projectRoot: workflow.projectRoot });
+        assertGateWaiversBoundToCanonicalSpec(run.result, waiverContext);
+        validateGatePass(run.stepId as PipelineStep['id'], run.result);
+      }
+      await assertControllerEvidenceChainUnmodified(workflow, snapshot.fingerprint);
+      assertOutstandingFindingsCarriedForward(workflow.gateRuns, result);
+      assertEvidenceChainComplete(
+        workflow.stepIds,
+        [...workflow.gateRuns, gateRun],
+        snapshot.fingerprint,
+      );
+    }
+  } catch (error) {
+    // 失败尝试不要记成 pass，避免污染 latestGateRuns
+    const failedRun: GateRun = {
+      ...gateRun,
+      status: 'fail',
+      result: {
+        ...gateRun.result,
+        status: 'fail',
+        summary: (error as Error).message.slice(0, 10_000) || gateRun.result.summary,
+      },
+    };
+    await ctx.workflows.recordGateAttempt(
+      workflowId,
+      stepIndex,
+      options.recordAttemptStepId ?? stepId,
+      failedRun,
+      snapshot.fingerprint,
+    );
+    throw error;
+  }
+  return { gateRun, projectFingerprint: snapshot.fingerprint };
+}
+
+/**
+ * 代码树偏离上游门禁证据时，退回对应步骤重建，而不是把整条流水线打成 failed。
+ * 返回 true 表示已接管（已回复并续跑或已失败兜底）。
+ */
+async function tryRewindForFingerprintDrift(
+  ctx: AppContext,
+  workflowId: string,
+  error: unknown,
+  expectedStep?: { stepIndex: number; stepId: PipelineStep['id'] },
+): Promise<boolean> {
+  const message = error instanceof Error ? error.message : String(error);
+  const rewindTo = (isFingerprintDriftError(error) && error.rewindToStepId)
+    ? error.rewindToStepId
+    : rewindStepIdFromDriftMessage(message);
+  if (!rewindTo) return false;
+
+  const workflow = ctx.workflows.get(workflowId);
+  if (!workflow) return false;
+  const targetIndex = workflow.stepIds.indexOf(rewindTo);
+  if (targetIndex < 0) return false;
+
+  const stepTitle = DEFAULT_PIPELINE_STEPS.find((step) => step.id === rewindTo)?.title ?? rewindTo;
+  const reason = `${message}；已自动退回「${stepTitle}」重建证据后再继续。`;
+
+  let rewound: DeliveryWorkflow | undefined;
+  if (expectedStep && workflow.status === 'executing') {
+    rewound = await ctx.workflows.updateIfCurrentStep(
+      workflowId,
+      expectedStep.stepIndex,
+      expectedStep.stepId,
+      {
+        status: 'ready',
+        nextStepIndex: targetIndex,
+        error: undefined,
+        priorOutputs: {
+          ...workflow.priorOutputs,
+          fingerprint_drift: reason,
+        },
+      },
+    );
+  } else if (workflow.status === 'failed' || workflow.status === 'ready') {
+    rewound = await ctx.workflows.updateIfStatus(workflowId, workflow.status, {
+      status: 'ready',
+      nextStepIndex: targetIndex,
+      error: undefined,
+      priorOutputs: {
+        ...workflow.priorOutputs,
+        fingerprint_drift: reason,
+      },
+    });
+  }
+
+  if (!rewound) return false;
+
+  const initiator = ctx.botsById.get(rewound.initiatorBotId);
+  if (initiator) {
+    const msg = messageForWorkflow(ctx, rewound);
+    await initiator.reply(msg.messageId, `${rewound.name}：${reason}`, hasThread(msg)).catch(() => undefined);
+  }
+  console.warn(`[工作流] 指纹漂移，退回 ${rewindTo}: ${message}`);
+  void continueDeliveryWorkflow(ctx, workflowId).catch(async (continueError) => {
+    console.error('[工作流] 退回重建后续跑失败:', (continueError as Error).message);
+    await failWorkflow(ctx, workflowId, (continueError as Error).message);
+  });
+  return true;
+}
+
+/**
+ * 质量步骤发现需改代码的缺陷：记 bug 摘要并退回开发（或架构），不要弹绑目录重试卡。
+ */
+async function handOffQualityFix(
+  ctx: AppContext,
+  workflowId: string,
+  options: {
+    fromStepId: PipelineStep['id'];
+    fromStepIndex: number;
+    targetStepId: 'dev' | 'architect';
+    reason: string;
+    answer?: string;
+  },
+  continueAfterCommit = true,
+): Promise<void> {
+  const workflow = requireWorkflow(ctx, workflowId);
+  const targetIndex = workflow.stepIds.indexOf(options.targetStepId);
+  if (targetIndex < 0) {
+    await failWorkflow(
+      ctx,
+      workflowId,
+      options.reason,
+      { stepIndex: options.fromStepIndex, stepId: options.fromStepId },
+    );
+    return;
+  }
+
+  const stepTitle = DEFAULT_PIPELINE_STEPS.find((step) => step.id === options.targetStepId)?.title
+    ?? options.targetStepId;
+  const fromTitle = DEFAULT_PIPELINE_STEPS.find((step) => step.id === options.fromStepId)?.title
+    ?? options.fromStepId;
+  const reason = options.reason.trim() || '质量步骤发现需修复的缺陷';
+  const brief = [
+    `来源步骤：${fromTitle}（${options.fromStepId}）`,
+    `缺陷摘要：${reason}`,
+    '请修复后输出完整 GATE_RESULT；修复完成后流水线会从该步骤重新向后推进（含后续评审/测试/运行时审计）。',
+  ].join('\n');
+
+  const nextPrior: Record<string, string> = { ...workflow.priorOutputs };
+  delete nextPrior.blocked_workdir;
+  nextPrior.quality_fix_request = brief;
+  nextPrior[`blocked_${options.fromStepId}`] = compactAgentOutput(options.answer
+    ?? workflow.priorOutputs[`blocked_${options.fromStepId}`]
+    ?? reason, 6_000);
+
+  const patch = {
+    status: 'ready' as const,
+    nextStepIndex: targetIndex,
+    error: undefined,
+    priorOutputs: nextPrior,
+  };
+
+  let handed: DeliveryWorkflow | undefined;
+  if (workflow.status === 'executing') {
+    handed = await ctx.workflows.updateIfCurrentStep(
+      workflowId,
+      options.fromStepIndex,
+      options.fromStepId,
+      patch,
+    );
+  } else if (workflow.status === 'awaiting_step_unblock' || workflow.status === 'failed' || workflow.status === 'ready') {
+    handed = await ctx.workflows.updateIfStatus(workflowId, workflow.status, patch);
+  }
+
+  if (!handed) {
+    await failWorkflow(
+      ctx,
+      workflowId,
+      reason,
+      { stepIndex: options.fromStepIndex, stepId: options.fromStepId },
+    );
+    return;
+  }
+
+  const initiator = ctx.botsById.get(handed.initiatorBotId);
+  if (initiator) {
+    const msg = messageForWorkflow(ctx, handed);
+    await initiator.reply(
+      msg.messageId,
+      [
+        `${handed.name}：${fromTitle}发现需改代码的问题，已记录并转交「${stepTitle}」修复。`,
+        reason,
+        `正在从步骤 ${options.targetStepId} 继续…`,
+      ].join('\n'),
+      hasThread(msg),
+    ).catch(() => undefined);
+  }
+  console.warn(`[工作流] 质量缺陷移交 ${options.fromStepId} → ${options.targetStepId}: ${reason}`);
+  if (continueAfterCommit) {
+    void continueDeliveryWorkflow(ctx, workflowId).catch(async (continueError) => {
+      console.error('[工作流] 移交修复后续跑失败:', (continueError as Error).message);
+      await failWorkflow(ctx, workflowId, (continueError as Error).message);
+    });
+  }
+}
+
+/** 供 /workflow retry：若当前阻塞其实是代码缺陷，则移交开发/架构而不是重发绑目录卡。 */
+export async function handOffBlockedWorkflowIfQualityFix(
+  ctx: AppContext,
+  workflowId: string,
+): Promise<boolean> {
+  const workflow = requireWorkflow(ctx, workflowId);
+  if (workflow.status !== 'awaiting_step_unblock') return false;
+  const stepId = workflow.stepIds[workflow.nextStepIndex];
+  if (!stepId) return false;
+  const reason = workflow.error
+    || workflow.priorOutputs[`blocked_${stepId}`]
+    || '';
+  const target = handoffStepIdFromQualityMessage(stepId, reason)
+    || resolveQualityHandoffTarget(stepId, reason);
+  if (!target) return false;
+  await handOffQualityFix(ctx, workflowId, {
+    fromStepId: stepId,
+    fromStepIndex: workflow.nextStepIndex,
+    targetStepId: target,
+    reason: (workflow.error || reason).slice(0, 4_000),
+    answer: workflow.priorOutputs[`blocked_${stepId}`],
+  });
+  return true;
+}
+
+async function priorOutputsForPrompt(
+  ctx: AppContext,
+  workflow: DeliveryWorkflow,
+): Promise<Record<string, string>> {
+  if (workflow.qualityPolicy !== 'gated') return workflow.priorOutputs;
+  const currentStepIndex = workflow.nextStepIndex;
+  // 退回 dev/review 时保留历史 attempt 作审计，但不把旧 QA/终审结论再喂给上游角色。
+  const evidence = [...latestGateRuns(workflow.gateRuns).values()]
+    .filter((run) => {
+      const runStepIndex = workflow.stepIds.indexOf(run.stepId as PipelineStep['id']);
+      return runStepIndex >= 0 && runStepIndex < currentStepIndex;
+    })
+    .map((run) => ({
+    gateId: run.gateId,
+    status: run.status,
+    attempt: run.attempt,
+    projectFingerprint: run.projectFingerprint,
+    recordedAt: run.recordedAt,
+    summary: run.result.summary.slice(0, 800),
+    artifacts: run.result.artifacts.slice(0, 20),
+    outstandingFindings: run.result.findings
+      .filter((finding) => finding.status === 'open' || finding.status === 'waived')
+      .slice(0, 50)
+      .map((finding) => ({
+        id: finding.id,
+        severity: finding.severity,
+        status: finding.status,
+        summary: finding.summary.slice(0, 500),
+      })),
+    }));
+  const spec = workflow.specId ? ctx.specs.get(workflow.specId) : undefined;
+  const canonical = spec?.canonical && spec.status === 'approved' ? spec : undefined;
+  const canonicalSnapshot = canonical
+    ? await ensureCanonicalSpecSnapshotFile(await prepareEvidenceRoot(workflow), canonical)
+    : undefined;
+  const canonicalSpec = canonical
+    ? JSON.stringify({
+      id: canonical.id,
+      version: canonical.version,
+      sha256: canonical.contentHash,
+      projectId: canonical.projectId,
+      status: canonical.status,
+      source: 'agent-os-spec-store',
+      contentKey: 'pm',
+      snapshot: canonicalSnapshot,
+    })
+    : workflow.priorOutputs.canonical_spec;
+  const stepId = workflow.stepIds[currentStepIndex];
+  const snapshot = workflow.projectRoot && stepId !== 'pm'
+    ? await fingerprintProject(workflow.projectRoot)
+    : undefined;
+  const evidenceChainPath = stepId === 'final_review'
+    ? resolve(evidenceRootFor(workflow), 'evidence-chain.json')
+    : undefined;
+  const evidenceChainContent = evidenceChainPath
+    ? await readFile(evidenceChainPath)
+    : undefined;
+  return {
+    ...workflow.priorOutputs,
+    ...(canonical ? { pm: canonical.content } : {}),
+    ...(canonicalSpec ? { canonical_spec: canonicalSpec } : {}),
+    workflow_context: JSON.stringify({
+      workflowId: workflow.id,
+      projectRoot: workflow.projectRoot,
+      evidenceRoot: evidenceRootFor(workflow),
+      qualityProtocolVersion: '2.0',
+      gateAttemptStartedAt: workflow.updatedAt,
+      canonicalRequirementIds: canonical
+        ? extractRequirementIds(canonical.content)
+        : undefined,
+      canonicalSpec: canonicalSnapshot,
+      controllerEvidenceChain: evidenceChainPath && evidenceChainContent
+        ? {
+          path: evidenceChainPath,
+          sha256: createHash('sha256').update(evidenceChainContent).digest('hex'),
+        }
+        : undefined,
+      projectFingerprintBeforeStep: snapshot?.fingerprint,
+      fingerprintCommand: snapshot
+        ? [process.execPath, FINGERPRINT_SCRIPT_PATH, snapshot.projectRoot]
+        : undefined,
+      hashPathCommandPrefix: snapshot
+        ? [process.execPath, HASH_PATH_SCRIPT_PATH]
+        : undefined,
+      rule: '所有结构化 artifact 必须写入 evidenceRoot，并在 GATE_RESULT 中提供真实 SHA-256。',
+    }),
+    quality_evidence: JSON.stringify(evidence),
+  };
+}
+
+function stepStartFingerprintFromPrompt(outputs: Record<string, string>): string | undefined {
+  const raw = outputs.workflow_context;
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as { projectFingerprintBeforeStep?: unknown };
+    return typeof parsed.projectFingerprintBeforeStep === 'string'
+      && /^[a-f0-9]{64}$/.test(parsed.projectFingerprintBeforeStep)
+      ? parsed.projectFingerprintBeforeStep
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function evidenceRootFor(workflow: DeliveryWorkflow): string {
+  if (!workflow.projectRoot) throw new Error('门禁工作流缺少项目根目录');
+  return resolve(workflow.projectRoot, '.agent-os', 'evidence', workflow.id);
+}
+
+async function writeControllerEvidenceChain(ctx: AppContext, workflow: DeliveryWorkflow): Promise<string> {
+  if (!workflow.projectRoot) throw new Error('门禁工作流缺少项目根目录');
+  const evidenceRoot = await prepareEvidenceRoot(workflow);
+  const latest = latestGateRuns(workflow.gateRuns);
+  const canonicalSpec = assertCanonicalWorkflowSpec(ctx, workflow);
+  const waiverContext = canonicalSpecWaiverContext(canonicalSpec);
+  await verifyCanonicalSpecSnapshotFile(evidenceRoot, canonicalSpec);
+  for (const run of latest.values()) {
+    if (run.gateId === 'final-review') continue;
+    await verifyGateArtifacts(evidenceRoot, run.result, { projectRoot: workflow.projectRoot });
+    if (!run.projectFingerprint) throw new Error(`门禁 ${run.gateId} 缺少项目 fingerprint`);
+    const runIndex = workflow.gateRuns.findIndex((candidate) => candidate.id === run.id);
+    await assertGateLineage(run.stepId as PipelineStep['id'], run.result, {
+      canonicalSpecHash: canonicalSpec.contentHash!,
+      canonicalRequirementIds: extractRequirementIds(canonicalSpec.content),
+      projectFingerprint: run.projectFingerprint,
+      stepStartFingerprint: run.stepStartFingerprint,
+      previousRuns: runIndex >= 0 ? workflow.gateRuns.slice(0, runIndex) : [],
+    });
+    assertFindingContinuity(
+      runIndex >= 0 ? workflow.gateRuns.slice(0, runIndex) : [],
+      run.result,
+    );
+    assertGateWaiversBoundToCanonicalSpec(run.result, waiverContext);
+    validateGatePass(run.stepId as PipelineStep['id'], run.result);
+  }
+  const implementation = latest.get('implementation');
+  if (implementation) assertPlannedFindingsClosed('dev', workflow.gateRuns, implementation.result);
+  const snapshot = await fingerprintProject(workflow.projectRoot);
+  const manifest = buildEvidenceChainManifest(
+    workflow.id,
+    workflow.stepIds,
+    workflow.gateRuns,
+    snapshot.fingerprint,
+    controllerEvidenceGeneratedAt(workflow),
+  );
+  const path = resolve(evidenceRoot, 'evidence-chain.json');
+  const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporaryPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    await rename(temporaryPath, path);
+  } catch (error) {
+    await unlink(temporaryPath).catch(() => undefined);
+    throw error;
+  }
+  return path;
+}
+
+/** 终审角色只能读取控制器证据链；终审及汇总后都重新构造并做语义等值校验。 */
+async function assertControllerEvidenceChainUnmodified(
+  workflow: DeliveryWorkflow,
+  currentFingerprint: string,
+): Promise<void> {
+  const evidenceRoot = await prepareEvidenceRoot(workflow);
+  const path = resolve(evidenceRoot, 'evidence-chain.json');
+  const stats = await lstat(path).catch(() => {
+    throw new Error('控制器证据链不存在，必须重新生成后再终审');
+  });
+  if (stats.isSymbolicLink() || !stats.isFile()) {
+    throw new Error('控制器证据链必须是普通文件且不能是符号链接');
+  }
+  let actual: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(await readFile(path, 'utf8')) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('root must be object');
+    actual = parsed as Record<string, unknown>;
+  } catch (error) {
+    throw new Error('控制器证据链不是有效 JSON：' + (error as Error).message);
+  }
+  const expected = JSON.parse(JSON.stringify(buildEvidenceChainManifest(
+    workflow.id,
+    workflow.stepIds,
+    workflow.gateRuns,
+    currentFingerprint,
+    controllerEvidenceGeneratedAt(workflow),
+  ))) as Record<string, unknown>;
+  if (!isDeepStrictEqual(actual, expected)) {
+    throw new Error('控制器证据链在生成后被改写或与当前门禁状态不一致');
+  }
+}
+
+function controllerEvidenceGeneratedAt(workflow: DeliveryWorkflow): string {
+  const timestamps = [...latestGateRuns(workflow.gateRuns).values()]
+    .filter((run) => run.gateId !== 'final-review')
+    .map((run) => run.recordedAt)
+    .sort();
+  const generatedAt = timestamps.at(-1);
+  if (!generatedAt || Number.isNaN(Date.parse(generatedAt))) {
+    throw new Error('无法从上游门禁确定控制器证据链生成时间');
+  }
+  return generatedAt;
+}
+
+function assertCanonicalWorkflowSpec(ctx: AppContext, workflow: DeliveryWorkflow): ProductSpec {
+  const spec = workflow.specId ? ctx.specs.get(workflow.specId) : undefined;
+  if (
+    !spec
+    || spec.status !== 'approved'
+    || !spec.canonical
+    || spec.projectId !== workflow.projectRoot
+    || !spec.contentHash
+    || !spec.approvedAt
+  ) {
+    throw new Error('工作流缺少当前项目已批准且带 hash 的 canonical Spec，不能进入技术交付阶段。');
+  }
+  if (extractRequirementIds(spec.content).length === 0) {
+    throw new Error('canonical Spec 缺少稳定需求 ID（例如 RQ-001），不能进入技术交付阶段。');
+  }
+  parseCanonicalSpecWaivers(spec.content);
+  return spec;
+}
+
+function assertSpecRequirementIds(spec: Pick<ProductSpec, 'content'>): void {
+  if (extractRequirementIds(spec.content).length === 0) {
+    throw new Error('产品 Spec 缺少以条目开头声明的稳定需求 ID（例如 `### RQ-001 登录`），请先退回产品经理修订。');
+  }
+  parseCanonicalSpecWaivers(spec.content);
+}
+
+function canonicalSpecWaiverContext(spec: ProductSpec): CanonicalSpecWaiverContext {
+  if (!spec.contentHash || !spec.approvedAt) {
+    throw new Error('canonical Spec 缺少 waiver 绑定所需的内容 hash 或批准时间');
+  }
+  return {
+    specId: spec.id,
+    version: spec.version,
+    content: spec.content,
+    contentHash: spec.contentHash,
+    approvedAt: spec.approvedAt,
+  };
+}
+
+interface CanonicalSpecSnapshot {
+  path: string;
+  sha256: string;
+}
+
+export async function ensureCanonicalSpecSnapshotFile(
+  evidenceRoot: string,
+  spec: ProductSpec,
+): Promise<CanonicalSpecSnapshot> {
+  if (!spec.contentHash) throw new Error('canonical Spec 缺少内容 hash');
+  const path = resolve(evidenceRoot, 'canonical-spec.md');
+  const stats = await lstat(path).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return undefined;
+    throw error;
+  });
+  if (!stats) {
+    const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(temporaryPath, spec.content, 'utf8');
+      await rename(temporaryPath, path);
+    } catch (error) {
+      await unlink(temporaryPath).catch(() => undefined);
+      throw error;
+    }
+  }
+  return verifyCanonicalSpecSnapshotFile(evidenceRoot, spec);
+}
+
+async function verifyCanonicalSpecSnapshotFile(
+  evidenceRoot: string,
+  spec: ProductSpec,
+): Promise<CanonicalSpecSnapshot> {
+  if (!spec.contentHash) throw new Error('canonical Spec 缺少内容 hash');
+  const path = resolve(evidenceRoot, 'canonical-spec.md');
+  const stats = await lstat(path).catch(() => {
+    throw new Error('控制器 canonical Spec 快照不存在');
+  });
+  if (stats.isSymbolicLink() || !stats.isFile()) {
+    throw new Error('控制器 canonical Spec 快照必须是普通文件且不能是符号链接');
+  }
+  const content = await readFile(path);
+  const sha256 = createHash('sha256').update(content).digest('hex');
+  if (sha256 !== spec.contentHash) {
+    throw new Error('控制器 canonical Spec 快照被改写或已过期');
+  }
+  return { path, sha256 };
+}
+
+async function prepareEvidenceRoot(workflow: DeliveryWorkflow): Promise<string> {
+  if (!workflow.projectRoot) throw new Error('门禁工作流缺少项目根目录');
+  const projectRoot = await realpath(workflow.projectRoot);
+  const agentRoot = resolve(projectRoot, '.agent-os');
+  const evidenceRoot = resolve(agentRoot, 'evidence');
+  const workflowRoot = evidenceRootFor({ ...workflow, projectRoot });
+  for (const directory of [agentRoot, evidenceRoot, workflowRoot]) {
+    const existing = await lstat(directory).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return undefined;
+      throw error;
+    });
+    if (existing?.isSymbolicLink()) throw new Error('证据目录不能是符号链接：' + directory);
+    if (existing && !existing.isDirectory()) throw new Error('证据路径不是目录：' + directory);
+    if (!existing) {
+      await mkdir(directory).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== 'EEXIST') throw error;
+      });
+    }
+    const canonical = await realpath(directory);
+    const rel = relative(projectRoot, canonical);
+    if (!rel || isAbsolute(rel) || rel === '..' || rel.startsWith(`..${sep}`)) {
+      throw new Error('证据目录必须位于项目根目录内：' + directory);
+    }
+  }
+  return workflowRoot;
 }
 
 /** 飞书表单完成后，用答案重新执行 PM 步骤。 */
@@ -394,6 +1460,7 @@ export async function confirmSpecForReview(ctx: AppContext, specId: string) {
   const spec = ctx.specs.get(specId);
   if (!spec) throw new Error(`Spec 不存在: ${specId}`);
   if (!spec.workflowId) throw new Error(`Spec ${spec.id} 没有关联交付工作流。`);
+  assertSpecRequirementIds(spec);
   const workflow = requireWorkflow(ctx, spec.workflowId);
   if (workflow.status !== 'awaiting_spec_confirmation' || workflow.specId !== spec.id) {
     throw new Error('交付工作流不在方案确认节点。');
@@ -417,6 +1484,45 @@ export async function confirmSpecForReview(ctx: AppContext, specId: string) {
       .catch((rollbackError) => {
         console.error(`[工作流] 回滚 Spec ${confirmed.id} 确认状态失败:`, sanitizeErrorForLog(rollbackError));
       });
+    throw error;
+  }
+}
+
+/** 确认方案并直接进入技术交付，跳过飞书云文档发布与评审。 */
+export async function confirmSpecAndStartDelivery(ctx: AppContext, specId: string): Promise<void> {
+  const spec = ctx.specs.get(specId);
+  if (!spec) throw new Error(`Spec 不存在: ${specId}`);
+  if (!spec.workflowId) throw new Error(`Spec ${spec.id} 没有关联交付工作流。`);
+  if (spec.status !== 'pending_confirmation' && spec.status !== 'confirmed') {
+    throw new Error(`当前 Spec 状态为 ${spec.status}，无法直接进入技术交付。`);
+  }
+  assertSpecRequirementIds(spec);
+  if (parseCanonicalSpecWaivers(spec.content).length > 0) {
+    throw new Error('该 Spec 含风险接受条款，必须发布到飞书云文档完成全文评审，不能从截断确认卡直接批准。');
+  }
+  const workflow = requireWorkflow(ctx, spec.workflowId);
+  if (workflow.specId !== spec.id) throw new Error('Spec 与交付工作流关联不一致。');
+  const originalWorkflowStatus = workflow.status;
+  if (originalWorkflowStatus !== 'awaiting_spec_confirmation' && originalWorkflowStatus !== 'awaiting_doc_review') {
+    throw new Error(`工作流当前状态为 ${originalWorkflowStatus}，无法直接进入技术交付。`);
+  }
+  const approved = await ctx.specs.updateIfStatus(spec.id, spec.status, {
+    status: 'approved',
+    confirmationFeedback: undefined,
+  });
+  if (!approved) throw new Error(`Spec 当前状态为 ${ctx.specs.get(spec.id)?.status ?? 'unknown'}，无法重复确认。`);
+  let activated = false;
+  try {
+    await activateApprovedSpecWorkflow(ctx, approved, workflow, originalWorkflowStatus);
+    activated = true;
+    await continueDeliveryWorkflow(ctx, workflow.id);
+  } catch (error) {
+    if (!activated) {
+      await ctx.specs.updateIfStatus(approved.id, 'approved', { status: spec.status })
+        .catch((rollbackError) => {
+          console.error(`[工作流] 回滚 Spec ${approved.id} 审批状态失败:`, sanitizeErrorForLog(rollbackError));
+        });
+    }
     throw error;
   }
 }
@@ -503,23 +1609,67 @@ async function prepareWorkflowForSpecRevision(
   });
 }
 
-/** 产品评审通过后，启动架构、开发、评审和 QA 内部交付步骤。 */
+/** 产品评审通过后，启动架构、开发、评审、QA、运行时审计和最终审查。 */
 export async function resumeWorkflowAfterProductReview(ctx: AppContext, specId: string): Promise<void> {
   const spec = ctx.specs.get(specId);
   if (!spec) throw new Error(`Spec 不存在: ${specId}`);
   if (!spec.workflowId) throw new Error(`Spec ${spec.id} 没有关联交付工作流。`);
   if (spec.status !== 'approved') throw new Error(`Spec ${spec.id} 尚未通过产品评审。`);
+  assertSpecRequirementIds(spec);
   const workflow = requireWorkflow(ctx, spec.workflowId);
   if (workflow.status !== 'awaiting_doc_review' || workflow.specId !== spec.id) {
     throw new Error(`工作流当前状态为 ${workflow.status}，无法启动内部交付小队。`);
   }
-  const transitioned = await ctx.workflows.updateIfStatus(workflow.id, 'awaiting_doc_review', {
-    status: 'ready',
-    priorOutputs: { ...workflow.priorOutputs, pm: spec.content },
-    error: undefined,
-  });
-  if (!transitioned) throw new Error(`工作流当前状态为 ${ctx.workflows.get(workflow.id)?.status ?? 'unknown'}，无法启动内部交付小队。`);
+  await activateApprovedSpecWorkflow(ctx, spec, workflow, 'awaiting_doc_review');
   await continueDeliveryWorkflow(ctx, workflow.id);
+}
+
+/** 在工作流存储锁内切换 canonical Spec 并取得项目级技术交付租约。 */
+async function activateApprovedSpecWorkflow(
+  ctx: AppContext,
+  spec: ProductSpec,
+  workflow: DeliveryWorkflow,
+  expectedStatus: DeliveryWorkflow['status'] | readonly DeliveryWorkflow['status'][],
+): Promise<DeliveryWorkflow> {
+  assertSpecRequirementIds(spec);
+  if (spec.status !== 'approved') throw new Error(`Spec ${spec.id} 尚未批准。`);
+  if (workflow.specId !== spec.id || spec.workflowId !== workflow.id) {
+    throw new Error('Spec 与交付工作流关联不一致。');
+  }
+  const previousCanonical = spec.projectId ? ctx.specs.findCanonical(spec.projectId) : undefined;
+  let canonicalChanged = false;
+  try {
+    const transitioned = await ctx.workflows.activateTechnicalDelivery(
+      workflow.id,
+      expectedStatus,
+      {
+        priorOutputs: { ...workflow.priorOutputs, pm: spec.content },
+        error: undefined,
+      },
+      async () => {
+        if (ctx.specs.get(spec.id)?.canonical) return;
+        await ctx.specs.markCanonical(spec.id);
+        canonicalChanged = true;
+      },
+    );
+    if (!transitioned || transitioned.specId !== spec.id) {
+      throw new Error(`工作流当前状态为 ${ctx.workflows.get(workflow.id)?.status ?? 'unknown'}，无法启动内部交付。`);
+    }
+    return transitioned;
+  } catch (error) {
+    if (canonicalChanged) {
+      if (previousCanonical && previousCanonical.id !== spec.id) {
+        await ctx.specs.markCanonical(previousCanonical.id).catch((rollbackError) => {
+          console.error('[工作流] 回滚规范版本失败:', sanitizeErrorForLog(rollbackError));
+        });
+      } else {
+        await ctx.specs.clearCanonical(spec.id).catch((rollbackError) => {
+          console.error('[工作流] 回滚规范版本失败:', sanitizeErrorForLog(rollbackError));
+        });
+      }
+    }
+    throw error;
+  }
 }
 
 /** 服务重启后恢复尚未进入人工等待节点的流水线。 */
@@ -547,48 +1697,60 @@ export async function resumeRecoverableWorkflows(ctx: AppContext): Promise<void>
 export async function reconcileWorkflowSpecStates(ctx: AppContext): Promise<void> {
   for (const workflow of ctx.workflows.list()) {
     if (!workflow.specId) continue;
-    const spec = ctx.specs.get(workflow.specId);
-    if (!spec || spec.workflowId !== workflow.id) {
-      throw new Error(`工作流 ${workflow.id} 的 Spec 关联损坏。`);
-    }
-    if (
-      workflow.status === 'awaiting_spec_confirmation'
-      && (spec.status === 'confirmed' || spec.status === 'published' || spec.status === 'in_review' || spec.status === 'approved')
-    ) {
-      await ctx.workflows.updateIfStatus(workflow.id, 'awaiting_spec_confirmation', {
-        status: 'awaiting_doc_review',
-        error: undefined,
-      });
-      continue;
-    }
-    if (workflow.status === 'awaiting_spec_confirmation' && spec.status === 'changes_requested' && spec.confirmationFeedback) {
-      await prepareWorkflowForSpecRevision(
-        ctx,
-        spec,
-        spec.confirmationFeedback,
-        [],
-        'awaiting_spec_confirmation',
-      );
-      continue;
-    }
-    if (workflow.status === 'awaiting_doc_review' && spec.status === 'changes_requested') {
-      const comments = spec.comments.filter((comment) => !comment.resolved);
-      if (comments.length > 0) {
+    try {
+      const spec = ctx.specs.get(workflow.specId);
+      if (!spec || spec.workflowId !== workflow.id) {
+        throw new Error(`工作流 ${workflow.id} 的 Spec 关联损坏。`);
+      }
+      // 修复“Spec 已批准，但 canonical 切换或工作流推进尚未落盘”的崩溃窗口。
+      // approved 已是人工决策终态，可安全幂等地补齐 canonical 并直接恢复技术交付。
+      if (
+        (workflow.status === 'awaiting_spec_confirmation' || workflow.status === 'awaiting_doc_review')
+        && spec.status === 'approved'
+      ) {
+        assertSpecRequirementIds(spec);
+        await activateApprovedSpecWorkflow(ctx, spec, workflow, workflow.status);
+        continue;
+      }
+      if (
+        workflow.status === 'awaiting_spec_confirmation'
+        && (spec.status === 'confirmed' || spec.status === 'published' || spec.status === 'in_review')
+      ) {
+        await ctx.workflows.updateIfStatus(workflow.id, 'awaiting_spec_confirmation', {
+          status: 'awaiting_doc_review',
+          error: undefined,
+        });
+        continue;
+      }
+      if (workflow.status === 'awaiting_spec_confirmation' && spec.status === 'changes_requested' && spec.confirmationFeedback) {
         await prepareWorkflowForSpecRevision(
           ctx,
           spec,
-          comments.map((comment) => `- ${comment.content.slice(0, 2_000)}`).join('\n'),
-          comments.map((comment) => comment.id),
-          'awaiting_doc_review',
+          spec.confirmationFeedback,
+          [],
+          'awaiting_spec_confirmation',
         );
+        continue;
       }
-      continue;
-    }
-    if (workflow.status === 'awaiting_doc_review' && spec.status === 'approved') {
-      await ctx.workflows.updateIfStatus(workflow.id, 'awaiting_doc_review', {
-        status: 'ready',
-        priorOutputs: { ...workflow.priorOutputs, pm: spec.content },
-        error: undefined,
+      if (workflow.status === 'awaiting_doc_review' && spec.status === 'changes_requested') {
+        const comments = spec.comments.filter((comment) => !comment.resolved);
+        if (comments.length > 0) {
+          await prepareWorkflowForSpecRevision(
+            ctx,
+            spec,
+            comments.map((comment) => `- ${comment.content.slice(0, 2_000)}`).join('\n'),
+            comments.map((comment) => comment.id),
+            'awaiting_doc_review',
+          );
+        }
+        continue;
+      }
+    } catch (error) {
+      const message = `Spec 状态恢复失败：${persistentErrorMessage(error, 4_000)}`;
+      console.error(`[工作流] ${workflow.id} ${message}`);
+      // 单份历史坏数据必须 fail closed，但不能阻断其他健康工作流的恢复。
+      await failWorkflow(ctx, workflow.id, message).catch((failError) => {
+        console.error(`[工作流] ${workflow.id} 保存 Spec 恢复失败状态异常:`, sanitizeErrorForLog(failError));
       });
     }
   }
@@ -610,7 +1772,14 @@ async function failWorkflow(
     )
     : await ctx.workflows.updateIfStatus(
       workflowId,
-      ['ready', 'executing', 'awaiting_questions', 'awaiting_spec_confirmation', 'awaiting_doc_review'],
+      [
+        'ready',
+        'executing',
+        'awaiting_questions',
+        'awaiting_spec_confirmation',
+        'awaiting_doc_review',
+        'awaiting_step_unblock',
+      ],
       { status: 'failed', error: normalizedError },
     );
   if (!failed) return;
@@ -677,6 +1846,155 @@ export async function reconcileWorkflowSchedules(ctx: AppContext): Promise<void>
       await settleWorkflowSchedule(ctx, workflow, 'failed', workflow.error);
     }
   }
+}
+
+async function pauseWorkflowForStepBlock(
+  ctx: AppContext,
+  workflowId: string,
+  stepIndex: number,
+  stepId: PipelineStep['id'],
+  stepTitle: string,
+  answer: string,
+  reason?: string,
+): Promise<void> {
+  const workflow = requireWorkflow(ctx, workflowId);
+  const msg = messageForWorkflow(ctx, workflow);
+  const initiator = ctx.botsById.get(workflow.initiatorBotId);
+  const blockReason = reason?.trim() || '步骤报告阻塞，需人工纠正后重试';
+  const suggestedWorkdir = await firstBindableWorkdir([
+    ...extractAbsolutePathCandidates(answer),
+    ...extractAbsolutePathCandidates(workflow.goal),
+  ]);
+  const paused = await ctx.workflows.updateIfCurrentStep(workflowId, stepIndex, stepId, {
+    status: 'awaiting_step_unblock',
+    priorOutputs: {
+      ...workflow.priorOutputs,
+      [`blocked_${stepId}`]: compactAgentOutput(answer, 6_000),
+      ...(suggestedWorkdir ? { blocked_workdir: suggestedWorkdir } : {}),
+    },
+    error: blockReason,
+  });
+  if (!paused || !initiator) return;
+  let cardSent = true;
+  await initiator.replyCard(
+    msg.messageId,
+    buildStepBlockedCard({
+      workflowId,
+      stepId,
+      stepTitle,
+      reason: blockReason,
+      suggestedWorkdir,
+      blockVersion: paused.updatedAt,
+    }),
+    hasThread(msg),
+  ).catch((error) => {
+    cardSent = false;
+    console.error(`[${paused.name}] 阻塞卡发送失败:`, sanitizeErrorForLog(error));
+  });
+  // 卡片成功就不再发文本，避免「阻塞卡 + 同内容文本」双提示；失败时才文本兜底。
+  if (!cardSent) {
+    await initiator.reply(
+      msg.messageId,
+      [
+        `步骤「${stepTitle}」已阻塞，流水线暂停：${blockReason}`,
+        suggestedWorkdir
+          ? `建议目录：${suggestedWorkdir}`
+          : '可先用 `/workdir <绝对路径>` 绑定话题目录',
+        `用 \`/workflow retry ${workflowId}\` 重新发送阻塞卡。`,
+      ].join('\n'),
+      hasThread(msg),
+    ).catch(() => undefined);
+  }
+}
+
+/** 重新发送阻塞卡（用于 /workflow retry 或卡片发送失败后的恢复）。 */
+export async function resendBlockedCard(
+  ctx: AppContext,
+  workflowId: string,
+): Promise<void> {
+  const workflow = requireWorkflow(ctx, workflowId);
+  if (workflow.status !== 'awaiting_step_unblock') {
+    throw new Error(`工作流当前状态为 ${workflow.status}，不在阻塞等待中。`);
+  }
+  const msg = messageForWorkflow(ctx, workflow);
+  const initiator = ctx.botsById.get(workflow.initiatorBotId);
+  if (!initiator) throw new Error(`发起 Bot 未连接：${workflow.initiatorBotId}`);
+  const stepIndex = workflow.nextStepIndex;
+  const steps = stepsFor(workflow);
+  const step = steps[stepIndex];
+  const blockReason = workflow.error || '步骤报告阻塞，需人工纠正后重试';
+  const suggestedWorkdir = workflow.priorOutputs.blocked_workdir || undefined;
+  await initiator.replyCard(
+    msg.messageId,
+    buildStepBlockedCard({
+      workflowId,
+      stepId: step.id,
+      stepTitle: step.title,
+      reason: blockReason,
+      ...(suggestedWorkdir ? { suggestedWorkdir } : {}),
+      blockVersion: workflow.updatedAt,
+    }),
+    hasThread(msg),
+  ).catch((error) => {
+    console.error(`[工作流] 重发阻塞卡失败:`, sanitizeErrorForLog(error));
+  });
+}
+
+/** 纠正目录后重跑同一步（不推进 nextStepIndex）。 */
+export async function resumeBlockedWorkflowStep(
+  ctx: AppContext,
+  workflowId: string,
+  options?: { workdir?: string },
+): Promise<DeliveryWorkflow> {
+  const workflow = requireWorkflow(ctx, workflowId);
+  if (workflow.status !== 'awaiting_step_unblock') {
+    throw new Error(`工作流当前状态为 ${workflow.status}，不能重试阻塞步骤。`);
+  }
+  const msg = messageForWorkflow(ctx, workflow);
+  const requestedWorkdir = options?.workdir ? await assertWorkdir(options.workdir) : undefined;
+  const currentBinding = requestedWorkdir ?? ctx.topics.getWorkdir(msg.chatId, topicIdOf(msg));
+  if (workflow.qualityPolicy === 'gated' && currentBinding !== workflow.projectRoot) {
+    throw new Error('门禁工作流不能在中途切换项目目录；请在正确目录重新发起交付。');
+  }
+  // 先原子认领：防止并发重试两个按钮都通过前置检查再改目录
+  const resumed = await ctx.workflows.updateIfStatus(workflowId, 'awaiting_step_unblock', {
+    status: 'ready',
+    error: undefined,
+  });
+  if (!resumed) throw new Error('工作流状态已变化，请刷新后重试。');
+
+  // 原子认领成功后再切目录；失败也不会影响已认领的状态
+  if (requestedWorkdir) {
+    await ctx.sessions.clearCliContextForTopic(msg.chatId, topicIdOf(msg));
+    await ctx.topics.setWorkdir(msg.chatId, topicIdOf(msg), requestedWorkdir);
+  }
+  await continueDeliveryWorkflow(ctx, resumed.id);
+  return requireWorkflow(ctx, resumed.id);
+}
+
+export async function abortBlockedWorkflow(
+  ctx: AppContext,
+  workflowId: string,
+  reason = '用户终止已阻塞的流水线',
+): Promise<DeliveryWorkflow> {
+  const workflow = requireWorkflow(ctx, workflowId);
+  if (workflow.status !== 'awaiting_step_unblock') {
+    throw new Error(`工作流当前状态为 ${workflow.status}，不能按阻塞流程终止。`);
+  }
+  // awaiting_step_unblock 不能走 updateIfCurrentStep（它要求 status=executing）
+  await failWorkflow(ctx, workflowId, reason);
+  return requireWorkflow(ctx, workflowId);
+}
+
+async function firstBindableWorkdir(candidates: string[]): Promise<string | undefined> {
+  for (const candidate of candidates) {
+    try {
+      return await assertWorkdir(candidate);
+    } catch {
+      // 路径不存在或不在白名单时跳过，交给用户显式 /workdir。
+    }
+  }
+  return undefined;
 }
 
 function requireWorkflow(ctx: AppContext, id: string): DeliveryWorkflow {

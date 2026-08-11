@@ -1,8 +1,18 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import { highRiskClasses } from '../core/risk.js';
 import type { CliAdapter, CliEvent, CliExecutionPolicy, CliRunResult } from './types.js';
 
-const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
+/**
+ * 长工作流策略：
+ * - CLI_TIMEOUT_MS：从启动起的绝对上限（默认 6 小时），防止失控进程永挂
+ * - CLI_IDLE_TIMEOUT_MS：无 stream 事件多久视为卡住（默认 20 分钟）；有输出就续命
+ * 几小时的持续编码靠「有活动续命」，不要只把墙钟超时硬拉长。
+ */
+const DEFAULT_TIMEOUT_MS = 6 * 60 * 60 * 1000;
+const DEFAULT_IDLE_TIMEOUT_MS = 20 * 60 * 1000;
+const MIN_ENV_TIMEOUT_MS = 60_000;
+const MAX_TIMEOUT_MS = 12 * 60 * 60 * 1000;
 const MAX_STDERR_CHARS = 64 * 1024;
 const MAX_EVENT_LINE_CHARS = 4 * 1024 * 1024;
 const useProcessGroup = process.platform !== 'win32';
@@ -13,11 +23,59 @@ export interface RunCliOptions {
   cwd: string;
   sessionId?: string;
   signal?: AbortSignal;
+  /** 绝对上限（墙钟）；优先于 CLI_TIMEOUT_MS */
   timeoutMs?: number;
+  /** 无事件空闲超时；优先于 CLI_IDLE_TIMEOUT_MS；设 0 关闭空闲检测 */
+  idleTimeoutMs?: number;
   onEvent?: (event: CliEvent) => void;
   env?: NodeJS.ProcessEnv;
   executionPolicy?: CliExecutionPolicy;
   approvedScope?: string;
+}
+
+/** 解析绝对超时：优先显式参数，其次 CLI_TIMEOUT_MS，否则默认 6 小时。 */
+export function resolveCliTimeoutMs(
+  explicit?: number,
+  envValue = process.env.CLI_TIMEOUT_MS,
+): number {
+  if (typeof explicit === 'number' && Number.isFinite(explicit) && explicit > 0) {
+    return Math.min(Math.floor(explicit), MAX_TIMEOUT_MS);
+  }
+  const raw = envValue?.trim();
+  if (raw) {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) return clampEnvTimeoutMs(parsed);
+    console.warn(`[配置] CLI_TIMEOUT_MS=${raw} 非法，回退到 ${DEFAULT_TIMEOUT_MS}ms`);
+  }
+  return DEFAULT_TIMEOUT_MS;
+}
+
+/**
+ * 解析空闲超时：优先显式参数（含 0=关闭），其次 CLI_IDLE_TIMEOUT_MS，否则默认 20 分钟。
+ * 显式传入 0 表示关闭空闲检测（测试/特殊场景）。
+ */
+export function resolveCliIdleTimeoutMs(
+  explicit?: number,
+  envValue = process.env.CLI_IDLE_TIMEOUT_MS,
+): number {
+  if (typeof explicit === 'number' && Number.isFinite(explicit) && explicit >= 0) {
+    if (explicit === 0) return 0;
+    return Math.min(Math.floor(explicit), MAX_TIMEOUT_MS);
+  }
+  const raw = envValue?.trim();
+  if (raw) {
+    const parsed = Number(raw);
+    if (parsed === 0) return 0;
+    if (Number.isFinite(parsed) && parsed > 0) return clampEnvTimeoutMs(parsed);
+    console.warn(`[配置] CLI_IDLE_TIMEOUT_MS=${raw} 非法，回退到 ${DEFAULT_IDLE_TIMEOUT_MS}ms`);
+  }
+  return DEFAULT_IDLE_TIMEOUT_MS;
+}
+
+function clampEnvTimeoutMs(value: number): number {
+  if (value < MIN_ENV_TIMEOUT_MS) return MIN_ENV_TIMEOUT_MS;
+  if (value > MAX_TIMEOUT_MS) return MAX_TIMEOUT_MS;
+  return Math.floor(value);
 }
 
 /** 杀掉 CLI 进程组（含孙子进程）。 */
@@ -39,7 +97,7 @@ function killProcessTree(child: ChildProcess, sig: NodeJS.Signals = 'SIGTERM'): 
   }
 }
 
-/** 启动 CLI 子进程，解析 stream-json，支持取消/超时。 */
+/** 启动 CLI 子进程，解析 stream-json，支持取消/绝对超时/空闲超时。 */
 export function runCli(options: RunCliOptions): Promise<CliRunResult> {
   const {
     adapter,
@@ -47,12 +105,13 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
     cwd,
     sessionId,
     signal,
-    timeoutMs = DEFAULT_TIMEOUT_MS,
     onEvent,
     env,
     executionPolicy = 'standard',
     approvedScope,
   } = options;
+  const timeoutMs = resolveCliTimeoutMs(options.timeoutMs);
+  const idleTimeoutMs = resolveCliIdleTimeoutMs(options.idleTimeoutMs);
   // “仅输入分析”必须是一次性上下文，不能从旧会话带入未提供的文件或消息。
   const effectiveSessionId = executionPolicy === 'input-only' ? undefined : sessionId;
   const args = effectiveSessionId
@@ -72,7 +131,16 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: useProcessGroup,
-      env: { ...process.env, ...env, AGENT_OS_EXECUTION_POLICY: executionPolicy },
+      env: {
+        ...process.env,
+        ...env,
+        AGENT_OS_EXECUTION_POLICY: executionPolicy,
+        // 只传不可伪造的类别集合，不把可能含敏感信息的完整审批文本复制到环境变量。
+        // 显式覆盖宿主同名变量，避免陈旧环境配置扩大本轮授权。
+        AGENT_OS_APPROVED_RISK_CLASSES: executionPolicy === 'approved'
+          ? highRiskClasses(approvedScope ?? '').join(',')
+          : '',
+      },
     });
     const lines = createInterface({ input: child.stdout });
     let observedSessionId = effectiveSessionId;
@@ -82,7 +150,9 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
     let stderr = '';
     let settled = false;
     let timedOut = false;
+    let timeoutReason: 'absolute' | 'idle' | undefined;
     let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
 
     const forceKillLater = () => {
       if (forceKillTimer) return;
@@ -99,16 +169,33 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
       forceKillLater();
     };
 
-    signal?.addEventListener('abort', onAbort, { once: true });
-
-    const timer = setTimeout(() => {
+    const tripTimeout = (reason: 'absolute' | 'idle') => {
+      if (settled || timedOut) return;
       timedOut = true;
+      timeoutReason = reason;
+      const label = reason === 'idle'
+        ? `空闲超过 ${Math.round(idleTimeoutMs / 1000)}s 无输出`
+        : `达到绝对上限 ${Math.round(timeoutMs / 1000)}s`;
+      console.warn(`[CLI:${adapter.id}] ${label}，正在终止进程`);
       killProcessTree(child, 'SIGTERM');
       forceKillLater();
-    }, timeoutMs);
+    };
+
+    const armIdleTimer = () => {
+      if (idleTimeoutMs <= 0) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => tripTimeout('idle'), idleTimeoutMs);
+      idleTimer.unref();
+    };
+
+    signal?.addEventListener('abort', onAbort, { once: true });
+
+    const absoluteTimer = setTimeout(() => tripTimeout('absolute'), timeoutMs);
+    armIdleTimer();
 
     const finish = () => {
-      clearTimeout(timer);
+      clearTimeout(absoluteTimer);
+      if (idleTimer) clearTimeout(idleTimer);
       if (forceKillTimer) clearTimeout(forceKillTimer);
       signal?.removeEventListener('abort', onAbort);
     };
@@ -118,9 +205,16 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
       finish();
       reject(error);
     };
+    const timeoutError = () => new Error(
+      timeoutReason === 'idle'
+        ? `${adapter.displayName} 执行超时（超过 ${Math.round(idleTimeoutMs / 1000)}s 无输出，疑似卡住）`
+        : `${adapter.displayName} 执行超时`,
+    );
 
     lines.on('line', (line) => {
       if (internalError) return;
+      // 任意 stdout 行都算活动：工具进度/旁白/结果都会续命，支撑数小时长任务。
+      armIdleTimer();
       if (line.length > MAX_EVENT_LINE_CHARS) {
         internalError = new Error(`${adapter.displayName} 返回的单条事件过大`);
         onAbort();
@@ -167,7 +261,7 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
     });
     child.once('error', (error) => {
       if (timedOut) {
-        fail(new Error(`${adapter.displayName} 执行超时`));
+        fail(timeoutError());
         return;
       }
       if (signal?.aborted) {
@@ -180,7 +274,7 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
       if (settled) return;
       if (internalError) return fail(internalError);
       if (timedOut) {
-        return fail(new Error(`${adapter.displayName} 执行超时`));
+        return fail(timeoutError());
       }
       if (signal?.aborted) {
         return fail(new Error(`${adapter.displayName} 执行已取消`));

@@ -155,6 +155,7 @@ async function runApprovedAction(ctx: AppContext, approval: ApprovalRequest): Pr
       msg,
       task: approval.prompt,
       round: 1,
+      allowFixes: false,
       executionPolicy: 'approved',
       approvedScope: approval.prompt,
       onComplete: async () => {

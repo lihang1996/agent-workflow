@@ -1,0 +1,6 @@
+interface:
+  display_name: "Verify Software Delivery"
+  short_description: "运行完整交付质量门禁并识别测试资源风险、覆盖缺口和假阳性"
+  default_prompt: "使用 $verify-software-delivery 执行本项目全部适用交付检查。"
+policy:
+  allow_implicit_invocation: true

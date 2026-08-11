@@ -152,9 +152,9 @@ function outputArgs(prompt: string, policy: CliExecutionPolicy, approvedScope?: 
     ...(policy === 'input-only'
       ? ['--safe-mode', '--disable-slash-commands', '--no-session-persistence']
       : []),
-    ...(policy === 'approved' || policy === 'input-only'
-      ? []
-      : ['--settings', ensureClaudePermissionSettingsFile()]),
+    // 已审批模式虽然跳过 Claude 的交互式权限询问，仍必须加载 Agent OS
+    // PreToolUse 钩子，以便继续阻断审批类别之外的新高风险动作。
+    ...(policy === 'input-only' ? [] : ['--settings', ensureClaudePermissionSettingsFile()]),
     ...(policy === 'read-only' || policy === 'input-only'
       ? ['--mcp-config', '{"mcpServers":{}}', '--strict-mcp-config']
       : claudeMcpFlags()),

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { JsonCollabStore } from '../src/core/collab-store.js';
-import { isReviewApproved } from '../src/core/collab.js';
+import { isReviewApproved, isReviewExplicitlyApproved } from '../src/core/collab.js';
 
 test('评审只接受明确的通过结论行', () => {
   for (const answer of [
@@ -12,6 +12,9 @@ test('评审只接受明确的通过结论行', () => {
     '结论：[APPROVED]',
     '## 最终结论：LGTM',
     '- 评审通过。',
+    '核验完成。第 3 轮复审结论:**[APPROVED]**',
+    '## 复审结论:通过 ✅',
+    '复审结论：**通过**',
   ]) {
     assert.equal(isReviewApproved(answer), true, answer);
   }
@@ -21,9 +24,18 @@ test('评审只接受明确的通过结论行', () => {
     '修复后可以写 [APPROVED]',
     '结论：[APPROVED]，但还有阻塞问题',
     '请在通过时输出 LGTM',
+    '第 2 轮复审结论:**未通过(No [APPROVED])**',
   ]) {
     assert.equal(isReviewApproved(answer), false, answer);
   }
+  assert.equal(isReviewApproved('[APPROVED]\n最终结论：不通过，仍需修改'), false);
+  assert.equal(isReviewApproved('复审结论：不通过\n[APPROVED]'), true);
+});
+
+test('结构化门禁必须有显式 APPROVED 标记', () => {
+  assert.equal(isReviewExplicitlyApproved('最终结论：评审通过'), false);
+  assert.equal(isReviewExplicitlyApproved('结论：[APPROVED]\n[GATE_RESULT] {}'), true);
+  assert.equal(isReviewExplicitlyApproved('[APPROVED]\n结论：[REJECTED]'), false);
 });
 
 test('协作轮次落盘失败时回滚内存状态', async () => {
