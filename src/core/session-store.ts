@@ -10,9 +10,10 @@ export interface SessionStore {
 
 const SessionSchema = z.object({
   id: z.string().min(1),
+  botId: z.string().min(1),
   threadId: z.string().min(1),
   chatId: z.string().min(1),
-  cliId: z.literal('claude'),
+  cliId: z.enum(['claude', 'codex']),
   cliSessionId: z.string().min(1).optional(),
   status: z.enum(['creating', 'active', 'idle', 'closed']),
   createdAt: z.iso.datetime(),
@@ -20,14 +21,18 @@ const SessionSchema = z.object({
 });
 
 function recoverInterruptedSession(session: Session): Session {
-  if (session.status !== 'creating' && session.status !== 'active') return session;
+  if (session.status !== 'creating' && session.status !== 'active')
+    return session;
   return { ...session, status: 'idle' };
 }
 
 export class JsonSessionStore implements SessionStore {
   private writeQueue: Promise<void> = Promise.resolve();
 
-  constructor(private readonly filePath: string) {}
+  constructor(
+    private readonly filePath: string,
+    private readonly legacyBotId = 'default',
+  ) {}
 
   async load(): Promise<Session[]> {
     let content: string;
@@ -46,11 +51,15 @@ export class JsonSessionStore implements SessionStore {
     const sessions: Session[] = [];
     let needsCleanup = false;
     for (const row of rows) {
-      const result = SessionSchema.safeParse(row);
+      const isLegacy =
+        typeof row === 'object' && row !== null && !('botId' in row);
+      const candidate = isLegacy ? { ...row, botId: this.legacyBotId } : row;
+      const result = SessionSchema.safeParse(candidate);
       if (!result.success) {
         needsCleanup = true;
         continue;
       }
+      if (isLegacy) needsCleanup = true;
 
       const recovered = recoverInterruptedSession(result.data);
       if (recovered.status !== result.data.status) needsCleanup = true;

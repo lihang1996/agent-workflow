@@ -6,6 +6,7 @@ export type SessionStatus = 'creating' | 'active' | 'idle' | 'closed';
 
 export interface Session {
   id: string;
+  botId: string;
   threadId: string;
   chatId: string;
   cliId: CliId;
@@ -44,8 +45,8 @@ function topicIdOf(message: MessageAddress): string {
   return message.threadId || message.rootId || message.messageId;
 }
 
-function sessionKey(chatId: string, threadId: string): string {
-  return `${chatId}:${threadId}`;
+function sessionKey(botId: string, chatId: string, threadId: string): string {
+  return `${botId}:${chatId}:${threadId}`;
 }
 
 export class SessionManager {
@@ -60,11 +61,16 @@ export class SessionManager {
     this.store = options.store;
   }
 
-  static async open(options: SessionManagerOptions = {}): Promise<SessionManager> {
+  static async open(
+    options: SessionManagerOptions = {},
+  ): Promise<SessionManager> {
     const manager = new SessionManager(options);
-    const restored = await options.store?.load() ?? [];
+    const restored = (await options.store?.load()) ?? [];
     for (const session of restored) {
-      manager.sessions.set(sessionKey(session.chatId, session.threadId), session);
+      manager.sessions.set(
+        sessionKey(session.botId, session.chatId, session.threadId),
+        session,
+      );
     }
     return manager;
   }
@@ -74,21 +80,28 @@ export class SessionManager {
   }
 
   get(sessionId: string): Session | undefined {
-    return [...this.sessions.values()].find((session) => session.id === sessionId);
+    return [...this.sessions.values()].find(
+      (session) => session.id === sessionId,
+    );
   }
 
-  async resolve(message: MessageAddress): Promise<ResolvedSession> {
+  async resolve(
+    message: MessageAddress,
+    cliId: CliId = 'claude',
+    botId = 'default',
+  ): Promise<ResolvedSession> {
     const threadId = topicIdOf(message);
-    const key = sessionKey(message.chatId, threadId);
+    const key = sessionKey(botId, message.chatId, threadId);
     const existing = this.sessions.get(key);
     if (existing) return { session: existing, isNew: false };
 
     const now = this.now().toISOString();
     const session: Session = {
       id: this.createId(),
+      botId,
       threadId,
       chatId: message.chatId,
-      cliId: 'claude',
+      cliId,
       status: 'creating',
       createdAt: now,
       updatedAt: now,
@@ -103,7 +116,10 @@ export class SessionManager {
     return { session, isNew: true };
   }
 
-  async transition(sessionId: string, nextStatus: SessionStatus): Promise<Session> {
+  async transition(
+    sessionId: string,
+    nextStatus: SessionStatus,
+  ): Promise<Session> {
     const current = this.get(sessionId);
     if (!current) throw new Error(`会话不存在: ${sessionId}`);
     if (!ALLOWED_TRANSITIONS[current.status].includes(nextStatus)) {
@@ -115,7 +131,7 @@ export class SessionManager {
       status: nextStatus,
       updatedAt: this.now().toISOString(),
     };
-    const key = sessionKey(updated.chatId, updated.threadId);
+    const key = sessionKey(updated.botId, updated.chatId, updated.threadId);
     this.sessions.set(key, updated);
     try {
       await this.persist();
@@ -126,7 +142,10 @@ export class SessionManager {
     return updated;
   }
 
-  async setCliSessionId(sessionId: string, cliSessionId: string): Promise<Session> {
+  async setCliSessionId(
+    sessionId: string,
+    cliSessionId: string,
+  ): Promise<Session> {
     const current = this.get(sessionId);
     if (!current) throw new Error(`会话不存在: ${sessionId}`);
     if (!cliSessionId) throw new Error('CLI 会话 ID 不能为空');
@@ -136,7 +155,7 @@ export class SessionManager {
       cliSessionId,
       updatedAt: this.now().toISOString(),
     };
-    const key = sessionKey(updated.chatId, updated.threadId);
+    const key = sessionKey(updated.botId, updated.chatId, updated.threadId);
     this.sessions.set(key, updated);
     try {
       await this.persist();

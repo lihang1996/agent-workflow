@@ -1,6 +1,6 @@
-import { spawn } from "node:child_process";
-import { createInterface } from "node:readline";
-import type { CliAdapter, CliEvent, CliRunResult } from "./types.js";
+import { spawn } from 'node:child_process';
+import { createInterface } from 'node:readline';
+import type { CliAdapter, CliEvent, CliRunResult } from './types.js';
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -32,19 +32,21 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
     const child = spawn(adapter.command, args, {
       cwd,
       signal,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
     const lines = createInterface({ input: child.stdout });
     let observedSessionId = sessionId;
+    let observedAnswer: string | undefined;
+    let observedStats: CliRunResult['stats'];
     let finalResult: CliRunResult | undefined;
     let resultError: Error | undefined;
-    let stderr = "";
+    let stderr = '';
     let settled = false;
     let timedOut = false;
 
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
+      child.kill('SIGTERM');
     }, timeoutMs);
 
     const finish = () => clearTimeout(timer);
@@ -55,30 +57,33 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
       reject(error);
     };
 
-    lines.on("line", (line) => {
+    lines.on('line', (line) => {
       for (const event of adapter.parseEvents(line)) {
         onEvent?.(event);
-        if ("sessionId" in event && event.sessionId) {
+        if ('sessionId' in event && event.sessionId) {
           observedSessionId = event.sessionId;
         }
-        if (event.type === "error") {
+        if (event.type === 'error') {
           resultError = new Error(event.message);
           continue;
         }
-        if (event.type === "result") {
+        if (event.type === 'result') {
+          if (event.answer) observedAnswer = event.answer;
+          if (event.stats) observedStats = event.stats;
+          if (!observedAnswer) continue;
           finalResult = {
-            answer: event.answer,
+            answer: observedAnswer,
             sessionId: event.sessionId ?? observedSessionId,
-            ...(event.stats ? { stats: event.stats } : {}),
+            ...(observedStats ? { stats: observedStats } : {}),
           };
         }
       }
     });
 
-    child.stderr.on("data", (chunk: Buffer | string) => {
+    child.stderr.on('data', (chunk: Buffer | string) => {
       stderr += chunk.toString();
     });
-    child.once("error", (error) => {
+    child.once('error', (error) => {
       if (timedOut) {
         fail(new Error(`${adapter.displayName} 执行超时`));
         return;
@@ -89,7 +94,7 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
       }
       fail(error);
     });
-    child.once("close", (code) => {
+    child.once('close', (code) => {
       if (settled) return;
       if (timedOut) {
         return fail(new Error(`${adapter.displayName} 执行超时`));
@@ -99,11 +104,9 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
       }
       if (resultError) return fail(resultError);
       if (code !== 0) {
-        return fail(
-          new Error(
-            stderr.trim() || `${adapter.displayName} 退出，状态码 ${code}`,
-          ),
-        );
+        return fail(new Error(
+          stderr.trim() || `${adapter.displayName} 退出，状态码 ${code}`,
+        ));
       }
       if (!finalResult) {
         return fail(new Error(`${adapter.displayName} 没有返回最终结果`));
