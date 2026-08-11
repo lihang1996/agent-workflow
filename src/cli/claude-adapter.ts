@@ -1,4 +1,4 @@
-import type { CliAdapter, CliEvent, CliRunStats } from "./types.js";
+import type { CliAdapter, CliEvent, CliRunStats } from './types.js';
 
 interface ClaudeEvent {
   type?: unknown;
@@ -23,53 +23,51 @@ interface ClaudeContentBlock {
 }
 
 const TOOL_LABELS: Record<string, string> = {
-  Agent: "启动子任务",
-  Bash: "运行命令",
-  Edit: "修改文件",
-  Glob: "查找文件",
-  Grep: "搜索代码",
-  Read: "读取文件",
-  Task: "启动子任务",
-  TaskOutput: "等待子任务完成",
-  WebFetch: "读取网页",
-  WebSearch: "搜索资料",
-  Write: "写入文件",
+  Agent: '启动子任务',
+  Bash: '运行命令',
+  Edit: '修改文件',
+  Glob: '查找文件',
+  Grep: '搜索代码',
+  Read: '读取文件',
+  Task: '启动子任务',
+  TaskOutput: '等待子任务完成',
+  WebFetch: '读取网页',
+  WebSearch: '搜索资料',
+  Write: '写入文件',
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
+  return typeof value === 'object' && value !== null;
 }
 
 function asNumber(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value)
-    ? value
-    : undefined;
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
 function shortPath(value: unknown): string | undefined {
-  if (typeof value !== "string" || !value) return undefined;
-  const normalized = value.replaceAll("\\", "/");
-  const parts = normalized.split("/").filter(Boolean);
-  return parts.slice(normalized.startsWith("/") ? -2 : -3).join("/");
+  if (typeof value !== 'string' || !value) return undefined;
+  const normalized = value.replaceAll('\\', '/');
+  const parts = normalized.split('/').filter(Boolean);
+  return parts.slice(normalized.startsWith('/') ? -2 : -3).join('/');
 }
 
 function shortText(value: unknown, maxLength = 72): string | undefined {
-  if (typeof value !== "string") return undefined;
-  const text = value.replace(/\s+/g, " ").trim();
+  if (typeof value !== 'string') return undefined;
+  const text = value.replace(/\s+/g, ' ').trim();
   if (!text) return undefined;
   return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
 }
 
 function toolDetail(name: string, input: unknown): string | undefined {
   if (!isRecord(input)) return undefined;
-  if (["Read", "Edit", "Write"].includes(name)) {
+  if (['Read', 'Edit', 'Write'].includes(name)) {
     return shortPath(input.file_path);
   }
-  if (name === "Glob") return shortText(input.pattern);
-  if (name === "Grep") return shortText(input.pattern);
-  if (name === "Bash") return shortText(input.description);
-  if (name === "Agent" || name === "Task") return shortText(input.description);
-  if (name === "WebSearch") return shortText(input.query);
+  if (name === 'Glob') return shortText(input.pattern);
+  if (name === 'Grep') return shortText(input.pattern);
+  if (name === 'Bash') return shortText(input.description);
+  if (name === 'Agent' || name === 'Task') return shortText(input.description);
+  if (name === 'WebSearch') return shortText(input.query);
   return undefined;
 }
 
@@ -86,9 +84,7 @@ function usageTokens(usage: unknown): number | undefined {
     asNumber(usage.cache_read_input_tokens),
     asNumber(usage.cache_creation_input_tokens),
   ].filter((value): value is number => value !== undefined);
-  return values.length
-    ? values.reduce((sum, value) => sum + value, 0)
-    : undefined;
+  return values.length ? values.reduce((sum, value) => sum + value, 0) : undefined;
 }
 
 function contextWindowTokens(modelUsage: unknown): number | undefined {
@@ -120,20 +116,37 @@ function parseStats(event: ClaudeEvent): CliRunStats | undefined {
 }
 
 function outputArgs(prompt: string): string[] {
-  return ["-p", prompt, "--output-format", "stream-json", "--verbose"];
+  return [
+    '-p',
+    prompt,
+    '--output-format',
+    'stream-json',
+    '--verbose',
+  ];
 }
 
 export class ClaudeAdapter implements CliAdapter {
-  readonly id = "claude" as const;
-  readonly command = "claude";
-  readonly displayName = "Claude Code";
+  readonly id = 'claude' as const;
+  readonly command = 'claude';
+  readonly displayName = 'Claude Code';
 
   buildArgs(prompt: string): string[] {
     return outputArgs(prompt);
   }
 
   buildResumeArgs(prompt: string, sessionId: string): string[] {
-    return ["--resume", sessionId, ...outputArgs(prompt)];
+    return ['--resume', sessionId, ...outputArgs(prompt)];
+  }
+
+  buildCompactPlan(sessionId: string, instructions?: string) {
+    const command = instructions?.trim()
+      ? `/compact ${instructions.trim()}`
+      : '/compact';
+    return {
+      protocol: 'claude-stream-json' as const,
+      command: this.command,
+      args: this.buildResumeArgs(command, sessionId),
+    };
   }
 
   parseEvent(line: string): CliEvent | undefined {
@@ -148,77 +161,64 @@ export class ClaudeAdapter implements CliAdapter {
       return [];
     }
 
-    const sessionId =
-      typeof event.session_id === "string" ? event.session_id : undefined;
-    if (event.type === "system" && event.subtype === "init" && sessionId) {
-      return [{ type: "session", sessionId }];
+    const sessionId = typeof event.session_id === 'string'
+      ? event.session_id
+      : undefined;
+    if (event.type === 'system' && event.subtype === 'init' && sessionId) {
+      return [{ type: 'session', sessionId }];
     }
-    if (event.type === "assistant") {
+    if (event.type === 'assistant') {
       const message = isRecord(event.message) ? event.message : {};
       const usedTokens = usageTokens(message.usage);
-      const contextEvent: CliEvent[] =
-        usedTokens === undefined ? [] : [{ type: "context", usedTokens }];
-      const toolEvents = messageBlocks(event.message).flatMap(
-        (block): CliEvent[] => {
-          if (
-            block.type !== "tool_use" ||
-            typeof block.id !== "string" ||
-            typeof block.name !== "string"
-          )
-            return [];
-          const detail = toolDetail(block.name, block.input);
-          return [
-            {
-              type: "tool_start",
-              toolUseId: block.id,
-              toolName: block.name,
-              label: TOOL_LABELS[block.name] ?? `调用 ${block.name}`,
-              ...(detail ? { detail } : {}),
-            },
-          ];
-        },
-      );
+      const contextEvent: CliEvent[] = usedTokens === undefined
+        ? []
+        : [{ type: 'context', usedTokens }];
+      const toolEvents = messageBlocks(event.message).flatMap((block): CliEvent[] => {
+        if (
+          block.type !== 'tool_use'
+          || typeof block.id !== 'string'
+          || typeof block.name !== 'string'
+        ) return [];
+        const detail = toolDetail(block.name, block.input);
+        return [{
+          type: 'tool_start',
+          toolUseId: block.id,
+          toolName: block.name,
+          label: TOOL_LABELS[block.name] ?? `调用 ${block.name}`,
+          ...(detail ? { detail } : {}),
+        }];
+      });
       return [...contextEvent, ...toolEvents];
     }
-    if (event.type === "user") {
+    if (event.type === 'user') {
       return messageBlocks(event.message).flatMap((block): CliEvent[] => {
-        if (
-          block.type !== "tool_result" ||
-          typeof block.tool_use_id !== "string"
-        ) {
+        if (block.type !== 'tool_result' || typeof block.tool_use_id !== 'string') {
           return [];
         }
-        return [
-          {
-            type: "tool_end",
-            toolUseId: block.tool_use_id,
-            failed: block.is_error === true,
-          },
-        ];
+        return [{
+          type: 'tool_end',
+          toolUseId: block.tool_use_id,
+          failed: block.is_error === true,
+        }];
       });
     }
-    if (event.type !== "result") return [];
+    if (event.type !== 'result') return [];
     if (event.is_error) {
-      return [
-        {
-          type: "error",
-          message:
-            typeof event.result === "string"
-              ? event.result
-              : "Claude Code 执行失败",
-          ...(sessionId ? { sessionId } : {}),
-        },
-      ];
-    }
-    if (typeof event.result !== "string") return [];
-    const stats = parseStats(event);
-    return [
-      {
-        type: "result",
-        answer: event.result,
+      return [{
+        type: 'error',
+        message: typeof event.result === 'string'
+          ? event.result
+          : 'Claude Code 执行失败',
         ...(sessionId ? { sessionId } : {}),
-        ...(stats ? { stats } : {}),
-      },
-    ];
+      }];
+    }
+    if (typeof event.result !== 'string') return [];
+    const stats = parseStats(event);
+    return [{
+      type: 'result',
+      answer: event.result,
+      ...(sessionId ? { sessionId } : {}),
+      ...(stats ? { stats } : {}),
+    }];
   }
 }

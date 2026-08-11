@@ -1,4 +1,17 @@
-export type CliId = "claude" | "codex";
+export type CliId = 'claude' | 'codex';
+
+export type CliCompactPlan =
+  | {
+      protocol: 'claude-stream-json';
+      command: string;
+      args: string[];
+    }
+  | {
+      protocol: 'codex-app-server';
+      command: string;
+      args: string[];
+      sessionId: string;
+    };
 
 export interface CliRunStats {
   durationMs?: number;
@@ -12,19 +25,25 @@ export interface CliRunStats {
   contextWindowTokens?: number;
 }
 
+export interface CliSessionSummary {
+  id: string;
+  title: string;
+  updatedAt: string;
+}
+
 export type CliEvent =
-  | { type: "session"; sessionId: string }
+  | { type: 'session'; sessionId: string }
   | {
-      type: "tool_start";
+      type: 'tool_start';
       toolUseId: string;
       toolName: string;
       label: string;
       detail?: string;
     }
-  | { type: "tool_end"; toolUseId: string; failed: boolean }
-  | { type: "context"; usedTokens: number }
-  | { type: "result"; answer: string; sessionId?: string; stats?: CliRunStats }
-  | { type: "error"; message: string; sessionId?: string };
+  | { type: 'tool_end'; toolUseId: string; failed: boolean }
+  | { type: 'context'; usedTokens: number }
+  | { type: 'result'; answer: string; sessionId?: string; stats?: CliRunStats }
+  | { type: 'error'; message: string; sessionId?: string };
 
 export interface CliAdapter {
   readonly id: CliId;
@@ -32,6 +51,7 @@ export interface CliAdapter {
   readonly displayName: string;
   buildArgs(prompt: string): string[];
   buildResumeArgs(prompt: string, sessionId: string): string[];
+  buildCompactPlan(sessionId: string, instructions?: string): CliCompactPlan;
   parseEvents(line: string): CliEvent[];
 }
 
