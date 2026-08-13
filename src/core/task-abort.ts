@@ -1,4 +1,5 @@
 import { canControlOwnedResource } from './access.js';
+import type { IdentityInput, IdentityRegistry } from './identity-registry.js';
 
 export interface AbortableRun {
   controller: AbortController;
@@ -16,11 +17,12 @@ export type AbortTaskOutcome =
 export function requestTaskAbort(
   activeRuns: Map<string, AbortableRun>,
   sessionId: string,
-  operatorOpenId: string,
+  operator: IdentityInput,
+  identities?: IdentityRegistry,
 ): AbortTaskOutcome {
   const active = activeRuns.get(sessionId);
   if (!active) return "not_found";
-  if (!canControlOwnedResource(active.ownerOpenId, operatorOpenId)) return "forbidden";
+  if (!canControlOwnedResource(active.ownerOpenId, operator, identities)) return "forbidden";
   if (active.controller.signal.aborted) return "already_stopping";
   active.cancelMode = "stop";
   active.controller.abort();

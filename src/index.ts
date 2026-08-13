@@ -4,6 +4,7 @@
  */
 import 'dotenv/config';
 import { join } from 'node:path';
+import { open, rm } from 'node:fs/promises';
 import { startBot } from './im/lark.js';
 import { parseMaxRounds } from './core/collab.js';
 import { JsonActiveRunStore } from './core/active-run-store.js';
@@ -18,6 +19,7 @@ import { JsonSpecStore } from './core/spec-store.js';
 import { JsonScheduleStore } from './core/schedule-store.js';
 import { JsonApprovalStore } from './core/approval-store.js';
 import { JsonWorkflowStore } from './core/workflow-store.js';
+import { IdentityRegistry } from './core/identity-registry.js';
 import { resolveWorkdir } from './core/workdir.js';
 import { sanitizeForLog } from './core/log-inspection.js';
 import { listEngines } from './cli/registry.js';
@@ -49,6 +51,24 @@ if (botConfigs.length === 0) {
 }
 
 console.log('Agent OS 启动，正在建立飞书长连接…');
+
+// P0 修复：单实例锁，防止两个 pnpm start 跨进程 last-writer-wins 丢更新。
+const LOCK_FILE = join('data', '.agent-os.lock');
+let lockHandle: import('node:fs/promises').FileHandle | undefined;
+try {
+  await import('node:fs/promises').then((fs) => fs.mkdir('data', { recursive: true }));
+  lockHandle = await open(LOCK_FILE, 'wx');
+  await lockHandle.write(`${process.pid}\n`);
+  process.on('exit', () => {
+    try { lockHandle?.close(); } catch { /* ignore */ }
+    try { rm(LOCK_FILE); } catch { /* ignore */ }
+  });
+} catch {
+  console.error(`[启动] 检测到另一个 Agent OS 实例正在运行（${LOCK_FILE} 已存在）。`);
+  console.error('[启动] 同时运行两个实例会导致跨进程丢更新、重复调度和数据损坏。');
+  console.error('[启动] 如确认没有其他实例，请删除该锁文件后重试。');
+  process.exit(1);
+}
 for (const engine of listEngines()) {
   console.log(`[CLI] ${engine.id}=${engine.command} fallbackCwd=${resolveWorkdir({ cliId: engine.id })}`);
 }
@@ -73,8 +93,9 @@ const specs = await JsonSpecStore.open(join('data', 'specs.json'));
 const schedules = await JsonScheduleStore.open(join('data', 'schedules.json'));
 const approvals = await JsonApprovalStore.open(join('data', 'approvals.json'));
 const workflows = await JsonWorkflowStore.open(join('data', 'workflows.json'));
+const identities = await IdentityRegistry.open(join('data', 'user-identities.json'));
 console.log(
-  `[会话] 已恢复 ${sessions.size} 个会话，${topics.size} 个话题设置，${collabStore.size} 个协作轮次`,
+  `[会话] 已恢复 ${sessions.size} 个会话，${topics.size} 个话题设置，${collabStore.size} 个协作轮次，${identities.size} 个用户身份别名`,
 );
 
 const app = createApp({
@@ -87,6 +108,7 @@ const app = createApp({
   schedules,
   approvals,
   workflows,
+  identities,
   config: {
     defaultCliId,
     collabMaxRounds,

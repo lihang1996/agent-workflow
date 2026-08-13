@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { readFile } from "node:fs/promises";
+import { validateFindingsArray } from "../../_shared/finding-fields.mjs";
 
 const path = process.argv[2];
 if (!path) {
@@ -53,6 +54,7 @@ if (audit.status === "not-applicable") {
     errors.push("not-applicable audit needs applicability.reason and non-empty applicability.evidence");
   }
   if (!Array.isArray(audit.findings)) errors.push("findings must be an array");
+  else errors.push(...validateFindingsArray(audit.findings, { allowPlanned: false }));
   process.stdout.write(`${JSON.stringify({ status: errors.length ? "fail" : "pass", errors }, null, 2)}\n`);
   process.exit(errors.length ? 2 : 0);
 }
@@ -85,8 +87,8 @@ if ((audit.findings ?? []).some((item) =>
   && !(item?.status === "waived" && waiverForFinding(item)))) {
   errors.push("unwaived P0/P1 runtime findings remain");
 }
+errors.push(...validateFindingsArray(audit.findings ?? [], { allowPlanned: false }));
 for (const [index, finding] of (audit.findings ?? []).entries()) {
-  if (finding?.status === "planned") errors.push(`findings[${index}] cannot remain planned at runtime audit`);
   if (finding?.status === "waived" && !waiverForFinding(finding)) {
     errors.push(`findings[${index}] waiver is incomplete, ambiguous or expired`);
   }

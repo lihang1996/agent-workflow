@@ -97,11 +97,15 @@ pnpm test
 pnpm start
 ```
 
-`pnpm start` 使用 `tsx watch` 监听源码和 `.env`，适合本地开发热重载；如需不带 watch 的前台启动，可使用：
+`pnpm start` 使用稳定的单进程前台模式，源码或 `.env` 变化不会在流水线执行中发送 SIGTERM。需要开发热重载时使用：
 
 ```bash
-pnpm start:once
+pnpm dev
 ```
+
+`pnpm dev` 会在源码或 `.env` 变化时重启服务；进行中的持久化流水线会在新进程恢复，但当前 CLI 子任务必须重新执行。因此长时间交付建议使用 `pnpm start`。
+
+`pnpm start` 不会热加载新代码。若运行期间修改了 Agent OS 自身的 `src/`、`skills/`、`scripts/`、`package.json` 或 `.env`，控制器会在下一个技术步骤或结果提交前原地暂停，并提示“Agent OS 源码已更新，请重启服务后重试”；它不会继续运行半新半旧的门禁逻辑。重启后在原阻塞卡重试即可从同一步恢复。
 
 生产环境若执行编译后的 `dist`，请统一使用：
 
@@ -124,7 +128,7 @@ pnpm start:prod
 开发时还可使用：
 
 ```bash
-pnpm dev        # pnpm start 的别名
+pnpm dev        # 开发热重载（长时间流水线建议改用 pnpm start）
 pnpm probe      # 只校验 Bot 凭证和机器人身份，不发送消息
 pnpm probe:cli  # 手工查看 CLI 的 JSON 流事件
 ```
@@ -146,6 +150,17 @@ pnpm probe:cli  # 手工查看 CLI 的 JSON 流事件
 
 每个前缀至少需要 `<PREFIX>_APP_ID` 和 `<PREFIX>_APP_SECRET`，还可设置 `<PREFIX>_NAME`、`<PREFIX>_WORKDIR`。开发 Bot 兼容旧变量 `BOT_A_APP_ID` / `BOT_A_APP_SECRET`。
 
+### 用户身份与权限
+
+飞书 `open_id` 只在单个应用内稳定；同一个人在 CEO、QA 等不同 Bot 下会得到不同的 `open_id`。Agent OS 会从飞书签名事件读取 `user_id` / `union_id`，把可信别名原子保存到 `data/user-identities.json`，因此任务停止、工作流重试、Spec、问卷、定时任务和审批都能跨 Bot 识别同一个人，服务重启后仍然有效。旧数据只有 `open_id` 时也会在该用户下一次与原 Bot 交互后自动建立映射。
+
+| 变量 | 说明 |
+| --- | --- |
+| `OWNER_USER_ID` / `OWNER_UNION_ID` | 推荐的负责人稳定身份；任一即可，适合多 Bot 部署 |
+| `OWNER_OPEN_ID` | 兼容单 Bot 和旧配置；运行期间会通过可信事件映射到稳定身份 |
+| `AGENT_OS_ALLOWED_USER_IDS` / `AGENT_OS_ALLOWED_UNION_IDS` | 额外授权用户的稳定 ID，多个值用逗号分隔 |
+| `AGENT_OS_ALLOWED_OPEN_IDS` | 兼容旧版的应用级白名单，多个值用逗号分隔 |
+
 ### 引擎、流水线和工作目录
 
 | 变量 | 说明 | 默认/回退 |
@@ -158,8 +173,10 @@ pnpm probe:cli  # 手工查看 CLI 的 JSON 流事件
 | `MCP_STRICT` | Claude 是否加 `--strict-mcp-config` | `false` |
 | `CLAUDE_WORKDIR` | Claude 全局回退目录 | 当前工作目录 |
 | `CODEX_WORKDIR` | Codex 全局回退目录；未设置时继续回退到 `CLAUDE_WORKDIR`、当前工作目录 | 未设置时按上述顺序回退 |
-| `CODEX_SANDBOX` | Codex 普通任务沙箱：`read-only` 或 `workspace-write`；配置为全权限会安全回退 | `workspace-write` |
-| `CODEX_APPROVED_SANDBOX` | 仅审批通过的 Codex 任务沙箱：`read-only`、`workspace-write` 或 `danger-full-access`；全权限必须显式配置 | `workspace-write` |
+| `CODEX_SANDBOX` | Codex 普通任务权限：默认与 Claude dontAsk 对齐（`:danger-full-access` permission profile，不传 `--sandbox`）。设 `workspace-write` 或 `read-only` 才会收紧 | 未设置即全权限对齐 Claude |
+| `CODEX_LOCAL_NETWORK_ACCESS` | `false` 时禁止 Codex 本机网络/绑定（会从默认全权限降到无网络的 workspace profile） | `true`（未设置即允许） |
+| `CODEX_APPROVED_SANDBOX` | 已审批 Codex 任务权限；默认同样对齐 Claude skip-permissions。设 `workspace-write` 或 `read-only` 才会收紧 | 未设置即全权限对齐 Claude |
+| `AGENT_OS_TEST_RESOURCE_SENTINEL` | 明确授权 QA 对已通过隔离性预检的测试库执行 migration/TRUNCATE/DROP/seed；不能替代测试库命名与运行库不相等检查 | 未设置（不授权） |
 | `CLI_TIMEOUT_MS` | 单次 Claude/Codex **绝对**超时上限（毫秒）。持续有输出的长任务可跑到此上限；默认 6 小时，最大 12 小时 | `21600000`（6 小时） |
 | `CLI_IDLE_TIMEOUT_MS` | 无 stream 输出多久视为卡住并终止（毫秒）；有工具/旁白输出会自动续命。`0` 关闭空闲检测 | `1200000`（20 分钟） |
 | `APPROVAL_TTL_MINUTES` | 高风险审批有效期（1–1440 分钟） | `30` |
@@ -215,7 +232,7 @@ CEO 统一入口 → MCP 结构化问题 → /form 点选澄清
 - Spec 的“确认方案”与“退回修改”使用独立交互；修改意见只会随“退回修改”提交，不会被误当作确认输入。
 - 确认后点击「发布到飞书云文档」，系统会创建 Docx 并按块层级写入 Markdown；后续修订覆盖同一文档，不会更换评审链接。
 - 评审卡的“要求修改”和云文档里直接新增的评论/回复都会交给产品经理；修订版会重新进入确认流程，已处理评论同步标记为解决。
-- 普通 Spec 的确认卡可选择直接开始技术交付，或发布到飞书云文档继续产品评审；两条路径都会先固化同一份 canonical Spec，再执行架构、开发、代码评审、QA、运行时审计和最终审查。含 `[RISK_WAIVER]` 的 Spec 不显示直接开始入口，必须发布完整云文档并由当前 `OWNER_OPEN_ID`（未配置时为需求发起人）批准，避免在被截断的卡片预览中接受未读风险。也可用 `/squad` 单独启动内部交付小队。
+- 普通 Spec 的确认卡可选择直接开始技术交付，或发布到飞书云文档继续产品评审；两条路径都会先固化同一份 canonical Spec，再执行架构、开发、代码评审、QA、运行时审计和最终审查。含 `[RISK_WAIVER]` 的 Spec 不显示直接开始入口，必须发布完整云文档并由当前 `OWNER_*` 身份（未配置时为需求发起人）批准，避免在被截断的卡片预览中接受未读风险。也可用 `/squad` 单独启动内部交付小队。
 - 飞书应用需具备 Docx 创建/读取/编辑、Drive 文件评论读取/写入权限。建议在事件订阅中添加 `drive.notice.comment_add_v1`；即使事件暂未配置，服务也会定时补偿拉取评审评论。
 
 ## 会话与协作模型
@@ -231,6 +248,7 @@ CEO 统一入口 → MCP 结构化问题 → /form 点选澄清
 - 新交付工作流必须绑定真实项目目录。PM Spec 中每项需求须以稳定 ID 开头（例如 `### RQ-001 登录`）；所有设计、实现、评审、QA、运行时和终审 artifact 必须精确覆盖同一组 ID。
 - 非 PM 步骤必须显式输出 `[RESULT:done|blocked|failed]`。`[GATE_RESULT]` 后的 JSON 用括号平衡解析（可跨行），其中的检查命令、时间、退出码、artifact 路径与 SHA-256 都由控制器复核；空检查、伪造 hash、符号链接逃逸、过期证据和未闭环 P0/P1 会 fail closed。
 - 控制器在证据目录写入不可由 Agent 声明或改写的 `canonical-spec.md` 与 `evidence-chain.json`。`waived` finding 必须在人工确认前以同 ID `[RISK_WAIVER]` 写入 canonical Spec，批准时间和证据引用由控制器生成；评审阶段临时填写 owner/期限不构成人工授权。含风险接受条款的 Spec 强制走完整云文档评审，只有当前负责人可以最终批准。QA 若验证独立构建产物，还必须提供 `buildArtifact`，后续门禁会重新哈希；最终完成前会重验最新一轮完整证据链、源码 fingerprint、构建产物和需求覆盖。
+- Codex 交付流水线的可写任务默认与 Claude dontAsk 对齐（`:danger-full-access`，可启动本机服务、浏览器和隔离测试库）；普通聊天同样具备该运行时能力，高风险命令仍被 `untrusted` 审批阻断。启动日志会记录 `requested/configApplied/expected/reason`。migration/TRUNCATE/DROP/seed 仍需资源预检；负责人可在阻塞卡上确认隔离测试库并授权（仅当前流水线 QA 生效），也可显式设置 `AGENT_OS_TEST_RESOURCE_SENTINEL=true`。两种方式都不能绕过测试库命名和“不得等于开发/生产库”的检查。
 - 最终状态分为 clean 与 conditional：存在有效 waiver、开放 P2/P3 或可选检查缺口时只能“有条件完成”，不会显示成无风险通过。步骤状态先持久化，再落终态卡、释放当前 Bot 会话，最后启动下一步，避免异步回调覆盖新任务状态。
 
 ## 主动式 Agent
@@ -248,7 +266,7 @@ CEO 统一入口 → MCP 结构化问题 → /form 点选澄清
 
 日志巡检会先确认路径是可信根目录中的普通文件，再由 Agent OS 宿主以只读方式截取最后 500 行（最多 128 KiB）。凭证、Cookie、JWT、常见平台 Token 和连接串密码会先脱敏，日志内伪造的提示词/分隔符会被转义；报告固定给出异常计数、行号证据、影响和建议。巡检不会把日志路径误当成高风险执行指令，也不得调用工具、删除、截断、重启或部署；P0/P1 只上报，后续动作仍需经过审批门。日志位于项目目录之外时，请把其父目录加入 `AGENT_OS_ALLOWED_ROOTS`。
 
-高风险词（例如生产部署、外部推送、删除数据、权限/密钥变更）会自动弹出审批卡。仅 `OWNER_OPEN_ID` 指定的人可批准；未设置时，原始需求发起人拥有审批权。审批默认 30 分钟过期，批准后只放行最初审批卡绑定的这一项任务及其风险类别，例如“批准推送”不能被扩大成“删除数据”；新增风险必须重新审批。重复消息和重复点击都不会并发启动，负责人配置变更后旧负责人也不能继续使用历史卡片。执行结果会回写原审批卡，启动失败可在卡片上重试。普通 Codex 任务对不可信命令保持内置审批阻断，日志巡检使用一次性“仅输入分析”会话；已批准 Codex 任务默认仍为 `workspace-write`，只有管理员显式配置 `CODEX_APPROVED_SANDBOX=danger-full-access` 时才开放主机级权限，Claude 已批准模式仍保留 Agent OS 的超范围 PreToolUse 拦截。
+高风险词（例如生产部署、外部推送、删除数据、权限/密钥变更）会自动弹出审批卡。仅 `OWNER_USER_ID` / `OWNER_UNION_ID` / `OWNER_OPEN_ID` 指定的人可批准；未设置时，原始需求发起人拥有审批权。审批默认 30 分钟过期，批准后只放行最初审批卡绑定的这一项任务及其风险类别，例如“批准推送”不能被扩大成“删除数据”；新增风险必须重新审批。重复消息和重复点击都不会并发启动，负责人配置变更后旧负责人也不能继续使用历史卡片。执行结果会回写原审批卡，启动失败可在卡片上重试。普通 Codex 任务对不可信命令保持 `--ask-for-approval untrusted`，默认权限与 Claude dontAsk 对齐（不传 `--sandbox`，使用 `:danger-full-access`）；日志巡检使用一次性“仅输入分析”会话。已批准 Codex 默认同样对齐 Claude skip-permissions；若要收紧再设 `CODEX_APPROVED_SANDBOX=workspace-write`。Claude 已批准模式仍保留 Agent OS 的超范围 PreToolUse 拦截。
 
 定时高风险任务在等待审批期间保持“执行中”，批准后的真实成功/失败、拒绝或超时会再回写定时任务状态，因此不会把“仅成功发出审批卡”误记成任务成功。
 
@@ -273,6 +291,8 @@ pnpm test
 - **群聊没有响应**：确认已 @ 正确的 Bot、应用已加入群，并已开启飞书事件长连接。
 - **工作目录不存在**：`/workdir` 设置前确认路径是已存在的目录。
 - **恢复了旧上下文但目录已变更**：重新发送 `/workdir <路径>` 或 `/reset`，让系统建立新的 CLI 会话。
+- **提示“Agent OS 源码已更新”**：当前 `pnpm start` 进程仍在执行启动时加载的旧控制器代码。停止并重新执行 `pnpm start`（生产模式执行 `pnpm start:prod`），再点击新阻塞卡的重试按钮；不要在旧进程上反复重试。
+- **本地服务/浏览器仍报 EPERM**：先确认当前进程已加载不传 `--sandbox`、带 `default_permissions=":danger-full-access"` 的新参数；旧进程热重启前仍会走 `workspace-write` 旧沙箱。若 `.env` 显式写了 `CODEX_SANDBOX=workspace-write`，需要删掉或改成与 Claude 对齐的默认。子会话若仍返回 EPERM 必须如实阻塞，不能伪造运行态通过证据。
 - **云文档发布/评论失败**：检查飞书应用是否已申请并获批 Docx 创建/读取/编辑、Drive 文件评论读取/写入权限，并确认应用对目标文档有访问权；实时评论还需订阅 `drive.notice.comment_add_v1`。
 
 ## 已知限制 / 待补充

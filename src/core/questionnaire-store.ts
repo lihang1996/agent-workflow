@@ -137,6 +137,79 @@ export class JsonQuestionnaireStore {
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
   }
 
+  /**
+   * Codex MCP 若没注入 AGENT_OS_WORKFLOW_ID，问卷会落成无作用域记录。
+   * 产品步骤允许用输出里的 `/form <id>` 或 questionnaireId 找回同一份待回答问卷。
+   */
+  async recoverAwaitingFromProductOutput(
+    text: string,
+    workflowId: string,
+  ): Promise<Questionnaire | undefined> {
+    const ids = extractQuestionnaireIdsFromText(text);
+    if (ids.length === 0) return undefined;
+    const candidates: Questionnaire[] = [];
+    for (const id of ids) {
+      const row = await this.get(id);
+      if (!row || row.status !== 'awaiting_answers') continue;
+      if (row.workflowId && row.workflowId !== workflowId) continue;
+      candidates.push(row);
+    }
+    const unique = [...new Map(candidates.map((row) => [row.id, row])).values()];
+    if (unique.length === 0) return undefined;
+    if (unique.length > 1) {
+      throw new Error(
+        `产品输出提到了多份待回答问卷（${unique.map((row) => row.id).join(', ')}），无法确定应暂停哪一份。`,
+      );
+    }
+    return unique[0];
+  }
+
+  async attachWorkflowContext(
+    id: string,
+    context: {
+      workflowId: string;
+      chatId?: string;
+      topicId?: string;
+      ownerOpenId?: string;
+      botId?: string;
+      messageId?: string;
+    },
+  ): Promise<Questionnaire> {
+    return this.enqueueMutation(async () => {
+      const current = await this.get(id);
+      if (!current) throw new Error(`问卷不存在: ${id}`);
+      if (current.status !== 'awaiting_answers') {
+        throw new Error(`问卷 ${id} 不是待回答状态`);
+      }
+      const fields: Array<[keyof typeof context, string | undefined]> = [
+        ['workflowId', current.workflowId],
+        ['chatId', current.chatId],
+        ['topicId', current.topicId],
+        ['ownerOpenId', current.ownerOpenId],
+        ['botId', current.botId],
+        ['messageId', current.messageId],
+      ];
+      for (const [key, existing] of fields) {
+        const incoming = context[key];
+        if (existing && incoming && existing !== incoming) {
+          throw new Error(`问卷 ${id} 已绑定其他上下文（${key}）`);
+        }
+      }
+      const questionnaire = QuestionnaireSchema.parse({
+        ...current,
+        workflowId: current.workflowId ?? context.workflowId,
+        chatId: current.chatId ?? context.chatId,
+        topicId: current.topicId ?? context.topicId,
+        ownerOpenId: current.ownerOpenId ?? context.ownerOpenId,
+        botId: current.botId ?? context.botId,
+        messageId: current.messageId ?? context.messageId,
+        updatedAt: nextUpdatedAt(current.updatedAt),
+      });
+      await this.write(questionnaire);
+      return questionnaire;
+    });
+  }
+
   /** 启动时完整校验问卷目录，避免损坏记录在工作流执行到一半时才暴露。 */
   private async validateAll(): Promise<void> {
     let names: string[];
@@ -280,6 +353,29 @@ function normalizeAnswers(
     normalized[id] = values;
   }
   return normalized;
+}
+
+const FORM_COMMAND_ID_RE = /\/form\s+([0-9a-f]{8}(?:-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})?)\b/gi;
+const QUESTIONNAIRE_ID_JSON_RE = /"questionnaireId"\s*:\s*"([0-9a-f]{8}(?:-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})?)"/gi;
+
+/** 从 PM 终稿或 MCP 预览里提取问卷 ID；同一 ID 出现多次只保留一次。 */
+export function extractQuestionnaireIdsFromText(text: string): string[] {
+  const seen = new Set<string>();
+  const ids: string[] = [];
+  for (const pattern of [FORM_COMMAND_ID_RE, QUESTIONNAIRE_ID_JSON_RE]) {
+    pattern.lastIndex = 0;
+    for (const match of text.matchAll(pattern)) {
+      const candidate = match[1];
+      if (!candidate) continue;
+      const parsed = QuestionnaireIdSchema.safeParse(candidate);
+      if (!parsed.success) continue;
+      const normalized = parsed.data.toLowerCase();
+      if (seen.has(normalized)) continue;
+      seen.add(normalized);
+      ids.push(parsed.data);
+    }
+  }
+  return ids;
 }
 
 export interface QuestionnaireAccessContext {

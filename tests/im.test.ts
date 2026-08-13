@@ -8,7 +8,12 @@ import {
   resolveMentions,
 } from '../src/im/message-parser.js';
 import { parseCommand } from '../src/core/command-parser.js';
-import { documentClientToken, resourceLocalName, sanitizeDocumentTitle } from '../src/im/lark.js';
+import {
+  documentClientToken,
+  parseCardAction,
+  resourceLocalName,
+  sanitizeDocumentTitle,
+} from '../src/im/lark.js';
 import { buildSpecConfirmationCard } from '../src/im/workflow-card.js';
 import type { ProductSpec } from '../src/core/spec-store.js';
 
@@ -32,6 +37,26 @@ function spec(status: ProductSpec['status']): ProductSpec {
     updatedAt: '2026-01-01T00:00:00.000Z',
   };
 }
+
+test('卡片回调同时保留应用级和跨应用稳定用户 ID', () => {
+  const action = parseCardAction({
+    operator: {
+      open_id: 'ou_qa_scoped',
+      user_id: 'u_tenant_stable',
+      union_id: 'on_developer_stable',
+    },
+    context: { open_message_id: 'om_card' },
+    action: { value: { action: 'abort_task' }, form_value: { reason: 'stop' } },
+  });
+  assert.deepEqual(action, {
+    operatorOpenId: 'ou_qa_scoped',
+    operatorUserId: 'u_tenant_stable',
+    operatorUnionId: 'on_developer_stable',
+    messageId: 'om_card',
+    value: { action: 'abort_task' },
+    formValue: { reason: 'stop' },
+  });
+});
 
 test('Spec 确认卡在待确认状态同时提供云文档评审与直接开始两个入口', () => {
   const card = buildSpecConfirmationCard(spec('pending_confirmation'));

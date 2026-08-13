@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { readFile } from "node:fs/promises";
+import { validateFindingsArray } from "../../_shared/finding-fields.mjs";
 
 const path = process.argv[2];
 if (!path) {
@@ -72,17 +73,14 @@ if ((report.requirementCoverage ?? []).some((item) =>
   ["P0", "P1"].includes(item?.priority) && item?.status !== "pass" && item?.status !== "waived")) {
   errors.push("P0/P1 requirement coverage is incomplete");
 }
+errors.push(...validateFindingsArray(report.findings ?? [], { allowPlanned: false }));
 for (const [index, finding] of (report.findings ?? []).entries()) {
-  if (!finding?.id || !finding?.severity || !finding?.status || !finding?.summary) {
-    errors.push(`findings[${index}] needs id, severity, status and summary`);
-  }
   if (["P0", "P1"].includes(finding?.severity)) {
-    if (!Array.isArray(finding?.evidence) || finding.evidence.length === 0) errors.push(`findings[${index}] P0/P1 needs evidence`);
+    if (!Array.isArray(finding?.evidence) || finding.evidence.length === 0) {
+      errors.push(`findings[${index}] P0/P1 needs evidence`);
+    }
     if (!finding?.impact) errors.push(`findings[${index}] P0/P1 needs impact`);
     if (!finding?.confidence) errors.push(`findings[${index}] P0/P1 needs confidence`);
-    if (finding?.category === "security" && !finding?.exploitability) {
-      errors.push(`findings[${index}] security P0/P1 needs exploitability`);
-    }
   }
   if (finding?.status === "waived") {
     if (!waiverForFinding(finding)) errors.push(`findings[${index}] waiver is incomplete, ambiguous or expired`);

@@ -1,7 +1,14 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { highRiskClasses } from '../core/risk.js';
-import type { CliAdapter, CliEvent, CliExecutionPolicy, CliRunResult } from './types.js';
+import { pickAskMcpContextEnv } from '../mcp/config.js';
+import type {
+  CliAdapter,
+  CliCapabilityExpectation,
+  CliEvent,
+  CliExecutionPolicy,
+  CliRunResult,
+} from './types.js';
 
 /**
  * 长工作流策略：
@@ -27,10 +34,29 @@ export interface RunCliOptions {
   timeoutMs?: number;
   /** 无事件空闲超时；优先于 CLI_IDLE_TIMEOUT_MS；设 0 关闭空闲检测 */
   idleTimeoutMs?: number;
+  /** P1 修复：工具调用硬上限；超过后终止 CLI 并报错。默认 100。 */
+  maxToolCount?: number;
   onEvent?: (event: CliEvent) => void;
   env?: NodeJS.ProcessEnv;
   executionPolicy?: CliExecutionPolicy;
   approvedScope?: string;
+  localNetworkAccess?: boolean;
+}
+
+/**
+ * 显式覆盖宿主可能残留的同名变量，让子进程能区分“调用方请求”“已追加参数”和“预计能力”。
+ * 这些字段是启动前观测值，不宣称下游 CLI 已实际授予网络能力。
+ */
+export function buildLocalNetworkCapabilityEnv(
+  requested: boolean,
+  expectation?: CliCapabilityExpectation,
+): Record<string, string> {
+  return {
+    AGENT_OS_LOCAL_NETWORK_REQUESTED: requested ? 'true' : 'false',
+    AGENT_OS_LOCAL_NETWORK_CONFIG_APPLIED: expectation?.configApplied ? 'true' : 'false',
+    AGENT_OS_LOCAL_NETWORK_EXPECTED: expectation?.expected ?? 'adapter-managed',
+    AGENT_OS_LOCAL_NETWORK_REASON: expectation?.reason ?? 'adapter-does-not-report',
+  };
 }
 
 /** 解析绝对超时：优先显式参数，其次 CLI_TIMEOUT_MS，否则默认 6 小时。 */
@@ -109,14 +135,39 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
     env,
     executionPolicy = 'standard',
     approvedScope,
+    localNetworkAccess = false,
   } = options;
   const timeoutMs = resolveCliTimeoutMs(options.timeoutMs);
   const idleTimeoutMs = resolveCliIdleTimeoutMs(options.idleTimeoutMs);
   // “仅输入分析”必须是一次性上下文，不能从旧会话带入未提供的文件或消息。
   const effectiveSessionId = executionPolicy === 'input-only' ? undefined : sessionId;
+  const capabilityExpectations: CliCapabilityExpectation[] = [];
+  const buildOptions = {
+    executionPolicy,
+    approvedScope,
+    localNetworkAccess,
+    mcpContextEnv: pickAskMcpContextEnv(env),
+    onCapabilityExpectation(expectation: CliCapabilityExpectation) {
+      const previous = capabilityExpectations.findIndex(
+        (candidate) => candidate.capability === expectation.capability,
+      );
+      if (previous >= 0) capabilityExpectations[previous] = expectation;
+      else capabilityExpectations.push(expectation);
+    },
+  };
   const args = effectiveSessionId
-    ? adapter.buildResumeArgs(prompt, effectiveSessionId, { executionPolicy, approvedScope })
-    : adapter.buildArgs(prompt, { executionPolicy, approvedScope });
+    ? adapter.buildResumeArgs(prompt, effectiveSessionId, buildOptions)
+    : adapter.buildArgs(prompt, buildOptions);
+  const localNetworkExpectation = capabilityExpectations.find(
+    (expectation) => expectation.capability === 'local-network',
+  );
+  const capabilityEnv = buildLocalNetworkCapabilityEnv(localNetworkAccess, localNetworkExpectation);
+  console.info(
+    `[CLI:${adapter.id}] local-network requested=${capabilityEnv.AGENT_OS_LOCAL_NETWORK_REQUESTED}`
+    + ` configApplied=${capabilityEnv.AGENT_OS_LOCAL_NETWORK_CONFIG_APPLIED}`
+    + ` expected=${capabilityEnv.AGENT_OS_LOCAL_NETWORK_EXPECTED}`
+    + ` reason=${capabilityEnv.AGENT_OS_LOCAL_NETWORK_REASON}`,
+  );
 
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     return Promise.reject(new Error(`${adapter.displayName} 超时时间必须大于 0`));
@@ -140,6 +191,7 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
         AGENT_OS_APPROVED_RISK_CLASSES: executionPolicy === 'approved'
           ? highRiskClasses(approvedScope ?? '').join(',')
           : '',
+        ...capabilityEnv,
       },
     });
     const lines = createInterface({ input: child.stdout });
@@ -153,6 +205,9 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
     let timeoutReason: 'absolute' | 'idle' | undefined;
     let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    // P1 修复：工具调用计数与预算
+    const maxToolCount = options.maxToolCount ?? Number(process.env.CLI_MAX_TOOL_COUNT ?? 100);
+    let toolCount = 0;
 
     const forceKillLater = () => {
       if (forceKillTimer) return;
@@ -243,6 +298,18 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
           resultError = new Error(event.message);
           continue;
         }
+        // P1 修复：工具预算执行
+        if (event.type === 'tool_start' || event.type === 'tool') {
+          toolCount++;
+          if (toolCount > maxToolCount) {
+            internalError = new Error(
+              `${adapter.displayName} 工具调用次数（${toolCount}）超过上限（${maxToolCount}），已终止。` +
+              `请拆分任务或通过 CLI_MAX_TOOL_COUNT 环境变量调整上限。`,
+            );
+            onAbort();
+            return;
+          }
+        }
         if (event.type === 'result') {
           const resultSessionId = executionPolicy === 'input-only'
             ? undefined
@@ -257,6 +324,8 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
     });
 
     child.stderr.on('data', (chunk: Buffer | string) => {
+      // P1 修复：stderr 输出也算活动（编译警告/进度信息常走 stderr），应续命 idle timer。
+      armIdleTimer();
       stderr = `${stderr}${chunk.toString()}`.slice(-MAX_STDERR_CHARS);
     });
     child.once('error', (error) => {

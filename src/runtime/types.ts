@@ -7,6 +7,8 @@ export type TerminalStatus = 'success' | 'failed' | 'interrupted';
 export interface ActiveRun {
   controller: AbortController;
   ownerOpenId: string;
+  /** 持久化流水线任务可在服务重启后从当前步骤恢复。 */
+  workflowId?: string;
   cancelMode?: 'stop' | 'close';
   bot: Bot;
   cardId: string;

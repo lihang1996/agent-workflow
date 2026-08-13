@@ -17,8 +17,11 @@ pnpm dev（tsx watch）/ pnpm start / pnpm build / pnpm test
 > 踩坑后追加一行：现象 → 原因 → 正确做法。给未来的 AI 和人看。
 
 - Codex 双引擎依赖本机 `codex` CLI（不是 ChatGPT 桌面 App）；`command not found` → `npm i -g @openai/codex` 并保证跑 `pnpm start` 的终端能 `which codex`，再用 `/engine codex`。
+- Codex `exec` 无审批弹窗：未预授权 MCP 会被记成「问卷被取消」。`propose_questions`/`get_questionnaire` 必须走 `mcp_servers.agent-os-ask.tools.*.approval_mode=approve`；`record_answers` 保持 prompt，答案只认飞书卡片。
+- Codex 问卷 MCP 成功但仍报「未创建结构化问卷」：Codex 用 `-c mcp_servers.*.env` 覆盖 MCP 子进程环境，只写 `AGENT_OS_ROOT` 时 `AGENT_OS_WORKFLOW_ID` 到不了 ask-server，问卷落成无作用域记录，`latestAwaitingForWorkflow` 看不见。必须把任务上下文一并注入 `-c`；PM 输出 `/form <id>` 时控制器按 ID 找回并绑定，不能只靠 workflowId 精确匹配。
 - Codex 流式里 `item.started`/`item.completed` 成对出现 → 工具进度只在 started 上报；最终答案等 `turn.completed`，避免中间旁白当结果、工具事件翻倍。
-- `codex exec resume` 报 `unexpected argument '--sandbox'` → `--sandbox` 只能挂在 `exec` 上，写成 `codex exec --sandbox <mode> resume --json <id> <prompt>`。
+- `codex exec resume` 报 `unexpected argument '--sandbox'` → `--sandbox` 只能挂在 `exec` 上；普通/已审批任务现在默认不传 `--sandbox`，改用 permission profile。
+- Codex 本机 listen/Postgres/浏览器 EPERM，而 Claude 同任务能跑：传了 `--sandbox workspace-write` 会走旧沙箱，`allow_local_binding` 不会生效。对齐 Claude dontAsk：去掉 `--sandbox`，用 `default_permissions=":danger-full-access"`，问卷上下文仍要写入 `mcp_servers.agent-os-ask.env`。
 - 多 Bot 群聊必须 @ 到对应机器人才会响应；每个飞书应用都要单独开「长连接」收事件，并拉进同一个群。
 - 一个话题一个项目：用 `/workdir <路径>` 绑定话题目录（全角色共享）；优先级为 话题目录 > `BOT_*_WORKDIR` > `CLAUDE_WORKDIR`/`CODEX_WORKDIR` > cwd。
 - 会话管理：`/reset` 清 CLI 上下文，`/close` 关闭，`/reopen` 恢复，`/clean` 删除已关闭记录；换目录会清话题下各角色上下文。
@@ -36,11 +39,12 @@ pnpm dev（tsx watch）/ pnpm start / pnpm build / pnpm test
 - 飞书创建云文档 title 不能含换行；流水线用多行 goal 当 Spec 标题时会 1770001 invalid param，需 `sanitizeDocumentTitle`。
 - 飞书 `client_token` 必须是 UUID 形态；`sha256().digest('hex')` 的 64 位会在写入云文档块时 1770001。
 - 飞书 Markdown→块后写入嵌套块前，必须删掉 `table.property.merge_info`（只读）；清错成 `table.merge_info` 顶层时，带表格 Spec 会 1770001，文档空壳已建、状态停在 confirmed，旧卡因 updatedAt 变化报「已过期」→ 死循环。失败时要刷新卡片带新 specVersion。
-- Claude 普通任务用 `--permission-mode dontAsk`：未在 `permissions.allow` 的 Write/Bash 会被直接拒绝（不会弹窗），开发步骤会误报「只读阻塞」。runtime settings 需预授权工作区读写与常规构建；高风险仍走 PreToolUse + `/approval`。已审批 Claude 也必须加载同一 hook，并只放行原请求命中的风险类别；Codex 已审批沙箱默认仍为 `workspace-write`，全权限必须显式配置。
+- Claude 普通任务用 `--permission-mode dontAsk`：未在 `permissions.allow` 的 Write/Bash 会被直接拒绝（不会弹窗），开发步骤会误报「只读阻塞」。runtime settings 需预授权工作区读写与常规构建；高风险仍走 PreToolUse + `/approval`。已审批 Claude 也必须加载同一 hook，并只放行原请求命中的风险类别。Codex 要对齐同一能力：不要传 `--sandbox`（会强制旧沙箱、丢掉本机 bind），默认 `default_permissions=":danger-full-access"`；高风险仍靠 `--ask-for-approval untrusted`。`CODEX_SANDBOX`/`CODEX_APPROVED_SANDBOX` 只在需要收紧时才设 `workspace-write`/`read-only`。
 - 流水线 `[RESULT:blocked]` 发卡成功后不要再发同文案文本，否则飞书会出现「阻塞卡 + 文本」双提示；文本只做发卡失败兜底。
 - 单次 CLI 不要只靠短墙钟超时：持续编码可能数小时。现用「绝对上限（默认 6h，`CLI_TIMEOUT_MS`）+ 空闲超时（默认 20 分钟无输出，`CLI_IDLE_TIMEOUT_MS`，有活动续命）」。更长交付应拆多轮（做完一阶段输出 [RESULT:done]，再 @Bot 继续），并注意上下文压缩。
 - 流水线步骤语义结果：非 PM 步骤必须显式输出 `[RESULT:done|blocked|failed]`，缺标记也 fail closed；CLI 退出码成功≠业务完成。blocked 暂停为 `awaiting_step_unblock`，勿继续评审。目标路径需在 `AGENT_OS_ALLOWED_ROOTS`；流水线不再自动绑定目录，用户须显式 `/workdir <绝对路径>`。
 - 飞书卡片 JSON 2.0 form 提交按钮：`form_action_type: "submit"` 放在按钮顶层（实战验证必须如此）。官方文档写的 `behaviors` 数组加 `form_action` 方式实际 API 报 "unknown behavior type" 400；`action_type: "form_submit"` 是 deprecated 且单独使用会 300123。
+- 问卷卡 `select_static` 不能写 `label`（飞书 230099/200621 unknown property）；题干用独立 markdown，`label` 只给 `input`。发卡失败时文本兜底 `/form <id>`，不要把已暂停的 `awaiting_questions` 工作流打成失败。
 - 业务控制（停任务 / Spec / 问卷 / 定时任务）用 `canControlOwnedResource`（发起人 ∪ OWNER ∪ ALLOWED）；高风险审批仍用 `assertOwnedBy`（只认当前 OWNER）。停任务若只比 `operator === owner`，白名单用户会看到「只有任务发起人可以停止它」。
 - 阻塞卡必须带 `blockVersion`（= workflow.updatedAt），handler 校验 stepId + blockVersion，缺字段直接拒绝（不放行旧卡）。终止按钮也要带相同版本信息。
 - RESULT 标记只在流水线非 PM 步骤解析（`startCliTask` 的 `resultProtocol` 参数）；PM 产出 Spec 正文，普通聊天/handoff/定时/巡检也不解析。正则要求标记在行首。
@@ -50,7 +54,11 @@ pnpm dev（tsx watch）/ pnpm start / pnpm build / pnpm test
 - `resumeBlockedWorkflowStep` 先原子认领（updateIfStatus）再切目录，防止并发重试两个按钮都通过前置检查再改目录。
 - 多 Bot 场景下同一用户的 Open ID 在不同飞书应用中不同；`assertOwnedBy` 用全局 `OWNER_OPEN_ID`，跨 Bot 审批会拒绝同一真实用户。本地单 Bot 场景无此问题；多 Bot 需用 union_id 或 per-Bot 负责人配置。
 - 设计门禁（架构师）只设计不实现：发现 P0/P1 并给出实现点+验证点后，GATE_RESULT finding 标记 `status: "planned"` 可随 design pass 通过；`"open"` 才阻断。开发门禁必须用相同 id 闭环为 `"resolved"`/`"waived"`，未闭环报「实现门禁必须闭环设计门禁登记的 P0/P1」。
+- 架构师把 planned FIND 写成 `[RESULT:failed]` → 流水线停在技术方案而不是进入开发。原因：通用 RESULT 说明把「发现需改代码」一律标 failed，且门禁提示曾写「pass 不得含 planned P0/P1」。正确做法：架构师 planned 必须 `[RESULT:done]`；控制器在设计门禁已通过时把误标的 failed 纠偏为 done。
+- 评审未通过写成 `[RESULT:failed]` → 协作 `onSuccess` 被跳过，流水线直接停而不是回传开发。未通过必须 `[RESULT:done]` 且不要 `[APPROVED]`；控制器对评审/汇总误标的 failed 按完成继续。
+- CEO 汇总把残余 P2 写成 `[RESULT:failed]` → 前面门禁已过仍整条失败。汇总只允许 `[RESULT:done]`（缺上下文才 blocked）。
 - findings 的状态字段名必须是 `status`（open/planned/resolved/waived），agent 别用 change-plan 里的 `disposition`；已闭环的旧问题标 `resolved`，不要当开放 P1。`GateFindingSchema` 有 disposition→status 兼容层，但未命中的值默认 open 会阻断（不静默放行）。
+- findings 的 `category`/`confidence`/`exploitability` 必须使用控制器枚举；Skill 本地校验（`skills/_shared/finding-fields.mjs`）与控制器共用同一套合法值与常见近义别名。未知自造标签必须在本地脚本就 fail，不能等控制器再拒。
 - 普通产品 Spec 不再强制走飞书云文档：确认卡提供「确认并直接开始技术交付」（`confirm_spec_start`）直接批准+标记 canonical+启动流水线；「确认方案」仍走云文档评审路径（confirm→publish→approve）。含 `[RISK_WAIVER]` 的 Spec 必须发布完整云文档，直接开始入口与后端调用都会被阻断，最终批准只认当前 `OWNER_OPEN_ID`（未配置时认需求发起人）。按钮回调里 `confirmSpecAndStartDelivery` 与 `approveSpecReview` 一样会回滚 canonical 与工作流状态。
 - 同一真实用户跨 Bot 直聊被「当前用户没有操作权限」拒：把每个飞书应用里该用户的 open_id 都加进 `AGENT_OS_ALLOWED_OPEN_IDS`；只加 CEO 应用的白名单拦不住架构师/dev/qa 应用。
 - 门禁 GATE_RESULT：不要用「单行且 `}` 后必须结束」的死正则——模型常在 JSON 后粘上 DSML/工具调用垃圾，或把超长 findings 塞进同一行导致截断，看起来像「缺少 GATE_RESULT」。应括号平衡提取 JSON；sha256 以证据目录文件重算；review-report 的 findings 以落盘 artifact 为准；答案完全缺标记时可从 `change-review.json` 等主 artifact 恢复。
@@ -65,3 +73,4 @@ pnpm dev（tsx watch）/ pnpm start / pnpm build / pnpm test
 - CLI 成功生命周期顺序固定为：语义校验 → 原子提交工作流状态 → 终态卡 → 持久化终态快照 → 释放当前会话 → 启动下一步。返工、复审和正常推进都不得在 `onSuccess` 内直接启动同一/下一 CLI，否则旧任务 finally 可能覆盖新会话的 active 状态。
 - 启动恢复逐工作流隔离：坏 Spec、关联损坏或缺稳定 ID 的旧数据只将对应工作流置 failed，不能抛出并阻断其他 ready 工作流。Node 22 test runner 偶发 IPC clone 错误时用 `--experimental-test-isolation=none` 单进程执行；项目 `pnpm test` 已固定该模式。
 - 同一 `projectRoot` 同时只允许一条进入技术阶段的 gated workflow；Spec canonical 切换与技术租约激活必须原子化。跨话题并发确认时只允许一个成功，另一条保留在人工节点并明确报告占用工作流 ID，防止代码树和证据链交叉污染。
+- Codex 长任务时 API 可能临时断线并自动重连（"Reconnecting... N/5"）；CodexAdapter 必须过滤可恢复的重连消息（返回空事件数组），让 Codex CLI 内置重连机制完成其工作，不能误当成终态失败。

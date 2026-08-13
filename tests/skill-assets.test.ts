@@ -73,6 +73,11 @@ test('契约和设计脚本拒绝缺失验收、并发风险处置及伪造空�
       requirementTrace: [{ requirementId: 'RQ-1', implementationPoints: ['src/api.ts'], verificationPoints: ['test/api.test.ts'] }],
       riskAssessments: [{ id: 'concurrency', disposition: 'applicable', evidence: 'read then write', control: 'conditional update', verification: 'parallel test' }],
       allowedPaths: ['src', 'test'], testPlan: ['parallel update'],
+      checks: [{
+        id: 'risk-scan', command: [process.execPath, '-e', 'process.exit(0)'], status: 'pass',
+        required: true, exitCode: 0, cwd: root,
+        startedAt: '2026-08-12T00:00:00.000Z', finishedAt: '2026-08-12T00:00:01.000Z',
+      }],
     });
     assert.equal(runScript('skills/design-risk-aware-change/scripts/validate-change-plan.mjs', [goodPlan]).status, 0);
     await writeJson(goodPlan, {
@@ -108,6 +113,41 @@ test('实现和 QA 脚本阻止越界改动、质量配置绕过与危险测试�
     assert.equal(dangerous.status, 3);
     assert.doesNotMatch(dangerous.stdout, /secret/);
 
+    await writeJson(resource, {
+      destructive: true,
+      connectionEnv: 'SKILL_TEST_DATABASE_URL',
+      runtimeConnectionEnvs: ['SKILL_RUNTIME_DATABASE_URL'],
+      sentinelEnv: 'AGENT_INVENTED_SENTINEL',
+    });
+    const inventedSentinel = runScript(
+      'skills/verify-software-delivery/scripts/preflight-test-resources.mjs',
+      [resource],
+      {
+        SKILL_TEST_DATABASE_URL: 'postgres://user:secret@localhost/project_test',
+        SKILL_RUNTIME_DATABASE_URL: 'postgres://user:secret@localhost/project_dev',
+        AGENT_INVENTED_SENTINEL: 'true',
+      },
+    );
+    assert.equal(inventedSentinel.status, 3);
+    assert.match(inventedSentinel.stdout, /sentinelEnv must be AGENT_OS_TEST_RESOURCE_SENTINEL/);
+
+    await writeJson(resource, {
+      destructive: true,
+      connectionEnv: 'SKILL_TEST_DATABASE_URL',
+      runtimeConnectionEnvs: ['SKILL_RUNTIME_DATABASE_URL'],
+      sentinelEnv: 'AGENT_OS_TEST_RESOURCE_SENTINEL',
+    });
+    const authorizedIsolatedResource = runScript(
+      'skills/verify-software-delivery/scripts/preflight-test-resources.mjs',
+      [resource],
+      {
+        SKILL_TEST_DATABASE_URL: 'postgres://user:secret@localhost/project_test',
+        SKILL_RUNTIME_DATABASE_URL: 'postgres://user:secret@localhost/project_dev',
+        AGENT_OS_TEST_RESOURCE_SENTINEL: 'true',
+      },
+    );
+    assert.equal(authorizedIsolatedResource.status, 0, authorizedIsolatedResource.stdout);
+
     const gateConfig = join(root, 'gates.json');
     await writeJson(gateConfig, {
       projectRoot: root,
@@ -134,6 +174,78 @@ test('实现和 QA 脚本阻止越界改动、质量配置绕过与危险测试�
       'skills/implement-traceable-change/scripts/validate-implementation-manifest.mjs',
       [manifest],
     ).status, 0);
+
+    const delegatedEnvironmentCheck = {
+      ...executedCheck,
+      id: 'browser-e2e',
+      command: [process.execPath, '-e', 'process.exit(1)'],
+      status: 'blocked',
+      required: false,
+      delegatedTo: 'verification',
+      exitCode: 1,
+    };
+    await writeJson(manifest, {
+      ...manifestBase,
+      targetedCheckResults: [executedCheck, delegatedEnvironmentCheck],
+    });
+    assert.equal(runScript(
+      'skills/implement-traceable-change/scripts/validate-implementation-manifest.mjs',
+      [manifest],
+    ).status, 0);
+    await writeJson(manifest, {
+      ...manifestBase,
+      targetedCheckResults: [executedCheck, { ...delegatedEnvironmentCheck, required: true }],
+    });
+    const invalidDelegation = runScript(
+      'skills/implement-traceable-change/scripts/validate-implementation-manifest.mjs',
+      [manifest],
+    );
+    assert.equal(invalidDelegation.status, 2);
+    assert.match(invalidDelegation.stdout, /delegatedTo requires verification \+ optional blocked\/unverified/);
+
+    const blockedCheck = {
+      ...executedCheck,
+      id: 'browser-runtime',
+      command: [process.execPath, '-e', 'process.exit(1)'],
+      status: 'blocked',
+      required: true,
+      exitCode: 1,
+    };
+    await writeJson(manifest, {
+      ...manifestBase,
+      status: 'blocked',
+      targetedCheckResults: [executedCheck, blockedCheck],
+    });
+    // P1 修复：本地脚本与控制器对齐，blocked 不再是合法 manifest status
+    assert.equal(runScript(
+      'skills/implement-traceable-change/scripts/validate-implementation-manifest.mjs',
+      [manifest],
+    ).status, 2);
+
+    await writeJson(manifest, {
+      ...manifestBase,
+      targetedCheckResults: [executedCheck, blockedCheck],
+    });
+    const passWithBlocker = runScript(
+      'skills/implement-traceable-change/scripts/validate-implementation-manifest.mjs',
+      [manifest],
+    );
+    assert.equal(passWithBlocker.status, 2);
+    assert.match(passWithBlocker.stdout, /pass manifest conflicts/);
+
+    await writeJson(manifest, {
+      ...manifestBase,
+      status: 'blocked',
+      targetedCheckResults: [executedCheck],
+    });
+    const blockedWithoutBlocker = runScript(
+      'skills/implement-traceable-change/scripts/validate-implementation-manifest.mjs',
+      [manifest],
+    );
+    // P1 修复：blocked 状态本身已被拒绝
+    assert.equal(blockedWithoutBlocker.status, 2);
+    assert.match(blockedWithoutBlocker.stdout, /status must be pass/);
+
     await writeJson(manifest, {
       ...manifestBase,
       targetedCheckResults: [{ ...executedCheck, command: 'node test.js' }],
@@ -225,6 +337,140 @@ test('变更审查脚本发现 untracked 范围差异并拒绝文本式批准', 
       decision: 'approved', status: 'pass',
     });
     assert.equal(runScript('skills/review-change-set/scripts/validate-review-report.mjs', [review]).status, 0);
+
+    await writeJson(review, {
+      implementationFingerprint: 'f'.repeat(64), reviewFingerprint: 'f'.repeat(64), baseline: 'HEAD',
+      reviewScope: scope,
+      requirementCoverage: [{ id: 'RQ-1', priority: 'P1', status: 'pass', evidence: ['src/tracked.ts:1'] }],
+      relatedContracts: [],
+      findings: [{
+        id: 'FIND-001',
+        severity: 'P2',
+        status: 'open',
+        category: 'totally-made-up-label',
+        summary: 'unknown category must fail locally',
+      }],
+      removalPlans: [], notReviewed: [], residualRisks: [],
+      decision: 'approved', status: 'pass',
+    });
+    const badCategory = runScript('skills/review-change-set/scripts/validate-review-report.mjs', [review]);
+    assert.equal(badCategory.status, 2, badCategory.stdout);
+    assert.match(badCategory.stdout, /category Invalid option/);
+
+    // 已知近义别名应与控制器一样被接受（映射到枚举），避免「本地 pass / 控制器 fail」缺口
+    await writeJson(review, {
+      implementationFingerprint: 'f'.repeat(64), reviewFingerprint: 'f'.repeat(64), baseline: 'HEAD',
+      reviewScope: scope,
+      requirementCoverage: [{ id: 'RQ-1', priority: 'P1', status: 'pass', evidence: ['src/tracked.ts:1'] }],
+      relatedContracts: [],
+      findings: [{
+        id: 'FIND-001',
+        severity: 'P2',
+        status: 'open',
+        category: 'test-reliability',
+        summary: 'local e2e reuses existing server',
+      }],
+      removalPlans: [], notReviewed: [], residualRisks: [],
+      decision: 'approved', status: 'pass',
+    });
+    assert.equal(runScript('skills/review-change-set/scripts/validate-review-report.mjs', [review]).status, 0);
+
+    await writeJson(review, {
+      implementationFingerprint: 'f'.repeat(64), reviewFingerprint: 'f'.repeat(64), baseline: 'HEAD',
+      reviewScope: scope,
+      requirementCoverage: [{ id: 'RQ-1', priority: 'P1', status: 'pass', evidence: ['src/tracked.ts:1'] }],
+      relatedContracts: [],
+      findings: [{
+        id: 'FIND-001',
+        severity: 'P2',
+        status: 'open',
+        category: 'testing',
+        summary: 'local e2e reuses existing server',
+      }],
+      removalPlans: [], notReviewed: [], residualRisks: [],
+      decision: 'approved', status: 'pass',
+    });
+    assert.equal(runScript('skills/review-change-set/scripts/validate-review-report.mjs', [review]).status, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('共享 finding 枚举与控制器 / 各阶段校验脚本对齐', async () => {
+  const shared = await import(resolve(repoRoot, 'skills/_shared/finding-fields.mjs'));
+  const { GATE_FINDING_CATEGORIES, GateFindingSchema } = await import('../src/core/quality-gates.js');
+  assert.deepEqual([...shared.FINDING_CATEGORIES], [...GATE_FINDING_CATEGORIES]);
+
+  const aliased = GateFindingSchema.parse({
+    id: 'FIND-001',
+    severity: 'P2',
+    status: 'open',
+    summary: 'docs drift',
+    category: 'documentation-accuracy',
+  });
+  assert.equal(aliased.category, 'maintainability');
+
+  assert.throws(() => GateFindingSchema.parse({
+    id: 'FIND-002',
+    severity: 'P2',
+    status: 'open',
+    summary: 'unknown label',
+    category: 'totally-made-up',
+  }), /category|Invalid option/i);
+
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-finding-enums-'));
+  try {
+    const findings = [{
+      id: 'FIND-X',
+      severity: 'P2',
+      status: 'open',
+      category: 'documentation-accuracy',
+      summary: 'alias should pass local validators after normalize acceptance',
+    }];
+    // 本地脚本接受已知别名（与控制器同一套 normalize）
+    const errors = shared.validateFindingsArray(findings, { allowPlanned: false });
+    assert.deepEqual(errors, []);
+
+    const unknown = shared.validateFindingsArray([{
+      ...findings[0],
+      category: 'totally-made-up',
+    }], { allowPlanned: false });
+    assert.match(unknown.join('\n'), /category Invalid option/);
+
+    const plan = join(root, 'change-plan.json');
+    await writeJson(plan, {
+      contractHash: 'a'.repeat(64),
+      projectFingerprint: 'b'.repeat(64),
+      status: 'pass',
+      requirementTrace: [{
+        requirementId: 'RQ-1',
+        implementationPoints: ['src/a.ts'],
+        verificationPoints: ['test a'],
+      }],
+      riskAssessments: [{
+        id: 'RISK-1',
+        disposition: 'weird-disposition',
+        evidence: ['src/a.ts'],
+      }],
+      allowedPaths: ['src'],
+      testPlan: ['unit'],
+      checks: [{
+        id: 'validate-change-plan',
+        command: ['node', 'x.mjs'],
+        status: 'pass',
+        required: true,
+        exitCode: 0,
+        cwd: root,
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+      }],
+    });
+    const dispositionRejected = runScript(
+      'skills/design-risk-aware-change/scripts/validate-change-plan.mjs',
+      [plan],
+    );
+    assert.equal(dispositionRejected.status, 2);
+    assert.match(dispositionRejected.stdout, /disposition must be one of/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

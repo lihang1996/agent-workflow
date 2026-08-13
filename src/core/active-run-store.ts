@@ -11,6 +11,7 @@ const ActiveRunSchema = z.object({
   botId: z.string().trim().min(1).max(100),
   cardId: z.string().trim().min(1).max(200),
   cardTitle: z.string().trim().min(1).max(200),
+  workflowId: z.uuid().optional(),
   progress: z.number().min(0).max(100),
   detail: z.string().max(2_000),
   activities: z.array(z.string().max(500)).max(20).default([]),

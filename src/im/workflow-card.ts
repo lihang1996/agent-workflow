@@ -4,6 +4,7 @@ import type { Questionnaire, Question } from '../core/questionnaire-store.js';
 import { extractRequirementIds } from '../core/requirement-ids.js';
 import type { ProductSpec } from '../core/spec-store.js';
 import { redactSecrets } from '../core/log-inspection.js';
+import { classifyStepBlockReason, type StepBlockKind } from '../core/step-result.js';
 import type { CardJson } from './card.js';
 
 /** 流水线步骤 [RESULT:blocked] 后的人工纠正卡。 */
@@ -13,15 +14,34 @@ export function buildStepBlockedCard(options: {
   stepTitle: string;
   reason: string;
   suggestedWorkdir?: string;
+  blockKind?: StepBlockKind;
+  testResourceAuthorizationAvailable?: boolean;
   /** 阻塞版本号（workflow.updatedAt），防止旧卡重放到新阻塞步骤 */
   blockVersion: string;
 }): CardJson {
+  const blockKind = options.blockKind ?? classifyStepBlockReason(options.reason);
+  const isWorkdirBlock = blockKind === 'workdir';
+  const suggestedWorkdir = isWorkdirBlock ? options.suggestedWorkdir : undefined;
   const value = {
     workflowId: options.workflowId,
     stepId: options.stepId,
     blockVersion: options.blockVersion,
-    ...(options.suggestedWorkdir ? { workdir: options.suggestedWorkdir } : {}),
+    ...(suggestedWorkdir ? { workdir: suggestedWorkdir } : {}),
   };
+  const guidance = blockGuidance(
+    blockKind,
+    suggestedWorkdir,
+    options.testResourceAuthorizationAvailable === true,
+  );
+  const retryLabel = blockKind === 'workdir'
+    ? '按当前话题目录重试'
+    : blockKind === 'environment'
+      ? '环境就绪后重试'
+      : blockKind === 'test-resource'
+        ? '资源授权完成后重试'
+        : blockKind === 'gate-evidence'
+          ? '修正证据后重试'
+          : '重试当前步骤';
   return {
     schema: '2.0',
     config: { update_multi: true, summary: { content: `流水线已阻塞：${options.stepTitle}` } },
@@ -38,21 +58,124 @@ export function buildStepBlockedCard(options: {
           content: [
             `**步骤**：${escapeCardMarkdown(options.stepTitle, 80)}`,
             `**原因**：${escapeCardMarkdown(options.reason, 800)}`,
-            options.suggestedWorkdir
-              ? `**建议目录**：\`${escapeCardMarkdown(options.suggestedWorkdir, 300)}\``
-              : '可先用 `/workdir <绝对路径>` 绑定话题目录，再点重试。',
+            guidance,
             '',
             '流水线已暂停，不会继续评审/测试。纠正后可重跑**同一步**。',
           ].join('\n'),
         },
-        ...(options.suggestedWorkdir
+        ...(suggestedWorkdir
           ? [button('retry_blocked_step_with_workdir', value, '绑定建议目录并重试', 'primary')]
           : []),
-        button('retry_blocked_step', value, '按当前话题目录重试', 'default'),
+        ...(options.testResourceAuthorizationAvailable
+          ? [button(
+            'authorize_test_resource_and_retry',
+            value,
+            '确认隔离测试库并授权重试',
+            'primary',
+          )]
+          : []),
+        button('retry_blocked_step', value, retryLabel, 'default'),
         button('abort_blocked_workflow', value, '终止流水线', 'danger'),
       ],
     },
   };
+}
+
+export type StepBlockedActionState =
+  | 'retrying'
+  | 'authorized-retrying'
+  | 'rerouted'
+  | 'inactive'
+  | 'aborted';
+
+/** 阻塞卡按钮被接受后的不可交互状态卡，防止旧按钮继续显示或重复提交。 */
+export function buildStepBlockedActionCard(options: {
+  stepTitle: string;
+  state: StepBlockedActionState;
+  detail?: string;
+}): CardJson {
+  const presentation = {
+    retrying: {
+      template: 'blue',
+      title: `流水线重试中 · ${options.stepTitle}`,
+      status: '已提交当前步骤重试。',
+    },
+    'authorized-retrying': {
+      template: 'blue',
+      title: `已授权并重试 · ${options.stepTitle}`,
+      status: '已确认隔离测试资源授权，正在重试当前步骤。',
+    },
+    rerouted: {
+      template: 'blue',
+      title: `流水线已转交 · ${options.stepTitle}`,
+      status: '已按问题类型转交正确步骤处理。',
+    },
+    inactive: {
+      template: 'grey',
+      title: `阻塞操作已失效 · ${options.stepTitle}`,
+      status: '流水线状态已经变化，这张旧阻塞卡不再可操作。',
+    },
+    aborted: {
+      template: 'grey',
+      title: `流水线已终止 · ${options.stepTitle}`,
+      status: '已终止这条阻塞中的流水线。',
+    },
+  } as const;
+  const current = presentation[options.state];
+  return {
+    schema: '2.0',
+    config: { update_multi: true, summary: { content: current.title } },
+    header: {
+      template: current.template,
+      title: { tag: 'plain_text', content: current.title },
+    },
+    body: {
+      direction: 'vertical',
+      vertical_spacing: '12px',
+      elements: [{
+        tag: 'markdown',
+        content: [
+          `**步骤**：${escapeCardMarkdown(options.stepTitle, 80)}`,
+          `**状态**：${current.status}`,
+          ...(options.detail ? [`**说明**：${escapeCardMarkdown(options.detail, 800)}`] : []),
+          '',
+          '原阻塞操作已关闭；后续结果或新的阻塞会在当前话题中更新。',
+        ].join('\n'),
+      }],
+    },
+  };
+}
+
+function blockGuidance(
+  kind: StepBlockKind,
+  suggestedWorkdir?: string,
+  testResourceAuthorizationAvailable = false,
+): string {
+  if (kind === 'workdir') {
+    return suggestedWorkdir
+      ? `**建议目录**：\`${escapeCardMarkdown(suggestedWorkdir, 300)}\``
+      : '**处理方式**：用 `/workdir <绝对路径>` 绑定正确项目目录，再重试。';
+  }
+  if (kind === 'environment') {
+    return [
+      '**处理方式**：保持当前项目目录不变，确认服务已启用 Codex 本机回环网络，并准备好浏览器/本地测试数据库。',
+      ...(testResourceAuthorizationAvailable
+        ? ['若检查会执行 migration/TRUNCATE，请确认使用隔离测试库，再点击下方授权按钮；预检仍会拒绝开发/生产库。']
+        : []),
+    ].join('\n');
+  }
+  if (kind === 'test-resource') {
+    return [
+      '**处理方式**：先确认测试数据库与开发/生产库完全隔离。',
+      testResourceAuthorizationAvailable
+        ? '确认后点击下方授权按钮；该授权只在本流水线 QA 中生效，且不会绕过测试库命名与运行库不相等检查。'
+        : '也可由负责人设置 `AGENT_OS_TEST_RESOURCE_SENTINEL=true` 后重启；该开关不会绕过隔离性检查。',
+    ].join('\n');
+  }
+  if (kind === 'gate-evidence') {
+    return '**处理方式**：保持当前项目目录不变，补齐或重新生成本步骤的 Gate/artifact 证据后重试。';
+  }
+  return '**处理方式**：保持当前项目目录不变，解决上面的前置条件后重试。';
 }
 
 function button(
@@ -76,35 +199,41 @@ function button(
   };
 }
 
-function questionElement(question: Question, answer?: string | string[]) {
+type FormElement = Record<string, unknown>;
+
+function questionElements(question: Question, answer?: string | string[]): FormElement[] {
   const required = question.required === false ? '（可选）' : '（必答）';
+  const title = `${question.prompt}${required}`;
   if (question.kind === 'text') {
-    return {
+    return [{
       tag: 'input',
       element_id: questionElementId('input', question.id),
       name: question.id,
       required: question.required !== false,
-      label: { tag: 'plain_text', content: `${question.prompt}${required}` },
+      label: { tag: 'plain_text', content: title },
       placeholder: { tag: 'plain_text', content: '请输入回答' },
       ...(typeof answer === 'string' ? { default_value: answer } : {}),
-    };
+    }];
   }
-  return {
-    tag: 'select_static',
-    element_id: questionElementId('select', question.id),
-    name: question.id,
-    required: question.required !== false,
-    label: { tag: 'plain_text', content: `${question.prompt}${required}` },
-    placeholder: { tag: 'plain_text', content: '请选择' },
-    options: (question.options ?? []).map((option) => ({
-      text: { tag: 'plain_text', content: option },
-      value: option,
-    })),
-    ...(question.kind === 'multi_choice' ? { multiple: true } : {}),
-    ...(typeof answer === 'string'
-      ? { initial_option: answer }
-      : Array.isArray(answer) ? { initial_options: answer } : {}),
-  };
+  // JSON 2.0 的 select_static 没有 label；题干必须用独立 markdown，否则飞书 230099/200621。
+  return [
+    { tag: 'markdown', content: `**${title}**` },
+    {
+      tag: 'select_static',
+      element_id: questionElementId('select', question.id),
+      name: question.id,
+      required: question.required !== false,
+      placeholder: { tag: 'plain_text', content: '请选择' },
+      options: (question.options ?? []).map((option) => ({
+        text: { tag: 'plain_text', content: option },
+        value: option,
+      })),
+      ...(question.kind === 'multi_choice' ? { multiple: true } : {}),
+      ...(typeof answer === 'string'
+        ? { initial_option: answer }
+        : Array.isArray(answer) ? { initial_options: answer } : {}),
+    },
+  ];
 }
 
 function questionElementId(prefix: 'input' | 'select', questionId: string): string {
@@ -132,7 +261,9 @@ export function buildQuestionnaireCard(questionnaire: Questionnaire): CardJson {
             tag: 'form',
             name: `questionnaire_${questionnaire.id}`.slice(0, 40),
             elements: [
-              ...questionnaire.questions.map((question) => questionElement(question, questionnaire.answers?.[question.id])),
+              ...questionnaire.questions.flatMap((question) => (
+                questionElements(question, questionnaire.answers?.[question.id])
+              )),
               button('submit_questionnaire', {
                 questionnaireId: questionnaire.id,
                 questionnaireVersion: questionnaire.updatedAt,

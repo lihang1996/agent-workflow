@@ -24,7 +24,8 @@ description: "在功能、修复、重构或迁移完成实现后、进入 QA �
 7. 区分事实、推断、建议和未验证；记录未覆盖范围与残余风险。
 8. 生成 `change-review.json`，运行 `scripts/validate-review-report.mjs <change-review.json>`；
    在 Gate 检查中记录原始 argv、cwd、起止时间、退出码和 required/status，禁止用自然语言命令冒充执行证据。
-9. 只有校验通过且没有开放 P0/P1 时才输出 `[APPROVED]`。
+9. 只有校验通过且没有开放 P0/P1 时才输出 `[APPROVED]` 与 `[RESULT:done]`。
+   未通过时输出 `[RESULT:done]` 且不要 `[APPROVED]`。
 
 ## 强制检查
 
@@ -49,11 +50,20 @@ description: "在功能、修复、重构或迁移完成实现后、进入 QA �
 输出 `change-review.json`，包含 `implementationFingerprint`、`reviewFingerprint`、
 `baseline`、`reviewScope`、`requirementCoverage`、`relatedContracts`、`findings`、
 `removalPlans`、`notReviewed`、`residualRisks`、`decision` 和 `status`。
+`findings[]` 字段必须与控制器 `GateFindingSchema` 对齐：
+`severity=P0|P1|P2|P3`，`status=open|resolved|waived`（审查不得保留 `planned`），
+可选 `category` 只能是
+`correctness|security|reliability|architecture|performance|maintainability|testing|compatibility|scope|other`
+（优先写枚举原值；未知自造标签会被本地校验拒绝；常见近义别名由共享模块归一化），
+可选 `confidence=low|medium|high`，安全类 P0/P1 还需
+`exploitability=not-applicable|unreachable|conditional|reachable|unverified`。
 把文件保存到 `evidenceRoot`，计算真实 SHA-256，并作为 `review-report` 写入
 `[GATE_RESULT].artifacts`；finding 摘要必须与 artifact 一致。
 
 基线不明、manifest 与真实变更无法调和、当前 fingerprint 与实现证据不一致、
-未覆盖完整变更集、开放 P0/P1、校验脚本失败或仅输出文本批准时阻止进入 QA。
+未覆盖完整变更集、校验脚本失败或仅输出文本批准时阻止进入 QA（`[RESULT:failed]`，审查本身无法完成）。
+开放 P0/P1 时不得输出 `[APPROVED]`，必须 `[RESULT:done]` 让协作回传开发；禁止把这些 FIND 写成
+`[RESULT:failed]`（那会跳过回传、停掉流水线）。
 
 ## 按需参考
 

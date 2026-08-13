@@ -9,7 +9,7 @@ import {
   DELIVERY_SQUAD_STEPS,
   parsePipelineSteps,
 } from '../src/core/pipeline.js';
-import { JsonQuestionnaireStore, questionnaireMatchesContext } from '../src/core/questionnaire-store.js';
+import { JsonQuestionnaireStore, extractQuestionnaireIdsFromText, questionnaireMatchesContext } from '../src/core/questionnaire-store.js';
 import { JsonApprovalStore } from '../src/core/approval-store.js';
 import { JsonSpecStore } from '../src/core/spec-store.js';
 import { SessionManager } from '../src/core/session-manager.js';
@@ -80,6 +80,40 @@ test('问卷带工作流作用域并可持久化答案', async () => {
     const answered = await store.recordAnswers(questionnaire.id, { scope: 'A' });
     assert.equal(answered.questionnaire.status, 'answered');
     assert.equal(await store.latestAwaitingForWorkflow(workflowId), undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('可从 /form 文案提取问卷 ID 并绑定到工作流', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-questionnaire-bind-'));
+  try {
+    const store = new JsonQuestionnaireStore(root);
+    const workflowId = '14a8e2a5-12b8-4b9e-b37e-52bb6833d1d0';
+    const orphan = await store.create({
+      title: '搜索框选中态',
+      questions: [{ id: 'style', prompt: '选中态？', kind: 'single_choice', options: ['红框', '阴影'] }],
+    });
+    assert.equal(orphan.workflowId, undefined);
+    assert.deepEqual(
+      extractQuestionnaireIdsFromText(`请发送：\n\n/form ${orphan.id}\n\n等待用户作答。`),
+      [orphan.id],
+    );
+    assert.equal(
+      (await store.recoverAwaitingFromProductOutput(`/form ${orphan.id}`, workflowId))?.id,
+      orphan.id,
+    );
+    const bound = await store.attachWorkflowContext(orphan.id, {
+      workflowId,
+      chatId: 'oc_chat',
+      topicId: 'omt_topic',
+      ownerOpenId: 'ou_owner',
+      botId: 'pm',
+      messageId: 'om_message',
+    });
+    assert.equal(bound.workflowId, workflowId);
+    assert.equal(bound.chatId, 'oc_chat');
+    assert.equal((await store.latestAwaitingForWorkflow(workflowId))?.id, orphan.id);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -502,6 +536,12 @@ test('问卷、Spec 退回和产品评审使用飞书 form_submit，Spec 确认�
     questions: [
       { id: 'sharedQuestionPrefixAlpha', prompt: '范围', kind: 'text' as const },
       { id: 'sharedQuestionPrefixBeta', prompt: '期限', kind: 'text' as const },
+      {
+        id: 'focusStyle',
+        prompt: '搜索框选中态',
+        kind: 'single_choice' as const,
+        options: ['红框', '阴影'],
+      },
     ],
     status: 'awaiting_answers' as const,
     createdAt: new Date().toISOString(),
@@ -530,9 +570,17 @@ test('问卷、Spec 退回和产品评审使用飞书 form_submit，Spec 确认�
     questionnaire.updatedAt,
   );
   const ids = questionForm.elements
-    .filter((item: any) => item.tag !== 'button')
+    .filter((item: any) => item.tag !== 'button' && item.tag !== 'markdown')
     .map((item: any) => item.element_id);
   assert.equal(new Set(ids).size, ids.length);
+  const select = questionForm.elements.find((item: any) => item.tag === 'select_static');
+  assert.ok(select);
+  assert.equal(select.label, undefined);
+  assert.equal(select.required, true);
+  assert.equal(
+    questionForm.elements.some((item: any) => item.tag === 'markdown' && String(item.content).includes('搜索框选中态')),
+    true,
+  );
   const confirmationCard = buildSpecConfirmationCard(spec) as any;
   const confirmationForm = confirmationCard.body.elements.find((item: any) => item.tag === 'form');
   assert.ok(confirmationForm);
@@ -706,6 +754,56 @@ test('PM 未创建问卷时不能把内联澄清问题保存成待确认 Spec', 
     assert.equal(workflows.get(workflow.id)?.status, 'awaiting_spec_confirmation');
     assert.equal(cards.length, 1);
     assert.match(replies[0] ?? '', /产品 Spec 已生成/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('产品步骤能从 /form 文案找回未绑定工作流的问卷', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-pm-form-recover-'));
+  try {
+    const workflows = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const specs = await JsonSpecStore.open(join(root, 'specs.json'));
+    const questionnaires = await JsonQuestionnaireStore.open(join(root, 'questionnaires'));
+    const workflow = await workflows.create({
+      kind: 'team', name: '团队交付流水线', initiatorBotId: 'ceo', goal: '修复搜索框', stepIds: ['pm'],
+      message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt', senderOpenId: 'ou' },
+    });
+    await workflows.update(workflow.id, { status: 'executing' });
+    const orphan = await questionnaires.create({
+      title: '搜索框选中态澄清',
+      questions: [{ id: 'style', prompt: '选中态？', kind: 'single_choice', options: ['红框', '阴影'] }],
+    });
+    const cards: unknown[] = [];
+    const replies: string[] = [];
+    const pm = {
+      id: 'pm',
+      replyCard: async (_messageId: string, card: unknown) => { cards.push(card); return 'om-card'; },
+    } as any;
+    const ceo = {
+      id: 'ceo',
+      reply: async (_messageId: string, content: string) => { replies.push(content); return 'om-reply'; },
+    } as any;
+    const ctx = {
+      workflows,
+      specs,
+      questionnaires,
+      botsById: new Map([['pm', pm], ['ceo', ceo]]),
+    } as unknown as AppContext;
+
+    await completeProductStep(
+      ctx,
+      workflow.id,
+      0,
+      pm,
+      `需求仍存在关键歧义，已创建飞书澄清问卷。\n\n请发送：\n\n\`/form ${orphan.id}\`\n`,
+    );
+    assert.equal(workflows.get(workflow.id)?.status, 'awaiting_questions');
+    assert.equal(workflows.get(workflow.id)?.questionnaireId, orphan.id);
+    assert.equal((await questionnaires.get(orphan.id))?.workflowId, workflow.id);
+    assert.equal(specs.findByWorkflowId(workflow.id), undefined);
+    assert.equal(cards.length, 1);
+    assert.match(replies[0] ?? '', /结构化问题/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1056,6 +1154,67 @@ test('同一工作流步骤只能被一个并发执行者认领', async () => {
     const claims = await Promise.all([store.claimReady(workflow.id), store.claimReady(workflow.id)]);
     assert.equal(claims.filter(Boolean).length, 1);
     assert.equal(store.get(workflow.id)?.status, 'executing');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('开发纯环境阻塞的自动纠偏在存储锁内最多执行一次', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-dev-environment-autocorrect-'));
+  try {
+    const store = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const workflow = await store.create({
+      kind: 'team', name: '交付流水线', initiatorBotId: 'dev', goal: '修复问题', stepIds: ['dev'],
+      message: { messageId: 'om-auto', chatId: 'oc', chatType: 'group', rootId: '', threadId: '', senderOpenId: 'ou' },
+    });
+    await store.claimReady(workflow.id);
+    const retries = await Promise.all([
+      store.retryCurrentDevEnvironmentBlockOnce(workflow.id, 0, '重新生成 pass manifest', '第一次阻塞证据'),
+      store.retryCurrentDevEnvironmentBlockOnce(workflow.id, 0, '重复指令', '重复阻塞证据'),
+    ]);
+    assert.equal(retries.filter(Boolean).length, 1);
+    assert.equal(store.get(workflow.id)?.status, 'ready');
+    assert.equal(store.get(workflow.id)?.nextStepIndex, 0);
+    assert.equal(store.get(workflow.id)?.priorOutputs.dev_environment_autocorrect, '重新生成 pass manifest');
+    assert.equal(store.get(workflow.id)?.priorOutputs.blocked_dev, '第一次阻塞证据');
+
+    await store.claimReady(workflow.id);
+    assert.equal(
+      await store.retryCurrentDevEnvironmentBlockOnce(workflow.id, 0, '第三次指令', '第三次阻塞证据'),
+      undefined,
+    );
+    const paused = await store.updateIfCurrentStep(workflow.id, 0, 'dev', {
+      status: 'awaiting_step_unblock',
+      error: '第二次仍为环境阻塞',
+    });
+    assert.equal(paused?.status, 'awaiting_step_unblock');
+    assert.equal(paused?.priorOutputs.dev_environment_autocorrect, '重新生成 pass manifest');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('开发环境纠偏成功推进后清理本轮 marker 与旧阻塞证据', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-dev-environment-autocorrect-cleanup-'));
+  try {
+    const store = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const workflow = await store.create({
+      kind: 'team', name: '交付流水线', initiatorBotId: 'dev', goal: '修复问题', stepIds: ['dev', 'qa'],
+      message: { messageId: 'om-auto-clean', chatId: 'oc', chatType: 'group', rootId: '', threadId: '', senderOpenId: 'ou' },
+    });
+    await store.claimReady(workflow.id);
+    await store.retryCurrentDevEnvironmentBlockOnce(
+      workflow.id,
+      0,
+      '重新生成 pass manifest',
+      '旧环境阻塞证据',
+    );
+    await store.claimReady(workflow.id);
+    const completed = await store.completeCurrentStep(workflow.id, 0, 'dev', '开发纠偏后通过');
+    assert.equal(completed?.nextStepIndex, 1);
+    assert.equal(completed?.priorOutputs.dev, '开发纠偏后通过');
+    assert.equal(completed?.priorOutputs.dev_environment_autocorrect, undefined);
+    assert.equal(completed?.priorOutputs.blocked_dev, undefined);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

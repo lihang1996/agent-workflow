@@ -1,5 +1,6 @@
 import type { ApprovalRequest } from '../core/approval-store.js';
 import { assertOwnedBy } from '../core/access.js';
+import { normalizeIdentity, type IdentityInput } from '../core/identity-registry.js';
 import { sanitizeErrorForLog } from '../core/log-inspection.js';
 import type { IncomingMessage, Bot } from '../im/lark.js';
 import { buildApprovalCard } from '../im/workflow-card.js';
@@ -76,13 +77,26 @@ function safeApprovalError(error: unknown): string {
 export async function executeApprovedAction(
   ctx: AppContext,
   approvalId: string,
-  operatorOpenId: string,
+  operator: IdentityInput,
 ): Promise<ApprovalRequest> {
   const pending = ctx.approvals.get(approvalId);
   if (!pending) throw new Error(`审批不存在: ${approvalId}`);
+  const operatorOpenId = normalizeIdentity(operator).openId;
+  if (!operatorOpenId) throw new Error('审批回调缺少操作人的 open_id。');
   // 配置负责人变更后，旧负责人不能继续使用尚未处理的历史卡片。
-  assertOwnedBy(pending.ownerOpenId, operatorOpenId);
-  const approval = await ctx.approvals.beginExecution(approvalId, operatorOpenId);
+  assertOwnedBy(pending.ownerOpenId, operator, ctx.identities);
+  const approval = await ctx.approvals.beginExecution(
+    approvalId,
+    operatorOpenId,
+    (ownerOpenId) => {
+      try {
+        assertOwnedBy(ownerOpenId, operator, ctx.identities);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  );
   await updateApprovalCard(ctx, approval);
   try {
     await runApprovedAction(ctx, approval);

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { JsonCollabStore } from '../src/core/collab-store.js';
-import { isReviewApproved, isReviewExplicitlyApproved } from '../src/core/collab.js';
+import { buildFollowUpReviewPrompt, buildInitialReviewPrompt, isReviewApproved, isReviewExplicitlyApproved } from '../src/core/collab.js';
 
 test('评审只接受明确的通过结论行', () => {
   for (const answer of [
@@ -36,6 +36,15 @@ test('结构化门禁必须有显式 APPROVED 标记', () => {
   assert.equal(isReviewExplicitlyApproved('最终结论：评审通过'), false);
   assert.equal(isReviewExplicitlyApproved('结论：[APPROVED]\n[GATE_RESULT] {}'), true);
   assert.equal(isReviewExplicitlyApproved('[APPROVED]\n结论：[REJECTED]'), false);
+});
+
+test('协作评审 prompt 禁止把未通过标成 RESULT:failed', () => {
+  const first = buildInitialReviewPrompt('审查实现', 1);
+  assert.match(first, /通过或未通过都用 \[RESULT:done\]/);
+  assert.match(first, /禁止把「发现需改代码」写成 \[RESULT:failed\]/);
+  const followUp = buildFollowUpReviewPrompt('审查实现', 2, '已按意见修改');
+  assert.match(followUp, /仍输出 \[RESULT:done\]/);
+  assert.match(followUp, /禁止用 \[RESULT:failed\] 停掉流水线/);
 });
 
 test('协作轮次落盘失败时回滚内存状态', async () => {

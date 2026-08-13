@@ -27,6 +27,9 @@ description: "在代码、数据、接口、权限、缓存、依赖、部署或
 7. 为正常、异常、边界、并发和攻击场景设计验证。
 8. 生成 `change-plan.json` 并运行 `scripts/validate-change-plan.mjs`；在 Gate 检查中记录
    原始 argv、cwd、起止时间、退出码和 required/status。
+9. `change-plan.json.checks` 是设计检查的权威集合；最终 `[GATE_RESULT].checks` 不得重复
+   其中任何 ID，没有额外检查时必须输出 `[]`，由控制器从主 artifact 水合。确需记录
+   写入 artifact 之后的额外检查时，只能使用新的唯一 ID。
 
 ## 强制检查
 
@@ -48,10 +51,17 @@ description: "在代码、数据、接口、权限、缓存、依赖、部署或
 
 输出 `change-plan.json`，包含 `contractHash`、`projectFingerprint`、`requirementTrace`、
 `affectedModules`、`riskAssessments`、`failureSemantics`、`migrationPlan`、`rollbackPlan`、
-`testPlan`、`allowedPaths`、`forbiddenPaths` 和 `status`。
+`testPlan`、`allowedPaths`、`forbiddenPaths`、非空 `checks` 和 `status`。
+`riskAssessments[].disposition` 只能是 `applicable|not-applicable|analysis-required`。
+若同时输出 `findings[]` 或 `[GATE_RESULT].findings`，字段必须与控制器对齐：
+`severity=P0|P1|P2|P3`，`status=planned|open|resolved|waived`（设计可用 `planned`），
+可选 `category` 只能是
+`correctness|security|reliability|architecture|performance|maintainability|testing|compatibility|scope|other`，
+禁止自造标签。
 把结构化输出保存到控制器提供的 `evidenceRoot`，计算真实 SHA-256，并写入 `[GATE_RESULT].artifacts`。
 
-P0/P1 缺映射、数据写存在未解决竞争、迁移不可恢复或关键兼容条件未验证时阻止开发。
+P0/P1 缺映射、数据写存在未解决竞争、迁移不可恢复或关键兼容条件未验证时阻止开发（`[RESULT:failed]`）。
+已给出实现点与验证点、标记为 `planned` 的 P0/P1 随设计门禁 pass 通过，必须输出 `[RESULT:done]` 交给开发闭环；禁止把这些 FIND 写成 `[RESULT:failed]`。
 
 ## 按需参考
 

@@ -1,7 +1,7 @@
 /**
  * CEO 团队交付流水线：PM → 架构 → 开发 → 评审 → 测试 → 运行时审计 → 最终审查 → CEO 汇总。
  */
-import { PIPELINE_RESULT_INSTRUCTION } from './step-result.js';
+import { pipelineResultInstruction } from './step-result.js';
 import { gateResultInstruction, skillNameForStep } from './quality-gates.js';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
@@ -86,6 +86,7 @@ const PRIOR_CONTEXT_KEYS: Record<PipelineStepId, readonly string[]> = {
     'quality_evidence',
     'fingerprint_drift',
     'quality_fix_request',
+    'dev_environment_autocorrect',
     'blocked_review',
     'blocked_qa',
     'blocked_runtime_audit',
@@ -174,7 +175,8 @@ function skillPath(skillName: string): string {
 
 function gatedTail(step: PipelineStep): string[] {
   const instruction = gateResultInstruction(step.id);
-  return instruction ? ['', PIPELINE_RESULT_INSTRUCTION, '', instruction] : ['', PIPELINE_RESULT_INSTRUCTION];
+  const resultInstruction = pipelineResultInstruction(step.id);
+  return instruction ? ['', resultInstruction, '', instruction] : ['', resultInstruction];
 }
 
 /** 构造各角色在流水线中的任务 prompt。 */
@@ -239,6 +241,7 @@ export function buildPipelineStepPrompt(
         prior,
         '',
         '请给出技术方案：模块边界、关键改动点、风险与取舍。不要直接大面积改代码。',
+        '本步只设计不实现。发现的 P0/P1 登记为 planned 后必须输出 [RESULT:done]，交给开发闭环；禁止因这些 FIND 输出 [RESULT:failed]。',
         ...gatedTail(step),
       ].join('\n');
     case 'dev':
@@ -251,6 +254,12 @@ export function buildPipelineStepPrompt(
         prior,
         '',
         '请按 Spec 与技术方案在当前可写项目目录落地实现，并简述改动点。',
+        '本步的必需验证职责固定为：完整变更范围与需求追踪、本次改动的目标快速测试、静态检查与编译可行性。',
+        '完整 production build、dev/production server、浏览器与普通功能 E2E 的验收责任属于 QA；开发阶段可提前运行，但不得因纯环境限制把它们升格为开发必需门禁。',
+        '若上述 QA 验收项仅因沙箱禁止绑定端口、缺少浏览器/数据库/网络等环境而无法取证，在 implementation-manifest 中记为 required=false、status=blocked/unverified 且 delegatedTo="verification"，写明原因并交由 QA 执行；开发必需项全部通过时 Gate 保持 pass 并输出 [RESULT:done]，不得仅因这类环境缺证输出 [RESULT:blocked] 或 [RESULT:failed]。',
+        '委派不会自动消除风险；只有后续 QA 在 verification gate 中以完全相同的 check id、command argv 和 cwd 运行，并记为 required=true/status=pass/exitCode=0，该环境缺证才算被覆盖；未委派或未精确覆盖的 optional gap 仍作为残余风险。',
+        '若前置产出包含 dev_environment_autocorrect，这是控制器的一次性契约纠偏：必须按其中说明重新生成 implementation-manifest 与 GATE_RESULT，不得复用上一轮 blocked manifest 或再次把同一纯环境缺证作为开发阻塞。',
+        '若目标快速测试、静态/编译检查真实失败，或已确认是代码导致的 build/E2E 失败，仍必须记录 required=true + status=fail 并输出 [RESULT:failed]；不得伪装成环境缺证。',
         '若当前 cwd 不是目标项目、目录不可写、或目标路径尚无代码仓库，不要空跑评审话术，直接 [RESULT:blocked]。',
         ...gatedTail(step),
       ].join('\n');
@@ -263,7 +272,11 @@ export function buildPipelineStepPrompt(
         '前置产出：',
         prior,
         '',
-        '请做冒烟/验收检查：列测试步骤、结果、遗留风险。必要时可运行构建或测试命令。',
+        '请负责完整交付验收：在适用时真实运行 production build、dev/production server、集成测试、浏览器普通功能 E2E 与冒烟检查，列出步骤、结果和遗留风险。',
+        '开发 artifact 中 required=false 的环境缺证只是交接信息，不是 QA 豁免；按 Spec 和项目发现应当验证的完整构建、服务或 E2E 在 QA 报告中必须保持 required=true。',
+        '对 implementation check 中 delegatedTo="verification" 的交接，QA 必须在 executedChecks 中保留完全相同的 id、command argv 和 cwd，并真实执行到 required=true/status=pass/exitCode=0；不得用相似 id、摘要或任意其他通过检查代替。',
+        '若这些必需项仅因浏览器、端口、数据库、网络或授权环境不可用而无法取证，记录 required=true + status=blocked/unverified，保持 verification gate 非 pass 并输出 [RESULT:blocked]，留在 QA 等待环境，不得倒退成开发阶段的环境责任。',
+        '命令已真实运行且因产品代码或测试失败时，记录 status=fail，写明可复现缺陷并输出 [RESULT:failed] 交回开发；不得误报为环境阻塞。',
         ...gatedTail(step),
       ].join('\n');
     case 'runtime_audit':
@@ -275,7 +288,9 @@ export function buildPipelineStepPrompt(
         '前置产出：',
         prior,
         '',
-        '请对适用的运行时边界做真实探测；不适用项要给出证据和理由，不能伪造通过。',
+        '请只对适用的运行时边界做真实探测：HTTP 状态与缓存/安全头、权限边界、键盘与焦点、响应式/浏览器边界、性能及可观测性。',
+        '复用 QA 已验证的构建与普通功能 E2E 证据；不得重复 QA 已完成的普通功能 E2E，不得在本步重做完整 production build。',
+        '不适用项要给出证据和理由，不能伪造通过；适用边界因环境缺失无法取证时停在运行时审计阻塞，真实代码缺陷则失败并交回开发。',
         ...gatedTail(step),
       ].join('\n');
     case 'final_review':
@@ -287,7 +302,7 @@ export function buildPipelineStepPrompt(
         '前置产出：',
         prior,
         '',
-        '请独立核对需求追踪、变更范围、QA 与运行时证据。发现证据断链或开放 P0/P1 必须失败。',
+        '请独立核对需求追踪、变更范围、QA 与运行时证据。发现证据断链或开放 P0/P1 必须 [RESULT:failed] 交回开发，系统会继续修而不是永久停掉流水线。',
         ...gatedTail(step),
       ].join('\n');
     case 'summary':
@@ -298,9 +313,9 @@ export function buildPipelineStepPrompt(
         prior,
         '',
         '完整 canonical Spec 与控制器证据路径见 workflow_context；需要核对细节时读取对应文件，不要从截断摘要猜测。',
-        '请用简洁中文汇总：做了什么、如何验证、剩余风险、下一步建议。',
+        '请用简洁中文汇总：做了什么、如何验证、剩余风险、下一步建议。残余风险写进正文，禁止用 [RESULT:failed] 把已通过的流水线打成失败。',
         '',
-        PIPELINE_RESULT_INSTRUCTION,
+        pipelineResultInstruction('summary'),
       ].join('\n');
     case 'review':
       return [
@@ -311,7 +326,8 @@ export function buildPipelineStepPrompt(
         '前置产出：',
         prior,
         '',
-        '请独立检查完整变更范围和关联契约；不能只依据开发总结。开放 P0/P1 时给出可执行修复意见并拒绝批准。',
+        '请独立检查完整变更范围和关联契约；不能只依据开发总结。',
+        '开放 P0/P1 时给出可执行修复意见并拒绝批准：输出 [RESULT:done] 且不要写 [APPROVED]，让协作回传开发。禁止因这些 FIND 输出 [RESULT:failed]。',
         ...gatedTail(step),
       ].join('\n');
     default:

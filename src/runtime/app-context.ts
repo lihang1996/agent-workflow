@@ -6,7 +6,12 @@ import type { JsonSpecStore } from '../core/spec-store.js';
 import type { JsonScheduleStore } from '../core/schedule-store.js';
 import type { JsonApprovalStore } from '../core/approval-store.js';
 import type { JsonWorkflowStore } from '../core/workflow-store.js';
+import { IdentityRegistry } from '../core/identity-registry.js';
 import type { PipelineStep } from '../core/pipeline.js';
+import {
+  processRuntimeSourceGuard,
+  type RuntimeSourceGuardLike,
+} from '../core/runtime-source-guard.js';
 import type { SessionManager } from '../core/session-manager.js';
 import type { JsonTopicStore } from '../core/topic-store.js';
 import type { Bot } from '../im/lark.js';
@@ -34,6 +39,8 @@ export interface AppContext extends AppConfig {
   schedules: JsonScheduleStore;
   approvals: JsonApprovalStore;
   workflows: JsonWorkflowStore;
+  identities: IdentityRegistry;
+  runtimeSourceGuard: RuntimeSourceGuardLike;
   botsById: Map<string, Bot>;
   persistTimer?: ReturnType<typeof setTimeout>;
   schedulerTimer?: ReturnType<typeof setInterval>;
@@ -52,6 +59,8 @@ export interface CreateAppDeps {
   schedules: JsonScheduleStore;
   approvals: JsonApprovalStore;
   workflows: JsonWorkflowStore;
+  identities?: IdentityRegistry;
+  runtimeSourceGuard?: RuntimeSourceGuardLike;
   config: AppConfig;
 }
 
@@ -71,6 +80,8 @@ export function createAppContext(deps: CreateAppDeps): AppContext {
     schedules: deps.schedules,
     approvals: deps.approvals,
     workflows: deps.workflows,
+    identities: deps.identities ?? new IdentityRegistry(),
+    runtimeSourceGuard: deps.runtimeSourceGuard ?? processRuntimeSourceGuard,
     botsById: new Map(),
     schedulerRunning: false,
     specReviewRunning: false,

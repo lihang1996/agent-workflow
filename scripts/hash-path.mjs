@@ -31,6 +31,8 @@ const portablePath = (path) => {
   return rel || '.';
 };
 
+const compareEntryNames = (left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0;
+
 const visit = async (path, suppliedStats) => {
   const stats = suppliedStats ?? await lstat(path);
   entryCount += 1;
@@ -45,7 +47,7 @@ const visit = async (path, suppliedStats) => {
   if (stats.isDirectory()) {
     hash.update(`directory\0${name}\0${stats.mode.toString(8)}\0`);
     const entries = await readdir(path, { withFileTypes: true });
-    entries.sort((left, right) => left.name.localeCompare(right.name));
+    entries.sort(compareEntryNames);
     for (const entry of entries) await visit(resolve(path, entry.name));
     return;
   }

@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
+  FingerprintDriftError,
+  GateFindingSchema,
   GateResultSchema,
   assertEvidenceChainComplete,
   assertFindingContinuity,
@@ -17,9 +19,11 @@ import {
   bindGateWaiversToCanonicalSpec,
   consolidateLatestGateFindings,
   createGateRun,
+  gateResultInstruction,
   parseGateResult,
   parseCanonicalSpecWaivers,
   rewindStepIdFromDriftMessage,
+  unresolvedOptionalCheckGapIds,
   validateGatePass,
   verifyGateArtifacts,
 } from '../src/core/quality-gates.js';
@@ -240,6 +244,27 @@ test('findings 兼容 INFO severity 与 title/detail 别名', () => {
   assert.match(parsed.findings[0]?.summary ?? '', /契约指纹差异已解释/);
   assert.equal(parsed.findings[1]?.severity, 'P1');
   assert.doesNotThrow(() => validateGatePass('architect', parsed));
+});
+
+test('finding category/confidence/exploitability 别名对齐，未知值 fail closed', () => {
+  const aliased = GateFindingSchema.parse({
+    id: 'FIND-001',
+    severity: 'P2',
+    status: 'open',
+    summary: 'e2e reuses server',
+    category: 'test-reliability',
+    confidence: 'High',
+  });
+  assert.equal(aliased.category, 'testing');
+  assert.equal(aliased.confidence, 'high');
+
+  assert.throws(() => GateFindingSchema.parse({
+    id: 'FIND-002',
+    severity: 'P2',
+    status: 'open',
+    summary: 'bad category',
+    category: 'documentation-accuracy-extra',
+  }), /Invalid option|category/i);
 });
 
 test('GATE_RESULT 兼容低风险形状，但拒绝不可复现的 command 字符串', () => {
@@ -511,6 +536,41 @@ test('GATE_RESULT 可用括号匹配提取，容忍行尾 DSML/工具调用垃�
   assert.equal(multi.summary, '多行 JSON');
 });
 
+test('门禁提示示例与主 artifact 的 checks 所有权保持一致', () => {
+  const exampleFrom = (stepId: Parameters<typeof gateResultInstruction>[0]) => {
+    const instruction = gateResultInstruction(stepId);
+    const marker = '示例：[GATE_RESULT] ';
+    const start = instruction.indexOf(marker);
+    assert.notEqual(start, -1);
+    const line = instruction.slice(start + marker.length).split('\n', 1)[0];
+    return { instruction, example: JSON.parse(line) as { checks: unknown[] } };
+  };
+
+  for (const stepId of ['architect', 'dev', 'qa'] as const) {
+    const { instruction, example } = exampleFrom(stepId);
+    assert.deepEqual(example.checks, [], `${stepId} 示例应由主 artifact 水合 checks`);
+    assert.match(instruction, /checks 不得重复其中任何 id/);
+    assert.match(instruction, /没有额外检查时必须写 \[\]/);
+  }
+  assert.match(
+    gateResultInstruction('architect'),
+    /设计门禁 status=pass 时允许 findings 为 planned 的 P0\/P1/,
+  );
+  assert.doesNotMatch(
+    gateResultInstruction('architect'),
+    /status=pass 时不得包含 open\/planned 的 P0\/P1/,
+  );
+  assert.match(
+    gateResultInstruction('dev'),
+    /status=pass 时不得包含 open\/planned 的 P0\/P1/,
+  );
+  for (const stepId of ['review', 'runtime_audit', 'final_review'] as const) {
+    const { instruction, example } = exampleFrom(stepId);
+    assert.equal(example.checks.length, 1, `${stepId} 示例必须保留真实门禁命令`);
+    assert.match(instruction, /GATE_RESULT\.checks 必须保留真实/);
+  }
+});
+
 test('答案完全缺少 GATE_RESULT 时可从证据目录主 artifact 恢复', async () => {
   const evidenceRoot = await mkdtemp(join(tmpdir(), 'agent-os-gate-recover-'));
   try {
@@ -625,6 +685,314 @@ test('GATE_RESULT 对证据目录内 artifact 会按文件内容重算错误长�
   }
 });
 
+test('实现门禁会从主 artifact 补齐 GATE_RESULT 未重复声明的目标检查', async () => {
+  const evidenceRoot = await mkdtemp(join(tmpdir(), 'agent-os-partial-implementation-checks-'));
+  try {
+    const manifestPath = join(evidenceRoot, 'implementation-manifest.json');
+    const unitTests = {
+      ...passingCheck('unit-tests'),
+      command: ['pnpm', 'test:unit'],
+      cwd: evidenceRoot,
+    };
+    const delegatedE2e = {
+      id: 'browser-e2e',
+      command: ['pnpm', 'test:e2e'],
+      status: 'blocked',
+      required: false,
+      delegatedTo: 'verification',
+      exitCode: null,
+      cwd: evidenceRoot,
+      startedAt: '2026-08-12T00:00:00.000Z',
+      finishedAt: '2026-08-12T00:00:01.000Z',
+    };
+    const manifestContent = JSON.stringify({
+      contractHash: 'a'.repeat(64),
+      planHash: 'b'.repeat(64),
+      fingerprintBefore: 'c'.repeat(64),
+      fingerprintAfter: 'd'.repeat(64),
+      changedFiles: ['src/a.ts'],
+      requirementImplementations: [{ requirementId: 'RQ-1', files: ['src/a.ts'] }],
+      targetedCheckResults: [unitTests, delegatedE2e],
+      status: 'pass',
+    });
+    await writeFile(manifestPath, manifestContent);
+    const validateArtifact = {
+      ...passingCheck('validate-artifact'),
+      cwd: evidenceRoot,
+    };
+    const answer = `[GATE_RESULT] ${JSON.stringify({
+      gateId: 'implementation',
+      status: 'pass',
+      summary: 'implementation verified',
+      requirementIds: ['RQ-1'],
+      checks: [validateArtifact],
+      evidence: [manifestPath],
+      artifacts: [{
+        path: manifestPath,
+        sha256: createHash('sha256').update(manifestContent).digest('hex'),
+        kind: 'manifest',
+      }],
+      findings: [],
+    })}`;
+
+    const parsed = await parseGateResult(answer, 'dev', { evidenceRoot });
+    assert.deepEqual(
+      parsed.checks.map((check) => check.id),
+      ['validate-artifact', 'unit-tests', 'browser-e2e'],
+    );
+    assert.equal(parsed.checks.find((check) => check.id === 'browser-e2e')?.delegatedTo, 'verification');
+    await assert.doesNotReject(verifyGateArtifacts(evidenceRoot, parsed));
+    assert.doesNotThrow(() => validateGatePass('dev', parsed));
+  } finally {
+    await rm(evidenceRoot, { recursive: true, force: true });
+  }
+});
+
+test('实现门禁同 ID 检查仅执行元数据不同时采用 artifact 记录', async () => {
+  const evidenceRoot = await mkdtemp(join(tmpdir(), 'agent-os-check-metadata-'));
+  try {
+    const manifestPath = join(evidenceRoot, 'implementation-manifest.json');
+    const unitTests = {
+      ...passingCheck('unit-tests'),
+      command: ['pnpm', 'test:unit'],
+      cwd: evidenceRoot,
+      durationMs: 125,
+      startedAt: '2026-08-12T00:00:00.000Z',
+      finishedAt: '2026-08-12T00:00:00.125Z',
+      logSha256: 'e'.repeat(64),
+    };
+    const manifestContent = JSON.stringify({
+      contractHash: 'a'.repeat(64),
+      planHash: 'b'.repeat(64),
+      fingerprintBefore: 'c'.repeat(64),
+      fingerprintAfter: 'd'.repeat(64),
+      changedFiles: ['src/a.ts'],
+      requirementImplementations: [{ requirementId: 'RQ-1', files: ['src/a.ts'] }],
+      targetedCheckResults: [unitTests],
+      status: 'pass',
+    });
+    await writeFile(manifestPath, manifestContent);
+    const answer = `[GATE_RESULT] ${JSON.stringify({
+      gateId: 'implementation',
+      status: 'pass',
+      summary: 'implementation verified',
+      requirementIds: ['RQ-1'],
+      checks: [{
+        id: 'unit-tests',
+        command: ['pnpm', 'test:unit'],
+        status: 'pass',
+        required: true,
+        exitCode: 0,
+      }],
+      evidence: [manifestPath],
+      artifacts: [{
+        path: manifestPath,
+        sha256: createHash('sha256').update(manifestContent).digest('hex'),
+        kind: 'manifest',
+      }],
+      findings: [],
+    })}`;
+
+    const parsed = await parseGateResult(answer, 'dev', { evidenceRoot });
+    assert.equal(parsed.checks[0]?.durationMs, 125);
+    assert.equal(parsed.checks[0]?.logSha256, 'e'.repeat(64));
+    await assert.doesNotReject(verifyGateArtifacts(evidenceRoot, parsed));
+  } finally {
+    await rm(evidenceRoot, { recursive: true, force: true });
+  }
+});
+
+test('设计门禁允许同 ID 的更晚同结论重跑，并保留 artifact 原始证据', async () => {
+  const evidenceRoot = await mkdtemp(join(tmpdir(), 'agent-os-later-design-check-rerun-'));
+  try {
+    const planPath = join(evidenceRoot, 'change-plan.json');
+    const artifactCheck = {
+      ...passingCheck('requirement-coverage-consistency'),
+      command: ['node', '-e', 'validateRequirementCoverage()'],
+      cwd: evidenceRoot,
+      startedAt: '2026-08-12T08:27:40.418Z',
+      finishedAt: '2026-08-12T08:27:40.490Z',
+    };
+    const planContent = JSON.stringify({
+      contractHash: 'a'.repeat(64),
+      projectFingerprint: 'b'.repeat(64),
+      requirementTrace: [{
+        requirementId: 'RQ-1',
+        implementationPoints: ['src/a.ts'],
+        verificationPoints: ['tests/a.test.ts'],
+      }],
+      riskAssessments: [],
+      allowedPaths: ['src/**'],
+      testPlan: ['pnpm test'],
+      checks: [artifactCheck],
+      status: 'pass',
+    });
+    await writeFile(planPath, planContent);
+    const laterRerun = {
+      ...artifactCheck,
+      command: ['node', '-e', 'validateRequirementCoverage(); validateCheckStatuses()'],
+      startedAt: '2026-08-12T08:28:21.336Z',
+      finishedAt: '2026-08-12T08:28:21.411Z',
+    };
+    const answer = `[GATE_RESULT] ${JSON.stringify({
+      gateId: 'design',
+      status: 'pass',
+      summary: 'design verified',
+      requirementIds: ['RQ-1'],
+      checks: [laterRerun],
+      evidence: [planPath],
+      artifacts: [{
+        path: planPath,
+        sha256: createHash('sha256').update(planContent).digest('hex'),
+        kind: 'plan',
+      }],
+      findings: [],
+    })}`;
+
+    const parsed = await parseGateResult(answer, 'architect', { evidenceRoot });
+    assert.deepEqual(parsed.checks, [artifactCheck]);
+    await assert.doesNotReject(verifyGateArtifacts(evidenceRoot, parsed));
+    assert.doesNotThrow(() => validateGatePass('architect', parsed));
+  } finally {
+    await rm(evidenceRoot, { recursive: true, force: true });
+  }
+});
+
+test('主 artifact 与非后续的同 ID 检查证据不一致时仍会拒绝', async () => {
+  const evidenceRoot = await mkdtemp(join(tmpdir(), 'agent-os-conflicting-implementation-check-'));
+  try {
+    const manifestPath = join(evidenceRoot, 'implementation-manifest.json');
+    const unitTests = {
+      ...passingCheck('unit-tests'),
+      command: ['pnpm', 'test:unit'],
+      cwd: evidenceRoot,
+    };
+    const manifestContent = JSON.stringify({
+      targetedCheckResults: [unitTests],
+      status: 'pass',
+    });
+    await writeFile(manifestPath, manifestContent);
+    const answer = `[GATE_RESULT] ${JSON.stringify({
+      gateId: 'implementation',
+      status: 'pass',
+      summary: 'implementation verified',
+      requirementIds: ['RQ-1'],
+      checks: [{ ...unitTests, command: ['pnpm', 'test:other'] }],
+      evidence: [manifestPath],
+      artifacts: [{
+        path: manifestPath,
+        sha256: createHash('sha256').update(manifestContent).digest('hex'),
+        kind: 'manifest',
+      }],
+      findings: [],
+    })}`;
+
+    await assert.rejects(
+      () => parseGateResult(answer, 'dev', { evidenceRoot }),
+      /同 ID 检查证据不一致：unit-tests/,
+    );
+  } finally {
+    await rm(evidenceRoot, { recursive: true, force: true });
+  }
+});
+
+test('同 ID 的更晚重跑若工作目录变化仍会拒绝', async () => {
+  const evidenceRoot = await mkdtemp(join(tmpdir(), 'agent-os-conflicting-design-rerun-cwd-'));
+  try {
+    const planPath = join(evidenceRoot, 'change-plan.json');
+    const artifactCheck = {
+      ...passingCheck('requirement-coverage-consistency'),
+      command: ['node', '-e', 'validateRequirementCoverage()'],
+      cwd: evidenceRoot,
+      startedAt: '2026-08-12T08:27:40.418Z',
+      finishedAt: '2026-08-12T08:27:40.490Z',
+    };
+    const planContent = JSON.stringify({ checks: [artifactCheck], status: 'pass' });
+    await writeFile(planPath, planContent);
+    const answer = `[GATE_RESULT] ${JSON.stringify({
+      gateId: 'design',
+      status: 'pass',
+      summary: 'design verified',
+      requirementIds: ['RQ-1'],
+      checks: [{
+        ...artifactCheck,
+        cwd: join(evidenceRoot, 'other-project'),
+        startedAt: '2026-08-12T08:28:21.336Z',
+        finishedAt: '2026-08-12T08:28:21.411Z',
+      }],
+      evidence: [planPath],
+      artifacts: [{
+        path: planPath,
+        sha256: createHash('sha256').update(planContent).digest('hex'),
+        kind: 'plan',
+      }],
+      findings: [],
+    })}`;
+
+    await assert.rejects(
+      () => parseGateResult(answer, 'architect', { evidenceRoot }),
+      /同 ID 检查证据不一致：requirement-coverage-consistency/,
+    );
+  } finally {
+    await rm(evidenceRoot, { recursive: true, force: true });
+  }
+});
+
+test('同 ID 的更晚重跑必须有完整时间且不能声称未来执行', async () => {
+  const evidenceRoot = await mkdtemp(join(tmpdir(), 'agent-os-invalid-design-rerun-time-'));
+  try {
+    const planPath = join(evidenceRoot, 'change-plan.json');
+    const artifactCheck = {
+      ...passingCheck('requirement-coverage-consistency'),
+      command: ['node', '-e', 'validateRequirementCoverage()'],
+      cwd: evidenceRoot,
+      startedAt: '2026-08-12T08:27:40.418Z',
+      finishedAt: '2026-08-12T08:27:40.490Z',
+    };
+    const planContent = JSON.stringify({ checks: [artifactCheck], status: 'pass' });
+    await writeFile(planPath, planContent);
+    const answerFor = (check: Record<string, unknown>) => `[GATE_RESULT] ${JSON.stringify({
+      gateId: 'design',
+      status: 'pass',
+      summary: 'design verified',
+      requirementIds: ['RQ-1'],
+      checks: [check],
+      evidence: [planPath],
+      artifacts: [{
+        path: planPath,
+        sha256: createHash('sha256').update(planContent).digest('hex'),
+        kind: 'plan',
+      }],
+      findings: [],
+    })}`;
+    const changedCommand = ['node', '-e', 'validateRequirementCoverage(); validateCheckStatuses()'];
+
+    await assert.rejects(
+      () => parseGateResult(answerFor({
+        ...artifactCheck,
+        command: changedCommand,
+        startedAt: '2026-08-12T08:28:21.336Z',
+        finishedAt: undefined,
+      }), 'architect', { evidenceRoot }),
+      /同 ID 检查证据不一致：requirement-coverage-consistency/,
+    );
+
+    const futureStartedAt = new Date(Date.now() + 10 * 60 * 1_000);
+    const futureFinishedAt = new Date(futureStartedAt.getTime() + 1_000);
+    await assert.rejects(
+      () => parseGateResult(answerFor({
+        ...artifactCheck,
+        command: changedCommand,
+        startedAt: futureStartedAt.toISOString(),
+        finishedAt: futureFinishedAt.toISOString(),
+      }), 'architect', { evidenceRoot }),
+      /同 ID 检查证据不一致：requirement-coverage-consistency/,
+    );
+  } finally {
+    await rm(evidenceRoot, { recursive: true, force: true });
+  }
+});
+
 test('GATE_RESULT 兼容 sha256 前缀与大小写，但不盲目截断超长 hex', () => {
   const wrapped = GateResultSchema.parse({
     gateId: 'design',
@@ -716,6 +1084,124 @@ test('设计以外不得用 planned 掩盖未完成项，可选检查失败会�
     ...qa,
     checks: [{ ...optionalBlocked, exitCode: 0 }],
   }), /不能声称 exitCode=0/);
+});
+
+test('可选环境缺证只能由更新且精确匹配的 QA 成功证据覆盖', () => {
+  const fingerprint = 'b'.repeat(64);
+  const delegatedCheck = {
+    id: 'browser-e2e',
+    command: ['pnpm', 'test:e2e'],
+    status: 'blocked' as const,
+    required: false,
+    delegatedTo: 'verification' as const,
+    exitCode: null,
+    cwd: '/tmp/project',
+    startedAt: '2026-08-12T01:00:00.000Z',
+    finishedAt: '2026-08-12T01:00:01.000Z',
+  };
+  const unresolvedOptional = {
+    ...delegatedCheck,
+    id: 'safari-compatibility',
+    command: ['pnpm', 'test:safari'],
+    delegatedTo: undefined,
+  };
+  const implementation = GateResultSchema.parse({
+    ...result('implementation'),
+    checks: [passingCheck('targeted-unit'), delegatedCheck, unresolvedOptional],
+  });
+  const qaCheck = {
+    ...delegatedCheck,
+    status: 'pass' as const,
+    required: true,
+    delegatedTo: undefined,
+    exitCode: 0,
+    startedAt: '2026-08-12T02:00:00.000Z',
+    finishedAt: '2026-08-12T02:00:01.000Z',
+  };
+  const verification = GateResultSchema.parse({
+    ...result('verification'),
+    checks: [qaCheck],
+  });
+  const implementationRun = {
+    ...createGateRun('dev', implementation, [], fingerprint),
+    recordedAt: '2026-08-12T01:01:00.000Z',
+  };
+  const verificationRun = {
+    ...createGateRun('qa', verification, [], fingerprint),
+    recordedAt: '2026-08-12T02:01:00.000Z',
+  };
+
+  assert.deepEqual(
+    unresolvedOptionalCheckGapIds([implementationRun, verificationRun]),
+    ['implementation/safari-compatibility'],
+    '精确 QA 证据只覆盖已委派项，未委派 optional gap 必须保留',
+  );
+
+  const mismatchCases = [
+    { name: '相似但不相同的 id', check: { ...qaCheck, id: 'browser-e2e-retry' } },
+    { name: '不同命令', check: { ...qaCheck, command: ['pnpm', 'test:e2e:smoke'] } },
+    { name: '不同工作目录', check: { ...qaCheck, cwd: '/tmp/other-project' } },
+    { name: 'QA 仍把检查记为 optional', check: { ...qaCheck, required: false } },
+  ];
+  for (const mismatch of mismatchCases) {
+    const mismatchedVerification = GateResultSchema.parse({
+      ...verification,
+      checks: [mismatch.check],
+    });
+    const mismatchedRun = { ...verificationRun, result: mismatchedVerification };
+    assert.ok(
+      unresolvedOptionalCheckGapIds([implementationRun, mismatchedRun])
+        .includes('implementation/browser-e2e'),
+      mismatch.name,
+    );
+  }
+
+  const olderVerificationRun = {
+    ...verificationRun,
+    recordedAt: '2026-08-12T00:59:00.000Z',
+  };
+  assert.ok(
+    unresolvedOptionalCheckGapIds([implementationRun, olderVerificationRun])
+      .includes('implementation/browser-e2e'),
+    '旧 QA 证据不得覆盖更新的开发委派',
+  );
+
+  const otherFingerprintRun = { ...verificationRun, projectFingerprint: 'c'.repeat(64) };
+  assert.ok(
+    unresolvedOptionalCheckGapIds([implementationRun, otherFingerprintRun])
+      .includes('implementation/browser-e2e'),
+    '不同项目快照的 QA 证据不得覆盖委派',
+  );
+});
+
+test('delegatedTo 只允许 implementation 的 optional blocked/unverified check', () => {
+  const base = {
+    id: 'browser-e2e',
+    command: ['pnpm', 'test:e2e'],
+    status: 'blocked' as const,
+    required: false,
+    delegatedTo: 'verification' as const,
+    exitCode: null,
+    cwd: '/tmp/project',
+    startedAt: '2026-08-12T01:00:00.000Z',
+    finishedAt: '2026-08-12T01:00:01.000Z',
+  };
+  assert.doesNotThrow(() => GateResultSchema.parse({
+    ...result('implementation'),
+    checks: [passingCheck('unit'), base],
+  }));
+  assert.throws(() => GateResultSchema.parse({
+    ...result('implementation'),
+    checks: [passingCheck('unit'), { ...base, required: true }],
+  }), /required=false/);
+  assert.throws(() => GateResultSchema.parse({
+    ...result('implementation'),
+    checks: [passingCheck('unit'), { ...base, status: 'pass', exitCode: 0 }],
+  }), /blocked\/unverified/);
+  assert.throws(() => GateResultSchema.parse({
+    ...result('verification'),
+    checks: [base],
+  }), /implementation gate/);
 });
 
 test('最终审查必须继承上游残余风险且不得降级，后续 resolved 可闭环', () => {
@@ -873,6 +1359,7 @@ test('artifact 必须位于工作流证据目录且内容 hash 匹配', async ()
     const evidenceRoot = join(root, 'evidence');
     await mkdir(evidenceRoot);
     const artifactPath = join(evidenceRoot, 'change-plan.json');
+    const planCheck = { ...passingCheck('validate-plan'), cwd: evidenceRoot };
     const content = `${JSON.stringify({
       contractHash: 'a'.repeat(64),
       projectFingerprint: 'b'.repeat(64),
@@ -884,12 +1371,13 @@ test('artifact 必须位于工作流证据目录且内容 hash 匹配', async ()
       riskAssessments: [],
       allowedPaths: ['src/**'],
       testPlan: ['pnpm test'],
+      checks: [planCheck],
       status: 'pass',
     })}\n`;
     await writeFile(artifactPath, content);
     const sha256 = createHash('sha256').update(content).digest('hex');
     const gateResult = GateResultSchema.parse({
-      gateId: 'design', status: 'pass', summary: 'verified', checks: [], evidence: [], findings: [],
+      gateId: 'design', status: 'pass', summary: 'verified', checks: [planCheck], evidence: [], findings: [],
       requirementIds: ['RQ-1'],
       artifacts: [{ path: artifactPath, sha256, kind: 'plan' }],
     });
@@ -1154,7 +1642,12 @@ test('门禁 lineage 拒绝旧 Spec、旧计划或旧评审报告', async () => 
       projectFingerprint: before,
       stepStartFingerprint: '7'.repeat(64),
       previousRuns: [],
-    }), /保持源码只读/);
+    }), (error: unknown) => {
+      assert.ok(error instanceof FingerprintDriftError);
+      assert.equal(error.rewindToStepId, 'architect');
+      assert.match(error.message, /保持源码只读/);
+      return true;
+    });
     await assert.rejects(assertGateLineage('architect', design, {
       canonicalSpecHash: '9'.repeat(64), canonicalRequirementIds: requirementIds,
       projectFingerprint: before, previousRuns: [],
@@ -1308,6 +1801,10 @@ test('纯库可用带证据的 not-applicable 通过运行时适用性节点', (
 });
 
 test('指纹漂移文案可映射回退步骤', () => {
+  assert.equal(
+    rewindStepIdFromDriftMessage('设计步骤执行期间项目快照发生变化；架构门禁必须保持源码只读'),
+    'architect',
+  );
   assert.equal(
     rewindStepIdFromDriftMessage('当前变更快照与最新 implementation gate 不一致，必须先重建实现证据'),
     'dev',

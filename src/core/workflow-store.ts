@@ -115,6 +115,9 @@ export const DeliveryWorkflowSchema = z.object({
     'fingerprint_drift',
     'quality_fix_request',
     'blocked_workdir',
+    'test_resource_authorized',
+    'dev_environment_autocorrect',
+    'runtime_source_changed',
     ...workflow.stepIds.map((stepId) => `blocked_${stepId}`),
   ]);
   for (const key of Object.keys(workflow.priorOutputs)) {
@@ -200,8 +203,9 @@ export class JsonWorkflowStore {
   }
 
   listRecoverable(): DeliveryWorkflow[] {
+    // P1 修复：加入 awaiting_questions，使问卷答案已落库但工作流未恢复的状态可自愈。
     return [...this.workflows.values()].filter((workflow) =>
-      workflow.status === 'ready' || workflow.status === 'executing');
+      workflow.status === 'ready' || workflow.status === 'executing' || workflow.status === 'awaiting_questions');
   }
 
   async create(input: Omit<
@@ -334,6 +338,75 @@ export class JsonWorkflowStore {
     });
   }
 
+  /**
+   * 开发把纯环境运行态缺证误报为 blocked 时，仅允许一次原子纠偏重试。
+   * marker 检查、阻塞证据落库和 executing -> ready 在同一个写锁内完成，
+   * 因而重复/迟到回调不能启动第二次自动重试。
+   */
+  async retryCurrentDevEnvironmentBlockOnce(
+    id: string,
+    stepIndex: number,
+    instruction: string,
+    blockedAnswer: string,
+  ): Promise<DeliveryWorkflow | undefined> {
+    return this.enqueueMutation(async () => {
+      const current = this.require(id);
+      if (
+        current.status !== 'executing'
+        || current.nextStepIndex !== stepIndex
+        || current.stepIds[stepIndex] !== 'dev'
+        || current.priorOutputs.dev_environment_autocorrect !== undefined
+      ) return undefined;
+      const next = DeliveryWorkflowSchema.parse({
+        ...current,
+        status: 'ready',
+        priorOutputs: {
+          ...current.priorOutputs,
+          blocked_dev: blockedAnswer,
+          dev_environment_autocorrect: instruction,
+        },
+        error: undefined,
+        updatedAt: new Date().toISOString(),
+      });
+      this.assertNoTechnicalDeliveryConflict(next);
+      await this.replaceAndPersist(id, next);
+      return next;
+    });
+  }
+
+  /**
+   * 新进程确认控制器源码与自身基线一致后，原子清理源码漂移阻塞并重跑同一步。
+   * 独立方法避免普通环境/目录重试误删该 marker。
+   */
+  async resumeCurrentRuntimeSourceBlock(
+    id: string,
+    stepIndex: number,
+    stepId: WorkflowStepId,
+  ): Promise<DeliveryWorkflow | undefined> {
+    return this.enqueueMutation(async () => {
+      const current = this.require(id);
+      if (
+        current.status !== 'awaiting_step_unblock'
+        || current.nextStepIndex !== stepIndex
+        || current.stepIds[stepIndex] !== stepId
+        || current.priorOutputs.runtime_source_changed === undefined
+      ) return undefined;
+      const priorOutputs = { ...current.priorOutputs };
+      delete priorOutputs.runtime_source_changed;
+      delete priorOutputs[`blocked_${stepId}`];
+      const next = DeliveryWorkflowSchema.parse({
+        ...current,
+        status: 'ready',
+        priorOutputs,
+        error: undefined,
+        updatedAt: new Date().toISOString(),
+      });
+      this.assertNoTechnicalDeliveryConflict(next);
+      await this.replaceAndPersist(id, next);
+      return next;
+    });
+  }
+
   /** 原子记录当前步骤产出并推进一次，重复成功回调不会跨过后续步骤。 */
   async completeCurrentStep(
     id: string,
@@ -349,11 +422,19 @@ export class JsonWorkflowStore {
         || current.nextStepIndex !== stepIndex
         || current.stepIds[stepIndex] !== stepId
       ) return undefined;
+      const nextPriorOutputs = { ...current.priorOutputs };
+      // 一次性开发环境纠偏只属于当前 dev 闭环。成功推进后清掉 marker 与旧阻塞正文，
+      // 避免后续 QA 代码修复退回 dev 时读取陈旧提示，并为新一轮 dev 提供独立额度。
+      if (stepId === 'dev') {
+        delete nextPriorOutputs.dev_environment_autocorrect;
+        delete nextPriorOutputs.blocked_dev;
+      }
+      nextPriorOutputs[stepId] = answer;
       const next = DeliveryWorkflowSchema.parse({
         ...current,
         status: 'ready',
         nextStepIndex: stepIndex + 1,
-        priorOutputs: { ...current.priorOutputs, [stepId]: answer },
+        priorOutputs: nextPriorOutputs,
         gateRuns: options.gateRun ? [...current.gateRuns, options.gateRun] : current.gateRuns,
         projectFingerprint: options.projectFingerprint ?? current.projectFingerprint,
         error: undefined,

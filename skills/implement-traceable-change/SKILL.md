@@ -51,6 +51,25 @@ description: "在已批准交付契约和风险方案下实现功能、修复、
 `fingerprintBefore`、`fingerprintAfter`、`changedFiles`、`requirementImplementations`、
 `riskControls`、`testsAddedOrChanged`、`targetedCheckResults`、`deviations` 和 `status`。
 把结构化输出保存到控制器提供的 `evidenceRoot`，计算真实 SHA-256，并写入 `[GATE_RESULT].artifacts`。
+`targetedCheckResults` 是实现检查的权威集合；`[GATE_RESULT].checks` 不得重复其中任何 ID，
+没有额外检查时必须写空数组，由控制器从 artifact 水合。若需登记 artifact 校验等额外命令，
+必须使用新的唯一 ID；禁止只复制部分目标检查或为同一检查编造另一份元数据。
+若输出 `[GATE_RESULT].findings`，字段必须与控制器对齐：`severity=P0|P1|P2|P3`，
+`status=open|resolved|waived`（实现不得用 `planned` 代替未完成控制），可选 `category` 只能是
+`correctness|security|reliability|architecture|performance|maintainability|testing|compatibility|scope|other`。
+
+- `status=pass` 时必须至少有一项 `required=true` 的通过检查，且所有 required 检查均通过。
+  向控制器提交 GATE_RESULT pass 时，artifact.status 必须是 `pass`。
+- 完整 build、本地 dev/start、真实浏览器或 E2E 仅因执行环境缺失而无法采证时，在开发阶段
+  登记为 `required=false`、`status=blocked|unverified`、`delegatedTo="verification"`，实现范围、目标快速测试和代码编译通过后
+  仍输出 `[RESULT:done]` 并移交 QA 补运行态证据，不得仅据此输出 `[RESULT:blocked]`。
+- `delegatedTo` 不是豁免：只有后续 verification gate 以完全相同的 check `id`、
+  `command` 原始 argv 和 `cwd` 真实执行，并记录 `required=true/status=pass/exitCode=0`，
+  才会消除该残余风险。未委派的 optional gap，或只有相似 ID/摘要/其他通过检查的情形仍必须披露。
+- 变更范围检查、目标快速测试或代码编译属于实现必需检查；它们失败或无法完成时：
+  检查记 `required=true` + `status=fail`，**不要**提交 GATE_RESULT pass，输出 `[RESULT:failed]`。
+  本地脚本可以把未完成实现校验为 `status=blocked`，但不得搭配 `[RESULT:done]` 或 Gate `status=pass`
+  （控制器只接受 pass artifact）。只有目录、权限或前置环境确实阻止实现时才使用 `[RESULT:blocked]`。
 
 修改越界、P0/P1 控制未实现、目标测试失败或质量门禁被弱化时阻止 QA。
 

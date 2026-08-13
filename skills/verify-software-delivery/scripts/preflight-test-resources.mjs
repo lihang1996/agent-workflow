@@ -7,12 +7,20 @@ if (!path) {
   process.exit(64);
 }
 const policy = JSON.parse(await readFile(path, "utf8"));
+const requiredSentinelEnv = "AGENT_OS_TEST_RESOURCE_SENTINEL";
 if (!policy.destructive) {
   process.stdout.write(`${JSON.stringify({ status: "pass", destructive: false }, null, 2)}\n`);
   process.exit(0);
 }
 
 const errors = [];
+if (policy.sentinelEnv && policy.sentinelEnv !== requiredSentinelEnv) {
+  errors.push(`sentinelEnv must be ${requiredSentinelEnv}`);
+}
+if (policy.requiredSentinelValue !== undefined
+  && String(policy.requiredSentinelValue).toLowerCase() !== "true") {
+  errors.push("requiredSentinelValue must be true");
+}
 const envName = policy.connectionEnv;
 const raw = typeof envName === "string" ? process.env[envName] : undefined;
 if (!envName || !raw) errors.push("destructive checks require a populated connectionEnv");
@@ -43,8 +51,8 @@ for (const otherName of policy.runtimeConnectionEnvs ?? []) {
     errors.push(`${otherName} is not a valid URL`);
   }
 }
-const sentinelOkay = policy.sentinelEnv
-  && process.env[policy.sentinelEnv] === String(policy.requiredSentinelValue ?? "true");
+const sentinelOkay = policy.sentinelEnv === requiredSentinelEnv
+  && process.env[requiredSentinelEnv]?.trim().toLowerCase() === "true";
 if (!sentinelOkay && !policy.disposableResourceId) {
   errors.push("destructive checks require a matching sentinel or disposableResourceId");
 }

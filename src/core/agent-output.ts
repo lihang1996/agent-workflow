@@ -9,8 +9,9 @@ export function humanReadableAgentOutput(answer: string): string {
 
   // GATE_RESULT 按协议必须位于正文末尾。发现真实 JSON 标记后，后续内容全部视为机器区，
   // 这也一并隔离模型偶发追加的 DSML / tool_calls 垃圾。
+  // P1 修复：与 GATE parser 的允许装饰对齐，接受 ** 加粗前缀和冒号。
   const gateMarker = visible.search(
-    /(?:^|\n)\s*(?:`{1,3})?\[GATE_RESULT\]\s*(?=\{)/,
+    /(?:^|\n)\s*(?:\*{0,2}|`{1,3})?\[GATE_RESULT\]\s*[:\s]*(?=\{)/,
   );
   if (gateMarker >= 0) visible = visible.slice(0, gateMarker);
 

@@ -30,6 +30,7 @@ import {
   parseGateResult,
   parseCanonicalSpecWaivers,
   rewindStepIdFromDriftMessage,
+  unresolvedOptionalCheckGapIds,
   validateGatePass,
   verifyGateArtifacts,
   type CanonicalSpecWaiverContext,
@@ -38,15 +39,29 @@ import {
 import { compactAgentOutput } from '../core/agent-output.js';
 import { fingerprintProject } from '../core/project-snapshot.js';
 import { extractRequirementIds } from '../core/requirement-ids.js';
+import {
+  isRuntimeSourceChangedError,
+  processRuntimeSourceGuard,
+  RUNTIME_SOURCE_RESTART_MESSAGE,
+} from '../core/runtime-source-guard.js';
+import {
+  isTestResourceSentinelAuthorized,
+  TEST_RESOURCE_SENTINEL_ENV,
+} from '../core/test-resource-policy.js';
 import type { DeliveryWorkflow } from '../core/workflow-store.js';
 import type { ProductSpec } from '../core/spec-store.js';
 import { redactSecrets, sanitizeErrorForLog, sanitizeForLog } from '../core/log-inspection.js';
 import {
+  classifyStepBlockReason,
   extractAbsolutePathCandidates,
+  findMisroutedEnvironmentBlock,
   handoffStepIdFromQualityMessage,
   hasExplicitStepResult,
   parseStepResult,
+  requiresTestResourceAuthorization,
   resolveQualityHandoffTarget,
+  shouldAcceptArchitectFailedAsDone,
+  shouldAutoCorrectDevEnvironmentBlock,
 } from '../core/step-result.js';
 import { assertWorkdir } from '../core/workdir.js';
 import { buildQuestionnaireCard, buildSpecConfirmationCard, buildStepBlockedCard } from '../im/workflow-card.js';
@@ -76,6 +91,17 @@ const FINGERPRINT_SCRIPT_PATH = fileURLToPath(
 const HASH_PATH_SCRIPT_PATH = fileURLToPath(
   new URL('../../scripts/hash-path.mjs', import.meta.url),
 );
+
+function devEnvironmentAutocorrectInstruction(reason: string): string {
+  return [
+    '控制器一次性自动纠偏：上一轮开发步骤把纯环境运行态缺证错误地报告成了 RESULT:blocked。',
+    `上一轮原因：${reason}`,
+    '请保留并重新验证开发职责内的 required 检查：变更范围/需求追踪、目标快速测试、静态检查与代码编译；这些项目真实失败时必须 RESULT:failed，不能降级。',
+    '仅对因沙箱端口、浏览器、数据库或网络不可用而缺少的完整 production build、dev/production server、浏览器或普通功能 E2E 证据，改记 required=false + status=blocked/unverified，并明确移交 QA。',
+    '废弃上一轮 blocked manifest/Gate，重新生成并校验 status=pass 的 implementation-manifest 与 GATE_RESULT；开发 required 项全部通过后输出 [RESULT:done]。',
+    '如果复核发现明确产品代码缺陷，不得套用本纠偏，按 required=true + status=fail 输出 [RESULT:failed]。',
+  ].join('\n');
+}
 
 /** CEO 团队交付流水线：按步骤串联各角色，关键人工节点会持久化暂停。 */
 export async function runTeamPipeline(
@@ -244,6 +270,18 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
     const msg = messageForWorkflow(ctx, workflow);
     const initiator = ctx.botsById.get(workflow.initiatorBotId);
     if (!initiator) throw new Error(`发起 Bot 未连接：${workflow.initiatorBotId}`);
+    const steps = stepsFor(workflow);
+    const pendingStep = steps[workflow.nextStepIndex];
+    // 必须先于话题目录/canonical Spec/项目 fingerprint 等业务项目读取执行。
+    const hasEnteredTechnicalDelivery = workflow.stepIds.indexOf('pm') < 0
+      || workflow.nextStepIndex > workflow.stepIds.indexOf('pm');
+    if (
+      workflow.qualityPolicy === 'gated'
+      && hasEnteredTechnicalDelivery
+      && (!pendingStep || pendingStep.id !== 'pm')
+    ) {
+      await assertRuntimeSourceCurrent(ctx);
+    }
     if (workflow.qualityPolicy === 'gated') {
       const bound = ctx.topics.getWorkdir(msg.chatId, topicIdOf(msg));
       if (!bound || bound !== workflow.projectRoot) {
@@ -251,7 +289,6 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
       }
       if (workflow.stepIds[workflow.nextStepIndex] !== 'pm') assertCanonicalWorkflowSpec(ctx, workflow);
     }
-    const steps = stepsFor(workflow);
     if (workflow.nextStepIndex >= steps.length) {
       let completionDisposition: DeliveryWorkflow['completionDisposition'] = 'clean';
       let completionDetail = '';
@@ -302,9 +339,7 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
           .filter((finding) => finding.status === 'open'
             && (finding.severity === 'P2' || finding.severity === 'P3'))
           .map((finding) => finding.id);
-        const optionalGapIds = [...latest.values()].flatMap((run) => run.result.checks
-          .filter((check) => !check.required && check.status !== 'pass')
-          .map((check) => `${run.gateId}/${check.id}`));
+        const optionalGapIds = unresolvedOptionalCheckGapIds(workflow.gateRuns);
         if (waivedIds.length > 0 || openResidualIds.length > 0 || optionalGapIds.length > 0) {
           completionDisposition = 'conditional';
           completionDetail = [
@@ -355,6 +390,10 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
         approvedScope: workflow.executionPolicy === 'approved' ? workflow.goal : undefined,
         resultProtocol: workflow.qualityPolicy === 'gated',
         stateKey: `workflow:${workflow.id}`,
+        workflowId: workflow.id,
+        beforeTask: workflow.qualityPolicy === 'gated'
+          ? () => assertRuntimeSourceCurrent(ctx)
+          : undefined,
         fixInstruction: workflow.qualityPolicy === 'gated'
           ? async () => {
             const currentWorkflow = requireWorkflow(ctx, workflow.id);
@@ -369,6 +408,7 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
           : undefined,
         validateFix: workflow.qualityPolicy === 'gated'
           ? async (answer) => {
+            await assertRuntimeSourceCurrent(ctx);
             assertExplicitSuccessfulStepResult(answer, 'dev');
             const completion = await buildGateCompletion(
               ctx,
@@ -393,6 +433,7 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
           : undefined,
         validateApproval: workflow.qualityPolicy === 'gated'
           ? async (answer) => {
+            await assertRuntimeSourceCurrent(ctx);
             assertExplicitSuccessfulStepResult(answer, 'review');
             reviewCompletion = await buildGateCompletion(
               ctx,
@@ -404,6 +445,7 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
           }
           : undefined,
         onComplete: async ({ approved, answer }) => {
+          if (workflow.qualityPolicy === 'gated') await assertRuntimeSourceCurrent(ctx);
           if (!approved) {
             await failWorkflow(
               ctx,
@@ -433,6 +475,7 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
           }
         },
         onBlocked: async ({ answer, reason }) => {
+          if (workflow.qualityPolicy === 'gated') await assertRuntimeSourceCurrent(ctx);
           await pauseWorkflowForStepBlock(
             ctx,
             workflow.id,
@@ -444,7 +487,31 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
           );
         },
         onFailure: async (error) => {
+          if (await pauseForRuntimeSourceChangeIfNeeded(
+            ctx,
+            workflow.id,
+            error,
+            { stepIndex, stepId: step.id },
+          )) return;
           if (await tryRewindForFingerprintDrift(ctx, workflow.id, error, { stepIndex, stepId: step.id })) {
+            return;
+          }
+          const handoff = resolveQualityHandoffTarget(step.id, error.message)
+            ?? ( /未处理 P0\/P1|仍有未处理 P0\/P1/.test(error.message)
+              && !/与审查 artifact 不一致|findings 集合不一致|格式错误/.test(error.message)
+              ? 'dev' as const
+              : undefined);
+          if (handoff) {
+            await handOffQualityFix(
+              ctx,
+              workflow.id,
+              {
+                fromStepId: step.id,
+                fromStepIndex: stepIndex,
+                targetStepId: handoff,
+                reason: error.message,
+              },
+            );
             return;
           }
           await failWorkflow(
@@ -461,62 +528,93 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
     const actor = ctx.botsById.get(step.botId);
     if (!actor) throw new Error(`角色 ${step.botId} 未连接`);
     const actorSession = await ensureRunnableSession(ctx, actor, msg);
-    if (!actorSession) throw new Error(`${actor.name} 正忙，请稍后重新发起。`);
+    if (!actorSession) {
+      // P1 修复：actor busy 时不要直接 throw 导致 failWorkflow，而是延迟重试。
+      // 设为 ready 状态让调度器在下一个 tick 重试。
+      console.warn(`[工作流] ${workflow.id} 角色 ${actor.name} 正忙，延迟重试。`);
+      await ctx.workflows.updateIfStatus(workflow.id, 'executing', {
+        status: 'ready',
+        error: `${actor.name} 正忙，将在稍后自动重试。`,
+      });
+      return;
+    }
 
     await initiator.reply(msg.messageId, `${stepLabel}：交给 ${actor.name}。`, hasThread(msg));
+    // P1 修复：捕获不可变的步骤启动时间，避免 workflow.updatedAt 在执行期间被更新后导致时间窗口校验不准。
+    const stepStartedAt = new Date().toISOString();
     let preparedGateCompletion: { gateRun: GateRun; projectFingerprint: string } | undefined;
     const promptOutputs = await priorOutputsForPrompt(ctx, workflow);
     const stepStartFingerprint = stepStartFingerprintFromPrompt(promptOutputs);
+    if (workflow.qualityPolicy === 'gated' && step.id !== 'pm') {
+      await assertRuntimeSourceCurrent(ctx);
+    }
     await startCliTask(ctx, {
       bot: actor,
       msg,
       session: actorSession,
       prompt: buildPipelineStepPrompt(step, workflow.goal, promptOutputs),
       workflowId: workflow.id,
+      testResourceSentinelAuthorized: step.id === 'qa' && (
+        isTestResourceSentinelAuthorized()
+        || workflow.priorOutputs.test_resource_authorized === 'true'
+      ),
       executionPolicy: workflow.executionPolicy,
       approvedScope: workflow.executionPolicy === 'approved' ? workflow.goal : undefined,
       // PM 步骤产出 Spec 正文，不解析 RESULT 标记
       resultProtocol: step.id !== 'pm',
+      acceptFailedResultIfValidated: step.id === 'architect',
+      treatFailedResultAsDone: step.id === 'summary',
       validateSuccess: workflow.qualityPolicy === 'gated' && gateIdForStep(step.id)
         ? async (answer) => {
+          await assertRuntimeSourceCurrent(ctx);
           preparedGateCompletion = await buildGateCompletion(
             ctx,
             workflow.id,
             stepIndex,
             step.id,
             answer,
-            { stepStartFingerprint },
+            { stepStartFingerprint, attemptStartedAt: stepStartedAt },
           );
         }
         : undefined,
-      onSuccess: async (answer) => {
+      onSuccess: async (answer, normalizedResult) => {
+        if (workflow.qualityPolicy === 'gated' && step.id !== 'pm') {
+          await assertRuntimeSourceCurrent(ctx);
+        }
         // PM 的 Spec 正文不应夹 RESULT 标记；其余步骤按显式标记决定推进/暂停/失败。
         if (step.id !== 'pm') {
-          const stepResult = parseStepResult(answer);
+          // P1 修复：使用 cli-task.ts 传入的已归一化 stepResult，避免重复解析导致不一致。
+          const stepResult = normalizedResult ?? parseStepResult(answer);
           if (stepResult.kind === 'failed') {
-            const handoff = resolveQualityHandoffTarget(step.id, stepResult.reason || '');
-            if (handoff) {
-              await handOffQualityFix(
+            if (shouldAcceptArchitectFailedAsDone(step.id, stepResult.kind, !!preparedGateCompletion)) {
+              console.warn(
+                `[工作流] ${workflow.id} 架构师输出了 [RESULT:failed]，但设计门禁可通过，已按完成继续。`,
+              );
+            } else {
+              const handoff = resolveQualityHandoffTarget(step.id, stepResult.reason || '');
+              if (handoff) {
+                await handOffQualityFix(
+                  ctx,
+                  workflow.id,
+                  {
+                    fromStepId: step.id,
+                    fromStepIndex: stepIndex,
+                    targetStepId: handoff,
+                    reason: stepResult.reason || '质量步骤报告失败，需修复后重跑',
+                    answer,
+                  },
+                  false,
+                );
+                return;
+              }
+              await failWorkflow(
                 ctx,
                 workflow.id,
-                {
-                  fromStepId: step.id,
-                  fromStepIndex: stepIndex,
-                  targetStepId: handoff,
-                  reason: stepResult.reason || '质量步骤报告失败，需修复后重跑',
-                  answer,
-                },
-                false,
+                stepResult.reason || '步骤报告失败',
+                { stepIndex, stepId: step.id },
               );
               return;
             }
-            await failWorkflow(
-              ctx,
-              workflow.id,
-              stepResult.reason || '步骤报告失败',
-              { stepIndex, stepId: step.id },
-            );
-            return;
           }
           if (stepResult.kind === 'blocked') {
             const handoff = resolveQualityHandoffTarget(step.id, stepResult.reason || '');
@@ -534,6 +632,28 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
                 false,
               );
               return;
+            }
+            if (shouldAutoCorrectDevEnvironmentBlock(step.id, stepResult.reason, answer)) {
+              const blockReason = stepResult.reason?.trim()
+                || compactAgentOutput(answer, 1_000)
+                || '开发步骤报告纯环境运行态阻塞';
+              const retried = await ctx.workflows.retryCurrentDevEnvironmentBlockOnce(
+                workflow.id,
+                stepIndex,
+                devEnvironmentAutocorrectInstruction(blockReason),
+                compactAgentOutput(answer, 6_000),
+              );
+              if (retried) {
+                console.warn(`[工作流] ${workflow.id} 开发环境阻塞已自动纠偏，将原步骤重跑一次。`);
+                await initiator.reply(
+                  msg.messageId,
+                  '检测到开发步骤把纯环境运行态缺证误报为阻塞；已自动纠偏，将在当前任务结束后重跑开发步骤一次，无需手工操作。',
+                  hasThread(msg),
+                ).catch((error) => {
+                  console.error(`[工作流] ${workflow.id} 发送开发环境纠偏通知失败:`, sanitizeErrorForLog(error));
+                });
+                return;
+              }
             }
             await pauseWorkflowForStepBlock(
               ctx,
@@ -559,7 +679,7 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
               stepIndex,
               step.id,
               answer,
-              { stepStartFingerprint },
+              { stepStartFingerprint, attemptStartedAt: stepStartedAt },
             )
           : undefined;
         await completeRegularStep(ctx, workflow.id, stepIndex, step.id, answer, completion, false);
@@ -571,6 +691,12 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
         }
       },
       onFailure: async (error) => {
+        if (await pauseForRuntimeSourceChangeIfNeeded(
+          ctx,
+          workflow.id,
+          error,
+          { stepIndex, stepId: step.id },
+        )) return;
         if (await tryRewindForFingerprintDrift(ctx, workflow.id, error, { stepIndex, stepId: step.id })) {
           return;
         }
@@ -604,10 +730,23 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
   } catch (error) {
     const workflow = claimedWorkflow ?? ctx.workflows.get(workflowId);
     if (!workflow) throw error;
+    // P0 修复：完成边界（nextStepIndex === stepIds.length）时 currentStepId 为 undefined。
+    // 旧代码用 nextStepIndex-1 做 expectedStep，但 updateIfCurrentStep 检查
+    // current.nextStepIndex === expectedStep.stepIndex，即 stepIds.length !== stepIds.length-1，
+    // 必然 CAS miss，导致 workflow 卡在 executing 且租约不释放。
+    // 修正：完成边界不传 expectedStep，让 failWorkflow 走 updateIfStatus。
     const currentStepId = workflow.stepIds[workflow.nextStepIndex];
-    const expectedStep = workflow.status === 'executing' && currentStepId
+    const atCompletionBoundary = workflow.status === 'executing'
+      && workflow.nextStepIndex === workflow.stepIds.length;
+    const expectedStep = workflow.status === 'executing' && currentStepId && !atCompletionBoundary
       ? { stepIndex: workflow.nextStepIndex, stepId: currentStepId }
       : undefined;
+    if (await pauseForRuntimeSourceChangeIfNeeded(
+      ctx,
+      workflow.id,
+      error,
+      expectedStep,
+    )) return;
     if (await tryRewindForFingerprintDrift(
       ctx,
       workflow.id,
@@ -675,7 +814,20 @@ export async function completeProductStep(
   if (!isCurrentExecutingStep(workflow, stepIndex, 'pm')) return;
   const msg = messageForWorkflow(ctx, workflow);
   const initiator = ctx.botsById.get(workflow.initiatorBotId) ?? actor;
-  const questionnaire = await ctx.questionnaires.latestAwaitingForWorkflow(workflow.id);
+  let questionnaire = await ctx.questionnaires.latestAwaitingForWorkflow(workflow.id);
+  if (!questionnaire) {
+    const recovered = await ctx.questionnaires.recoverAwaitingFromProductOutput(answer, workflow.id);
+    if (recovered) {
+      questionnaire = await ctx.questionnaires.attachWorkflowContext(recovered.id, {
+        workflowId: workflow.id,
+        chatId: msg.chatId,
+        topicId: topicIdOf(msg),
+        ownerOpenId: msg.senderOpenId,
+        botId: actor.id,
+        messageId: msg.messageId,
+      });
+    }
+  }
   workflow = requireWorkflow(ctx, workflowId);
   if (!isCurrentExecutingStep(workflow, stepIndex, 'pm')) return;
   if (questionnaire) {
@@ -686,10 +838,19 @@ export async function completeProductStep(
     });
     if (!paused) return;
     workflow = paused;
-    await actor.replyCard(msg.messageId, buildQuestionnaireCard(questionnaire), hasThread(msg));
+    let cardSent = true;
+    await actor.replyCard(msg.messageId, buildQuestionnaireCard(questionnaire), hasThread(msg)).catch((error) => {
+      cardSent = false;
+      console.error(`[工作流] ${workflow.id} 问卷卡发送失败:`, sanitizeErrorForLog(error));
+    });
     await initiator.reply(
       msg.messageId,
-      `产品经理提出了结构化问题（${questionnaire.id}）。完成卡片后流水线会自动继续。`,
+      cardSent
+        ? `产品经理提出了结构化问题（${questionnaire.id}）。完成卡片后流水线会自动继续。`
+        : [
+          `产品经理提出了结构化问题（${questionnaire.id}）。问卷卡片发送失败，请发送：`,
+          `/form ${questionnaire.id}`,
+        ].join('\n'),
       hasThread(msg),
     );
     return;
@@ -761,7 +922,17 @@ export async function completeProductStep(
   });
   if (!paused) throw new Error('产品步骤状态已变化，已停止发送过期的方案确认卡。');
   workflow = paused;
-  await actor.replyCard(msg.messageId, buildSpecConfirmationCard(spec), hasThread(msg));
+  // P1 修复：发卡失败时加文本兼底，提示用户用 /spec show 恢复。
+  try {
+    await actor.replyCard(msg.messageId, buildSpecConfirmationCard(spec), hasThread(msg));
+  } catch (cardError) {
+    console.error('[工作流] 发送 Spec 确认卡失败，发文本兼底:', (cardError as Error).message);
+    await actor.reply(
+      msg.messageId,
+      `产品 Spec 已生成（${spec.id}），但确认卡发送失败。请用 \`/spec show ${spec.id}\` 查看并确认。`,
+      hasThread(msg),
+    ).catch(() => undefined);
+  }
   await initiator.reply(
     msg.messageId,
     `产品 Spec 已生成（${spec.id}）。确认前架构和开发步骤不会启动。`,
@@ -822,6 +993,8 @@ async function buildGateCompletion(
   options: {
     recordAttemptStepId?: PipelineStep['id'];
     stepStartFingerprint?: string;
+    /** P1 修复：不可变的步骤启动时间，避免 workflow.updatedAt 在执行期间被更新后导致时间窗口校验不准。 */
+    attemptStartedAt?: string;
   } = {},
 ): Promise<{ gateRun: GateRun; projectFingerprint: string }> {
   const workflow = requireWorkflow(ctx, workflowId);
@@ -893,7 +1066,7 @@ async function buildGateCompletion(
     assertFindingContinuity(workflow.gateRuns, result);
     assertGateWaiversBoundToCanonicalSpec(result, waiverContext);
     validateGatePass(stepId, result);
-    assertGateChecksBelongToAttempt(result, workflow.updatedAt);
+    assertGateChecksBelongToAttempt(result, options.attemptStartedAt ?? workflow.updatedAt);
     assertPlannedFindingsClosed(stepId, workflow.gateRuns, result);
     const latest = latestGateRuns(workflow.gateRuns);
     if (stepId === 'review') {
@@ -943,6 +1116,11 @@ async function buildGateCompletion(
       );
     }
   } catch (error) {
+    // P1 修复：上游证据校验错误（如 FingerprintDriftError）不应消耗当前 gate 的 attempt 额度。
+    // 只记录当前 gate 自身校验失败为 failed attempt；上游错误直接抛出由调用方处理。
+    if (error instanceof FingerprintDriftError) {
+      throw error;
+    }
     // 失败尝试不要记成 pass，避免污染 latestGateRuns
     const failedRun: GateRun = {
       ...gateRun,
@@ -1097,12 +1275,9 @@ async function handOffQualityFix(
   }
 
   if (!handed) {
-    await failWorkflow(
-      ctx,
-      workflowId,
-      reason,
-      { stepIndex: options.fromStepIndex, stepId: options.fromStepId },
-    );
+    // P1 修复：第一次 CAS 已失败说明 step 已变化，不要用相同 expectedStep 再做第二次 CAS（必然也 miss）。
+    // 改用 updateIfStatus 覆盖任意非终态状态。
+    await failWorkflow(ctx, workflowId, reason);
     return;
   }
 
@@ -1135,6 +1310,8 @@ export async function handOffBlockedWorkflowIfQualityFix(
 ): Promise<boolean> {
   const workflow = requireWorkflow(ctx, workflowId);
   if (workflow.status !== 'awaiting_step_unblock') return false;
+  // 控制器源码漂移不是业务项目代码缺陷，必须留在原步骤等服务重启。
+  if (workflow.priorOutputs.runtime_source_changed !== undefined) return false;
   const stepId = workflow.stepIds[workflow.nextStepIndex];
   if (!stepId) return false;
   const reason = workflow.error
@@ -1237,6 +1414,14 @@ async function priorOutputsForPrompt(
       hashPathCommandPrefix: snapshot
         ? [process.execPath, HASH_PATH_SCRIPT_PATH]
         : undefined,
+      testResourceSafety: {
+        sentinelEnv: TEST_RESOURCE_SENTINEL_ENV,
+        sentinelAuthorized: stepId === 'qa' && (
+          isTestResourceSentinelAuthorized()
+          || workflow.priorOutputs.test_resource_authorized === 'true'
+        ),
+        rule: '只有连接串命名符合 test/ci/e2e/tmp、且与开发/预览/生产连接均不相同时，才可凭此 sentinel 执行 migration/TRUNCATE/DROP/seed。',
+      },
       rule: '所有结构化 artifact 必须写入 evidenceRoot，并在 GATE_RESULT 中提供真实 SHA-256。',
     }),
     quality_evidence: JSON.stringify(evidence),
@@ -1839,6 +2024,92 @@ export async function reconcileWorkflowSpecStates(ctx: AppContext): Promise<void
   }
 }
 
+async function assertRuntimeSourceCurrent(ctx: AppContext): Promise<void> {
+  await (ctx.runtimeSourceGuard ?? processRuntimeSourceGuard).assertCurrent();
+}
+
+/**
+ * 源码漂移属于运行中控制器失效，不是业务项目缺陷。只原子暂停当前非 PM 步骤，
+ * 不读取/改绑工作目录，也不结算审批或定时任务；新进程可从同一步 retry。
+ */
+export async function pauseForRuntimeSourceChangeIfNeeded(
+  ctx: AppContext,
+  workflowId: string,
+  error: unknown,
+  expectedStep?: WorkflowStepExpectation,
+): Promise<boolean> {
+  if (!expectedStep || expectedStep.stepId === 'pm') return false;
+  let sourceError = error;
+  if (!isRuntimeSourceChangedError(sourceError)) {
+    try {
+      await assertRuntimeSourceCurrent(ctx);
+      return false;
+    } catch (currentError) {
+      if (!isRuntimeSourceChangedError(currentError)) return false;
+      sourceError = currentError;
+    }
+  }
+  const workflow = ctx.workflows.get(workflowId);
+  if (!workflow || workflow.qualityPolicy !== 'gated') return false;
+  const detail = persistentErrorMessage(sourceError, 4_000);
+  const atCompletionBoundary = workflow.status === 'executing'
+    && workflow.nextStepIndex === workflow.stepIds.length
+    && expectedStep.stepIndex === workflow.nextStepIndex - 1;
+  const nextPriorOutputs = {
+    ...workflow.priorOutputs,
+    runtime_source_changed: RUNTIME_SOURCE_RESTART_MESSAGE,
+    [`blocked_${expectedStep.stepId}`]: detail,
+  };
+  // summary 已提交但最终结算尚未完成时，原子退回 summary；旧 summary 不能跨重启复用。
+  if (atCompletionBoundary) delete nextPriorOutputs[expectedStep.stepId];
+  const pausePatch = {
+    status: 'awaiting_step_unblock' as const,
+    ...(atCompletionBoundary ? { nextStepIndex: expectedStep.stepIndex } : {}),
+    priorOutputs: nextPriorOutputs,
+    error: detail,
+  };
+  const paused = atCompletionBoundary
+    ? await ctx.workflows.updateIfStatus(workflowId, 'executing', pausePatch)
+    : await ctx.workflows.updateIfCurrentStep(
+      workflowId,
+      expectedStep.stepIndex,
+      expectedStep.stepId,
+      pausePatch,
+    );
+  // 迟到的同类错误不应把已经暂停/推进的工作流再覆盖成 failed。
+  if (!paused) return true;
+
+  console.warn(`[工作流] ${workflowId} 检测到运行时源码漂移，已暂停 ${expectedStep.stepId}。`);
+  const initiator = ctx.botsById.get(paused.initiatorBotId);
+  if (!initiator) return true;
+  const msg = messageForWorkflow(ctx, paused);
+  const stepTitle = stepsFor(paused)[expectedStep.stepIndex]?.title ?? expectedStep.stepId;
+  let cardSent = true;
+  await initiator.replyCard(
+    msg.messageId,
+    buildStepBlockedCard({
+      workflowId,
+      stepId: expectedStep.stepId,
+      stepTitle,
+      reason: detail,
+      blockKind: 'other',
+      blockVersion: paused.updatedAt,
+    }),
+    hasThread(msg),
+  ).catch((cardError) => {
+    cardSent = false;
+    console.error(`[${paused.name}] 源码漂移阻塞卡发送失败:`, sanitizeErrorForLog(cardError));
+  });
+  if (!cardSent) {
+    await initiator.reply(
+      msg.messageId,
+      `${detail}\n流水线已暂停在当前步骤；重启 Agent OS 后重试。`,
+      hasThread(msg),
+    ).catch(() => undefined);
+  }
+  return true;
+}
+
 async function failWorkflow(
   ctx: AppContext,
   workflowId: string,
@@ -1944,17 +2215,27 @@ async function pauseWorkflowForStepBlock(
   const msg = messageForWorkflow(ctx, workflow);
   const initiator = ctx.botsById.get(workflow.initiatorBotId);
   const blockReason = reason?.trim() || '步骤报告阻塞，需人工纠正后重试';
-  const suggestedWorkdir = await firstBindableWorkdir([
-    ...extractAbsolutePathCandidates(answer),
-    ...extractAbsolutePathCandidates(workflow.goal),
-  ]);
+  const reasonKind = classifyStepBlockReason(blockReason);
+  const blockKind = reasonKind === 'other' ? classifyStepBlockReason(answer) : reasonKind;
+  const testResourceAuthorizationAvailable = requiresTestResourceAuthorization(
+    `${blockReason}\n${answer}`,
+  );
+  // 只有明确的目录阻塞才从回答抽路径；环境报告中的项目路径不能变成“建议绑定目录”。
+  const suggestedWorkdir = blockKind === 'workdir'
+    ? await firstBindableWorkdir([
+      ...extractAbsolutePathCandidates(answer),
+      ...extractAbsolutePathCandidates(workflow.goal),
+    ])
+    : undefined;
+  const nextPrior = {
+    ...workflow.priorOutputs,
+    [`blocked_${stepId}`]: compactAgentOutput(answer, 6_000),
+  };
+  if (suggestedWorkdir) nextPrior.blocked_workdir = suggestedWorkdir;
+  else delete nextPrior.blocked_workdir;
   const paused = await ctx.workflows.updateIfCurrentStep(workflowId, stepIndex, stepId, {
     status: 'awaiting_step_unblock',
-    priorOutputs: {
-      ...workflow.priorOutputs,
-      [`blocked_${stepId}`]: compactAgentOutput(answer, 6_000),
-      ...(suggestedWorkdir ? { blocked_workdir: suggestedWorkdir } : {}),
-    },
+    priorOutputs: nextPrior,
     error: blockReason,
   });
   if (!paused || !initiator) return;
@@ -1967,6 +2248,8 @@ async function pauseWorkflowForStepBlock(
       stepTitle,
       reason: blockReason,
       suggestedWorkdir,
+      blockKind,
+      testResourceAuthorizationAvailable,
       blockVersion: paused.updatedAt,
     }),
     hasThread(msg),
@@ -1982,7 +2265,13 @@ async function pauseWorkflowForStepBlock(
         `步骤「${stepTitle}」已阻塞，流水线暂停：${blockReason}`,
         suggestedWorkdir
           ? `建议目录：${suggestedWorkdir}`
-          : '可先用 `/workdir <绝对路径>` 绑定话题目录',
+          : blockKind === 'environment' || blockKind === 'test-resource'
+            ? testResourceAuthorizationAvailable
+              ? '请准备本机测试环境；确认测试库完全隔离后，可在阻塞卡中授权本流水线重试'
+              : '请准备本机测试环境后重试'
+            : blockKind === 'gate-evidence'
+              ? '请补齐或重新生成当前步骤的 Gate/artifact 证据'
+              : '请解决上述前置条件',
         `用 \`/workflow retry ${workflowId}\` 重新发送阻塞卡。`,
       ].join('\n'),
       hasThread(msg),
@@ -1990,14 +2279,41 @@ async function pauseWorkflowForStepBlock(
   }
 }
 
+async function restoreMisroutedEnvironmentBlock(
+  ctx: AppContext,
+  workflow: DeliveryWorkflow,
+): Promise<{ workflow: DeliveryWorkflow; restored: boolean }> {
+  const currentStepId = workflow.stepIds[workflow.nextStepIndex];
+  const misrouted = findMisroutedEnvironmentBlock(currentStepId, workflow.priorOutputs);
+  if (!misrouted || workflow.status !== 'awaiting_step_unblock') {
+    return { workflow, restored: false };
+  }
+  const sourceIndex = workflow.stepIds.indexOf(misrouted.sourceStepId);
+  if (sourceIndex < 0) return { workflow, restored: false };
+  const nextPrior = { ...workflow.priorOutputs };
+  delete nextPrior.quality_fix_request;
+  delete nextPrior.blocked_workdir;
+  const restored = await ctx.workflows.updateIfStatus(workflow.id, 'awaiting_step_unblock', {
+    nextStepIndex: sourceIndex,
+    priorOutputs: nextPrior,
+    error: misrouted.reason,
+  });
+  if (!restored) return { workflow: requireWorkflow(ctx, workflow.id), restored: false };
+  console.warn(`[工作流] 已纠正历史环境阻塞误移交：${currentStepId} → ${misrouted.sourceStepId}`);
+  return { workflow: restored, restored: true };
+}
+
 /** 重新发送阻塞卡（用于 /workflow retry 或卡片发送失败后的恢复）。 */
 export async function resendBlockedCard(
   ctx: AppContext,
   workflowId: string,
 ): Promise<void> {
-  const workflow = requireWorkflow(ctx, workflowId);
+  let workflow = requireWorkflow(ctx, workflowId);
   if (workflow.status !== 'awaiting_step_unblock') {
     throw new Error(`工作流当前状态为 ${workflow.status}，不在阻塞等待中。`);
+  }
+  if (workflow.priorOutputs.runtime_source_changed === undefined) {
+    ({ workflow } = await restoreMisroutedEnvironmentBlock(ctx, workflow));
   }
   const msg = messageForWorkflow(ctx, workflow);
   const initiator = ctx.botsById.get(workflow.initiatorBotId);
@@ -2006,7 +2322,15 @@ export async function resendBlockedCard(
   const steps = stepsFor(workflow);
   const step = steps[stepIndex];
   const blockReason = workflow.error || '步骤报告阻塞，需人工纠正后重试';
-  const suggestedWorkdir = workflow.priorOutputs.blocked_workdir || undefined;
+  const blockedAnswer = workflow.priorOutputs[`blocked_${step.id}`] || '';
+  const reasonKind = classifyStepBlockReason(blockReason);
+  const blockKind = reasonKind === 'other' ? classifyStepBlockReason(blockedAnswer) : reasonKind;
+  const testResourceAuthorizationAvailable = requiresTestResourceAuthorization(
+    `${blockReason}\n${blockedAnswer}`,
+  );
+  const suggestedWorkdir = blockKind === 'workdir'
+    ? workflow.priorOutputs.blocked_workdir || undefined
+    : undefined;
   await initiator.replyCard(
     msg.messageId,
     buildStepBlockedCard({
@@ -2015,6 +2339,8 @@ export async function resendBlockedCard(
       stepTitle: step.title,
       reason: blockReason,
       ...(suggestedWorkdir ? { suggestedWorkdir } : {}),
+      blockKind,
+      testResourceAuthorizationAvailable,
       blockVersion: workflow.updatedAt,
     }),
     hasThread(msg),
@@ -2027,23 +2353,53 @@ export async function resendBlockedCard(
 export async function resumeBlockedWorkflowStep(
   ctx: AppContext,
   workflowId: string,
-  options?: { workdir?: string },
+  options?: { workdir?: string; authorizeTestResource?: boolean },
 ): Promise<DeliveryWorkflow> {
-  const workflow = requireWorkflow(ctx, workflowId);
+  let workflow = requireWorkflow(ctx, workflowId);
   if (workflow.status !== 'awaiting_step_unblock') {
     throw new Error(`工作流当前状态为 ${workflow.status}，不能重试阻塞步骤。`);
   }
+  const runtimeSourceBlocked = workflow.priorOutputs.runtime_source_changed !== undefined;
+  // 在任何业务项目目录解析/绑定之前校验；同一个陈旧进程只能继续保持暂停。
+  if (runtimeSourceBlocked) await assertRuntimeSourceCurrent(ctx);
+  const normalized = runtimeSourceBlocked
+    ? { workflow, restored: false }
+    : await restoreMisroutedEnvironmentBlock(ctx, workflow);
+  workflow = normalized.workflow;
+  const currentStepId = workflow.stepIds[workflow.nextStepIndex];
+  const blockedAnswer = workflow.priorOutputs[`blocked_${currentStepId}`] || '';
+  if (
+    options?.authorizeTestResource
+    && !requiresTestResourceAuthorization(`${workflow.error || ''}\n${blockedAnswer}`)
+  ) {
+    throw new Error('当前阻塞不涉及破坏性测试资源，不能附加该授权。');
+  }
   const msg = messageForWorkflow(ctx, workflow);
-  const requestedWorkdir = options?.workdir ? await assertWorkdir(options.workdir) : undefined;
+  // 历史错误卡可能携带从 QA 报告误抽取的目录；纠正游标后必须忽略它。
+  const requestedWorkdir = !normalized.restored && options?.workdir
+    ? await assertWorkdir(options.workdir)
+    : undefined;
   const currentBinding = requestedWorkdir ?? ctx.topics.getWorkdir(msg.chatId, topicIdOf(msg));
   if (workflow.qualityPolicy === 'gated' && currentBinding !== workflow.projectRoot) {
     throw new Error('门禁工作流不能在中途切换项目目录；请在正确目录重新发起交付。');
   }
   // 先原子认领：防止并发重试两个按钮都通过前置检查再改目录
-  const resumed = await ctx.workflows.updateIfStatus(workflowId, 'awaiting_step_unblock', {
-    status: 'ready',
-    error: undefined,
-  });
+  const resumed = runtimeSourceBlocked
+    ? await ctx.workflows.resumeCurrentRuntimeSourceBlock(
+      workflowId,
+      workflow.nextStepIndex,
+      currentStepId,
+    )
+    : await ctx.workflows.updateIfStatus(workflowId, 'awaiting_step_unblock', {
+      status: 'ready',
+      error: undefined,
+      ...(options?.authorizeTestResource ? {
+        priorOutputs: {
+          ...workflow.priorOutputs,
+          test_resource_authorized: 'true',
+        },
+      } : {}),
+    });
   if (!resumed) throw new Error('工作流状态已变化，请刷新后重试。');
 
   // 原子认领成功后再切目录；失败也不会影响已认领的状态
@@ -2058,13 +2414,14 @@ export async function resumeBlockedWorkflowStep(
 export async function abortBlockedWorkflow(
   ctx: AppContext,
   workflowId: string,
-  reason = '用户终止已阻塞的流水线',
+  reason = '用户终止流水线',
 ): Promise<DeliveryWorkflow> {
   const workflow = requireWorkflow(ctx, workflowId);
-  if (workflow.status !== 'awaiting_step_unblock') {
-    throw new Error(`工作流当前状态为 ${workflow.status}，不能按阻塞流程终止。`);
+  // P1 修复：支持任意非终态状态的终止，不只是 awaiting_step_unblock。
+  const terminalStatuses = new Set(['completed', 'failed']);
+  if (terminalStatuses.has(workflow.status)) {
+    throw new Error(`工作流当前状态为 ${workflow.status}，无需终止。`);
   }
-  // awaiting_step_unblock 不能走 updateIfCurrentStep（它要求 status=executing）
   await failWorkflow(ctx, workflowId, reason);
   return requireWorkflow(ctx, workflowId);
 }

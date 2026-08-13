@@ -8,12 +8,16 @@ if (!path) {
 }
 const manifest = JSON.parse(await readFile(path, "utf8"));
 const errors = [];
+const allowedManifestStatuses = new Set(["pass"]);
+const allowedCheckStatuses = new Set(["pass", "fail", "blocked", "unverified", "skipped"]);
 for (const field of ["contractHash", "planHash", "fingerprintBefore", "fingerprintAfter"]) {
   if (typeof manifest[field] !== "string" || !/^[a-f0-9]{64}$/.test(manifest[field])) {
     errors.push(`${field} must be a 64-character SHA-256`);
   }
 }
-if (manifest.status !== "pass") errors.push("status must be pass");
+if (!allowedManifestStatuses.has(manifest.status)) {
+  errors.push("status must be pass");
+}
 if (!Array.isArray(manifest.changedFiles) || manifest.changedFiles.length === 0) {
   errors.push("changedFiles must be a non-empty array");
 }
@@ -35,12 +39,20 @@ for (const [index, risk] of (manifest.riskControls ?? []).entries()) {
 if (!Array.isArray(manifest.targetedCheckResults) || manifest.targetedCheckResults.length === 0) {
   errors.push("targetedCheckResults must be non-empty");
 }
+let requiredPassCount = 0;
+let requiredBlockerCount = 0;
 for (const [index, check] of (manifest.targetedCheckResults ?? []).entries()) {
   if (!Array.isArray(check?.command) || check.command.length === 0) {
     errors.push(`targetedCheckResults[${index}] needs reproducible command argv`);
   }
-  if (!check?.status || typeof check?.required !== "boolean") {
+  if (!allowedCheckStatuses.has(check?.status) || typeof check?.required !== "boolean") {
     errors.push(`targetedCheckResults[${index}] needs status and required`);
+  }
+  if (check?.delegatedTo !== undefined
+    && (check.delegatedTo !== "verification"
+      || check.required !== false
+      || !["blocked", "unverified"].includes(check.status))) {
+    errors.push(`targetedCheckResults[${index}] delegatedTo requires verification + optional blocked/unverified`);
   }
   if (!check?.cwd || !check?.startedAt || !check?.finishedAt) {
     errors.push(`targetedCheckResults[${index}] needs cwd, startedAt and finishedAt`);
@@ -48,8 +60,28 @@ for (const [index, check] of (manifest.targetedCheckResults ?? []).entries()) {
   if (check?.status === "pass" && check?.exitCode !== 0) {
     errors.push(`targetedCheckResults[${index}] pass conflicts with exitCode`);
   }
-  if (check?.required !== false && (check?.status !== "pass" || check?.exitCode !== 0)) {
-    errors.push(`targetedCheckResults[${index}] required check did not pass`);
+  if (check?.status === "fail"
+    && (check?.exitCode === undefined || check?.exitCode === null || check?.exitCode === 0)) {
+    errors.push(`targetedCheckResults[${index}] fail needs a non-zero exitCode`);
+  }
+  if (!["pass", "fail"].includes(check?.status) && check?.exitCode === 0) {
+    errors.push(`targetedCheckResults[${index}] ${check?.status} conflicts with exitCode=0`);
+  }
+  if (check?.required === true && check?.status === "pass" && check?.exitCode === 0) {
+    requiredPassCount += 1;
+  }
+  if (check?.required === true && ["fail", "blocked", "unverified"].includes(check?.status)) {
+    requiredBlockerCount += 1;
+  }
+}
+if (manifest.status === "pass") {
+  if (requiredPassCount === 0) {
+    errors.push("pass manifest needs at least one required passing check");
+  }
+  if (requiredBlockerCount > 0
+    || (manifest.targetedCheckResults ?? []).some((check) => check?.required === true
+      && (check?.status !== "pass" || check?.exitCode !== 0))) {
+    errors.push("pass manifest conflicts with an incomplete required check");
   }
 }
 process.stdout.write(`${JSON.stringify({ status: errors.length ? "fail" : "pass", errors }, null, 2)}\n`);

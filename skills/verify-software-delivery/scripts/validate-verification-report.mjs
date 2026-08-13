@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { readFile } from "node:fs/promises";
 import { isAbsolute } from "node:path";
+import { validateFindingsArray } from "../../_shared/finding-fields.mjs";
 
 const path = process.argv[2];
 if (!path) {
@@ -100,14 +101,11 @@ if (!Array.isArray(report.requirementResults) || !report.requirementResults.leng
   errors.push("requirementResults must be non-empty");
 }
 if (!Array.isArray(report.findings)) errors.push("findings must be an array");
+else errors.push(...validateFindingsArray(report.findings, { allowPlanned: false }));
 const waivedFindingIds = new Set((report.findings ?? [])
   .filter((finding) => finding?.status === "waived" && waiverForFinding(finding))
   .map((finding) => finding.id));
 for (const [index, finding] of (report.findings ?? []).entries()) {
-  if (!finding?.id || !finding?.severity || !finding?.status || !finding?.summary) {
-    errors.push(`findings[${index}] needs id, severity, status and summary`);
-  }
-  if (finding?.status === "planned") errors.push(`findings[${index}] cannot remain planned in QA`);
   if (["P0", "P1"].includes(finding?.severity) && finding?.status === "open") {
     errors.push(`findings[${index}] leaves P0/P1 open`);
   }

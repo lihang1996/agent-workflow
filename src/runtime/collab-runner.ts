@@ -31,6 +31,8 @@ export async function runCollabReview(
     resultProtocol?: boolean;
     /** 流水线使用工作流 ID 隔离轮次；独立 /review 默认仍按飞书话题隔离。 */
     stateKey?: string;
+    /** 关联持久化流水线；服务重启时任务卡会标记为可恢复而非用户取消。 */
+    workflowId?: string;
     /** 协作自然结束时回调（通过 / 触顶）；供流水线续跑。 */
     onComplete?: (result: { approved: boolean; answer: string }) => Promise<void>;
     /** onComplete 已提交状态、当前任务卡落终态且会话释放后调用；供安全启动下一步骤。 */
@@ -41,6 +43,8 @@ export async function runCollabReview(
     validateFix?: (answer: string) => Promise<void>;
     /** 自动修复时附加的实现 Skill 与证据要求。 */
     fixInstruction?: string | (() => Promise<string>);
+    /** 门禁流水线在每一轮 reviewer/dev 真正启动前执行的运行时安全检查。 */
+    beforeTask?: () => Promise<void>;
     onBlocked?: (result: { answer: string; reason?: string }) => Promise<void>;
     onFailure?: (error: Error) => Promise<void>;
   },
@@ -56,11 +60,13 @@ export async function runCollabReview(
     allowFixes = true,
     resultProtocol = false,
     stateKey,
+    workflowId,
     onComplete,
     afterComplete,
     validateApproval,
     validateFix,
     fixInstruction,
+    beforeTask,
     onBlocked,
     onFailure,
   } = options;
@@ -73,6 +79,7 @@ export async function runCollabReview(
   if (ctx.shuttingDown) {
     throw new Error('服务正在停止，无法启动协作');
   }
+  await beforeTask?.();
 
   const topicKey = stateKey ?? collabTopicKey(msg.chatId, topicIdOf(msg));
   const reviewerSession = await ensureRunnableSession(ctx, reviewer, msg);
@@ -112,10 +119,12 @@ export async function runCollabReview(
       msg,
       session: reviewerSession,
       prompt: reviewPrompt,
+      workflowId,
       executionPolicy,
       approvedScope,
       resultProtocol,
       hideProtocolOutput: true,
+      treatFailedResultAsDone: resultProtocol,
       validateSuccess: validateApproval
         ? async (answer) => {
           if (!approved(answer)) return;
@@ -126,6 +135,7 @@ export async function runCollabReview(
       onFailure: reportFailure,
       onSuccess: async (reviewAnswer) => {
         if (ctx.shuttingDown) return;
+        await beforeTask?.();
         if (resultProtocol) {
           const result = parseStepResult(reviewAnswer);
           if (result.kind === 'blocked') {
@@ -168,6 +178,7 @@ export async function runCollabReview(
           : fixInstruction;
         afterCurrentTask = async () => {
           if (!dev) throw new Error('自动修复协作缺少 dev Bot');
+          await beforeTask?.();
           const devSession = await ensureRunnableSession(ctx, dev, msg);
           if (!devSession) {
             await initiator.reply(
@@ -193,6 +204,7 @@ export async function runCollabReview(
             msg,
             session: devSession,
             prompt: buildFixFromReviewPrompt(reviewer, reviewAnswer, round, resolvedFixInstruction),
+            workflowId,
             executionPolicy,
             approvedScope,
             resultProtocol,
@@ -206,6 +218,7 @@ export async function runCollabReview(
             onFailure: reportFailure,
             onSuccess: async (devAnswer) => {
               if (ctx.shuttingDown) return;
+              await beforeTask?.();
               if (resultProtocol) {
                 const result = parseStepResult(devAnswer);
                 if (result.kind === 'blocked') {
@@ -247,11 +260,13 @@ export async function runCollabReview(
                   allowFixes,
                   resultProtocol,
                   stateKey,
+                  workflowId,
                   onComplete,
                   afterComplete,
                   validateApproval,
                   validateFix,
                   fixInstruction,
+                  beforeTask,
                   onBlocked,
                   onFailure,
                 });

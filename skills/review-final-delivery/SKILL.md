@@ -51,6 +51,10 @@ description: "在代码准备交付、合并或发布时，基于最终项目快
 输出 `final-review.json`，包含 `finalFingerprint`、`reviewedDiff`、
 `reviewScope`、`requirementCoverage`、`evidenceChain`、`findings`、`waivers`、
 `notReviewed`、`residualRisks`、`decision` 和 `status`。
+`findings[]` 必须与控制器对齐：`severity=P0|P1|P2|P3`，`status=open|resolved|waived`
+（终审不得保留 `planned`），可选 `category` 只能是
+`correctness|security|reliability|architecture|performance|maintainability|testing|compatibility|scope|other`，
+可选 `confidence=low|medium|high`，安全类 P0/P1 还需合法 `exploitability`。
 其中 `evidenceChain` 必须原样复制 `workflow_context.controllerEvidenceChain`，形状为
 `{"path":"绝对路径/evidence-chain.json","sha256":"64位真实哈希"}`；只写文件名或口头声称已读取无效。
 把结构化输出保存到控制器提供的 `evidenceRoot`，计算真实 SHA-256，并写入 `[GATE_RESULT].artifacts`。

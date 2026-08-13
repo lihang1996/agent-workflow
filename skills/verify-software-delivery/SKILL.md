@@ -19,6 +19,10 @@ description: "在代码或配置准备交付时，发现并运行适用的静态
 2. 合并契约、项目脚本和 CI 配置，建立适用门禁列表。
 3. 在 migration、truncate、drop 或 seed 前运行
    `scripts/preflight-test-resources.mjs <resource-policy.json>`。
+   `resource-policy.json.sentinelEnv` 必须原样使用
+   `workflow_context.testResourceSafety.sentinelEnv`（当前固定为
+   `AGENT_OS_TEST_RESOURCE_SENTINEL`），不得临时发明其它 sentinel 变量名；上下文中
+   `sentinelAuthorized=false` 时先阻塞，不执行破坏性命令。
 4. 使用 `scripts/run-quality-gates.mjs <gate-config.json>` 执行命令。
 5. 捕获每条命令的原始 argv、required/status、cwd、起止时间、退出码、耗时和脱敏日志；
    禁止把自然语言命令摘要登记为已执行命令。
@@ -30,7 +34,16 @@ description: "在代码或配置准备交付时，发现并运行适用的静态
 ## 强制检查
 
 - 按适用性运行 lint、类型/编译、unit、integration、migration、production build 和 E2E。
-- 破坏性资源必须验证测试命名、与运行库不相等以及 sentinel 或一次性资源 ID。
+- QA 是完整 production build、dev/production server、集成与浏览器普通功能 E2E 的验收责任方；
+  开发 manifest 中因环境缺证而记为 `required=false` 的项只是交接信息，不是 QA 豁免。
+- 对 implementation check 中的 `delegatedTo="verification"`，QA 必须在 `executedChecks`
+  中保留完全相同的 `id`、`command` 原始 argv 和 `cwd`，并真实执行到
+  `required=true/status=pass/exitCode=0`。不得用前缀/子串相似 ID、自然语言摘要
+  或任意其他通过检查代替；未被精确覆盖的委派仍是残余风险。
+- 普通功能 E2E 由 QA 在本阶段完成；下游 runtime audit 复用本报告与已验证构建，
+  只补充 HTTP、缓存/安全、权限、可访问性、响应式、性能和可观测性等边界探测，不应重复普通 E2E。
+- 破坏性资源必须验证测试命名、与运行库不相等以及统一 sentinel 或一次性资源 ID；
+  sentinel 只能作为最后一道授权，不能替代隔离性检查。
 - 必需命令缺环境时使用 required=true + status=unverified/blocked，整个 verification gate 禁止 pass。
 - P0/P1 要求必须具有行为级证据。
 
@@ -47,6 +60,10 @@ description: "在代码或配置准备交付时，发现并运行适用的静态
 输出 `verification-report.json`，包含 `implementationHash`、`changeReviewHash`、`projectFingerprint`、`buildHash`、
 `buildArtifact`、`discoveredGates`、`executedChecks`、`resourcePreflight`、`requirementResults`、`findings`、`waivers`、
 `falsePositiveAssessment`、`failures`、`warnings`、`unverified` 和 `status`。
+`findings[]` 必须与控制器对齐：`severity=P0|P1|P2|P3`，`status=open|resolved|waived`
+（QA 不得保留 `planned`），可选 `category` 只能是
+`correctness|security|reliability|architecture|performance|maintainability|testing|compatibility|scope|other`，
+可选 `confidence=low|medium|high`，安全类 P0/P1 还需合法 `exploitability`。
 其中 `implementationHash` 必须等于最新 `implementation-manifest.json` 的文件 SHA-256，
 `changeReviewHash` 必须等于最新 `change-review.json` 的文件 SHA-256，
 `projectFingerprint` 必须等于本轮 QA 实际项目快照；`buildHash` 必须标识本轮实际验证的
@@ -60,9 +77,15 @@ applicabilityEvidence，禁止发现后静默省略。
 `requirementResults.status=waived` 时必须提供 `findingId`，并指向同一报告/Gate 中具有完整
 人工批准证据的 waived finding；该 finding 还必须引用人工确认前 canonical Spec 中同 ID
 的 `[RISK_WAIVER]`，不得由 QA 新增 owner、期限或批准证据，也不得把需求豁免藏在 findings 之外。
+`executedChecks` 是 QA 检查的权威集合；`[GATE_RESULT].checks` 不得重复其中任何 ID，没有额外
+检查时必须写空数组，由控制器从报告水合。确需登记报告校验等额外命令时，必须使用新的唯一 ID。
 把结构化输出保存到控制器提供的 `evidenceRoot`，计算真实 SHA-256，并写入 `[GATE_RESULT].artifacts`。
 
 必需命令非零、资源校验失败、P0/P1 缺证据、必需环境不可用或测试被弱化时阻止后续阶段。
+仅因浏览器、端口、数据库、网络或授权环境不可用时，保留必需项的
+`required=true/status=blocked|unverified`，报告与 Gate 不得 pass，并用 `[RESULT:blocked]`
+停留在 QA 等待环境；不得倒退给开发修“环境”。命令已运行且确认是产品代码或测试失败时，
+记为 `status=fail`，创建可复现 finding，并用 `[RESULT:failed]` 交回开发。
 
 ## 按需参考
 

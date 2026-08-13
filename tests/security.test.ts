@@ -12,6 +12,7 @@ import {
   isAuthorizedOperator,
 } from '../src/core/access.js';
 import { requestTaskAbort } from '../src/core/task-abort.js';
+import { IdentityRegistry } from '../src/core/identity-registry.js';
 import { JsonApprovalStore, type ApprovalRequest } from '../src/core/approval-store.js';
 import { SessionManager } from '../src/core/session-manager.js';
 import {
@@ -27,6 +28,9 @@ import { highRiskClasses, highRiskToolCallReason, isHighRiskTask } from '../src/
 import { assertWorkdir } from '../src/core/workdir.js';
 import { ClaudeAdapter } from '../src/cli/claude-adapter.js';
 import { CodexAdapter } from '../src/cli/codex-adapter.js';
+import { buildLocalNetworkCapabilityEnv } from '../src/cli/runner.js';
+import type { CliCapabilityExpectation } from '../src/cli/types.js';
+import { pickAskMcpContextEnv } from '../src/mcp/config.js';
 import { buildApprovalCard } from '../src/im/workflow-card.js';
 import type { Bot, IncomingMessage } from '../src/im/lark.js';
 import type { AppContext } from '../src/runtime/app-context.js';
@@ -89,6 +93,164 @@ test('业务控制放行发起人与白名单；高风险审批在配置 OWNER �
     else process.env.OWNER_OPEN_ID = previousOwner;
     if (previousAllowed === undefined) delete process.env.AGENT_OS_ALLOWED_OPEN_IDS;
     else process.env.AGENT_OS_ALLOWED_OPEN_IDS = previousAllowed;
+  }
+});
+
+test('同一用户可用不同 Bot 的 open_id 控制任务，身份别名跨重启保留', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-identities-'));
+  const filePath = join(root, 'user-identities.json');
+  const previousOwnerOpenId = process.env.OWNER_OPEN_ID;
+  const previousOwnerUserId = process.env.OWNER_USER_ID;
+  const previousOwnerUnionId = process.env.OWNER_UNION_ID;
+  const previousAllowedOpenIds = process.env.AGENT_OS_ALLOWED_OPEN_IDS;
+  const previousAllowedUserIds = process.env.AGENT_OS_ALLOWED_USER_IDS;
+  const previousAllowedUnionIds = process.env.AGENT_OS_ALLOWED_UNION_IDS;
+  try {
+    process.env.OWNER_OPEN_ID = 'ou_ceo_scoped';
+    delete process.env.OWNER_USER_ID;
+    delete process.env.OWNER_UNION_ID;
+    delete process.env.AGENT_OS_ALLOWED_OPEN_IDS;
+    delete process.env.AGENT_OS_ALLOWED_USER_IDS;
+    delete process.env.AGENT_OS_ALLOWED_UNION_IDS;
+
+    const registry = await IdentityRegistry.open(filePath);
+    await registry.observe({
+      openId: 'ou_ceo_scoped',
+      userId: 'u_same_person',
+      unionId: 'on_same_person',
+    });
+    await registry.observe({
+      openId: 'ou_qa_scoped',
+      userId: 'u_same_person',
+      unionId: 'on_same_person',
+    });
+    assert.equal(isAuthorizedOperator({
+      senderOpenId: 'ou_qa_scoped',
+      senderUserId: 'u_same_person',
+      chatType: 'group',
+    }, registry), true);
+    assert.doesNotThrow(() => assertOwnedBy(
+      'ou_ceo_scoped',
+      { openId: 'ou_qa_scoped', userId: 'u_same_person' },
+      registry,
+    ));
+
+    const reopened = await IdentityRegistry.open(filePath);
+    const controller = new AbortController();
+    const runs = new Map([
+      ['s1', { controller, ownerOpenId: 'ou_ceo_scoped' }],
+    ]);
+    assert.equal(requestTaskAbort(
+      runs,
+      's1',
+      { openId: 'ou_qa_scoped', unionId: 'on_same_person' },
+      reopened,
+    ), 'stopped');
+    assert.equal(controller.signal.aborted, true);
+    assert.equal(canControlOwnedResource(
+      'ou_ceo_scoped',
+      { openId: 'ou_stranger', userId: 'u_stranger' },
+      reopened,
+    ), false);
+  } finally {
+    if (previousOwnerOpenId === undefined) delete process.env.OWNER_OPEN_ID;
+    else process.env.OWNER_OPEN_ID = previousOwnerOpenId;
+    if (previousOwnerUserId === undefined) delete process.env.OWNER_USER_ID;
+    else process.env.OWNER_USER_ID = previousOwnerUserId;
+    if (previousOwnerUnionId === undefined) delete process.env.OWNER_UNION_ID;
+    else process.env.OWNER_UNION_ID = previousOwnerUnionId;
+    if (previousAllowedOpenIds === undefined) delete process.env.AGENT_OS_ALLOWED_OPEN_IDS;
+    else process.env.AGENT_OS_ALLOWED_OPEN_IDS = previousAllowedOpenIds;
+    if (previousAllowedUserIds === undefined) delete process.env.AGENT_OS_ALLOWED_USER_IDS;
+    else process.env.AGENT_OS_ALLOWED_USER_IDS = previousAllowedUserIds;
+    if (previousAllowedUnionIds === undefined) delete process.env.AGENT_OS_ALLOWED_UNION_IDS;
+    else process.env.AGENT_OS_ALLOWED_UNION_IDS = previousAllowedUnionIds;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('停止任务卡使用稳定身份识别跨 Bot 的同一发起人', async () => {
+  const previousOwner = process.env.OWNER_OPEN_ID;
+  const previousAllowed = process.env.AGENT_OS_ALLOWED_OPEN_IDS;
+  delete process.env.OWNER_OPEN_ID;
+  delete process.env.AGENT_OS_ALLOWED_OPEN_IDS;
+  try {
+    const identities = new IdentityRegistry();
+    await identities.observe({ openId: 'ou_ceo_scoped', userId: 'u_owner' });
+    const controller = new AbortController();
+    const activeRun = {
+      controller,
+      ownerOpenId: 'ou_ceo_scoped',
+      cardTitle: '测试工程师 · Codex',
+      cardUpdater: { cancel: async () => undefined },
+      tracker: { snapshot: () => ({ elapsedMs: 1, activities: [], current: '执行中' }) },
+    };
+    const response = await handleCardAction({
+      identities,
+      activeRuns: new Map([['session-1', activeRun]]),
+    } as unknown as AppContext, {
+      operatorOpenId: 'ou_qa_scoped',
+      operatorUserId: 'u_owner',
+      messageId: 'om_task_card',
+      value: { action: 'abort_task', sessionId: 'session-1' },
+      formValue: {},
+    });
+    assert.match(response.toast?.content ?? '', /已发送停止指令/);
+    assert.equal(controller.signal.aborted, true);
+  } finally {
+    if (previousOwner === undefined) delete process.env.OWNER_OPEN_ID;
+    else process.env.OWNER_OPEN_ID = previousOwner;
+    if (previousAllowed === undefined) delete process.env.AGENT_OS_ALLOWED_OPEN_IDS;
+    else process.env.AGENT_OS_ALLOWED_OPEN_IDS = previousAllowed;
+  }
+});
+
+test('高风险审批的原子二次校验也接受跨 Bot 稳定身份', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-cross-bot-approval-'));
+  const previousOwner = process.env.OWNER_OPEN_ID;
+  const previousOwnerUserId = process.env.OWNER_USER_ID;
+  const previousOwnerUnionId = process.env.OWNER_UNION_ID;
+  const previousAllowed = process.env.AGENT_OS_ALLOWED_OPEN_IDS;
+  process.env.OWNER_OPEN_ID = 'ou_ceo_scoped';
+  delete process.env.OWNER_USER_ID;
+  delete process.env.OWNER_UNION_ID;
+  delete process.env.AGENT_OS_ALLOWED_OPEN_IDS;
+  try {
+    const approvals = await JsonApprovalStore.open(join(root, 'approvals.json'));
+    const pending = await approvals.create({
+      botId: 'ceo',
+      ownerOpenId: 'ou_ceo_scoped',
+      action: 'task',
+      prompt: 'git push origin main',
+      reason: '外部推送',
+      message: {
+        messageId: 'om_source', chatId: 'oc', chatType: 'group', rootId: '', threadId: '',
+        senderOpenId: 'ou_ceo_scoped',
+      },
+    });
+    await bindApprovalCard(approvals, pending, 'om_approval_card');
+    const identities = new IdentityRegistry();
+    await identities.observe({ openId: 'ou_ceo_scoped', unionId: 'on_owner' });
+    const response = await handleCardAction({ approvals, identities } as unknown as AppContext, {
+      operatorOpenId: 'ou_qa_scoped',
+      operatorUnionId: 'on_owner',
+      messageId: 'om_approval_card',
+      value: { action: 'reject_high_risk', approvalId: pending.id },
+      formValue: {},
+    });
+    assert.match(response.toast?.content ?? '', /已拒绝/);
+    assert.equal(approvals.get(pending.id)?.status, 'rejected');
+    assert.equal(approvals.get(pending.id)?.decidedBy, 'ou_qa_scoped');
+  } finally {
+    if (previousOwner === undefined) delete process.env.OWNER_OPEN_ID;
+    else process.env.OWNER_OPEN_ID = previousOwner;
+    if (previousOwnerUserId === undefined) delete process.env.OWNER_USER_ID;
+    else process.env.OWNER_USER_ID = previousOwnerUserId;
+    if (previousOwnerUnionId === undefined) delete process.env.OWNER_UNION_ID;
+    else process.env.OWNER_UNION_ID = previousOwnerUnionId;
+    if (previousAllowed === undefined) delete process.env.AGENT_OS_ALLOWED_OPEN_IDS;
+    else process.env.AGENT_OS_ALLOWED_OPEN_IDS = previousAllowed;
+    await rm(root, { recursive: true, force: true });
   }
 });
 
@@ -380,19 +542,58 @@ test('CLI 按普通、只读和已审批任务使用不同权限边界', () => {
   const previousMcp = process.env.MCP_ENABLED;
   const previousSandbox = process.env.CODEX_SANDBOX;
   const previousApprovedSandbox = process.env.CODEX_APPROVED_SANDBOX;
+  const previousLocalNetwork = process.env.CODEX_LOCAL_NETWORK_ACCESS;
   process.env.MCP_ENABLED = 'false';
-  process.env.CODEX_SANDBOX = 'danger-full-access';
-  process.env.CODEX_APPROVED_SANDBOX = 'danger-full-access';
+  delete process.env.CODEX_SANDBOX;
+  delete process.env.CODEX_APPROVED_SANDBOX;
+  delete process.env.CODEX_LOCAL_NETWORK_ACCESS;
   try {
     const codex = new CodexAdapter();
-    const standard = codex.buildArgs('修改 README', { executionPolicy: 'standard' });
-    assert.equal(standard[standard.indexOf('--sandbox') + 1], 'workspace-write');
+    const ordinaryCapabilities: CliCapabilityExpectation[] = [];
+    const ordinaryStandard = codex.buildArgs('修改 README', {
+      executionPolicy: 'standard',
+      onCapabilityExpectation: (expectation) => ordinaryCapabilities.push(expectation),
+    });
+    assert.equal(ordinaryStandard.includes('--sandbox'), false);
+    // P0 修复：standard 策略默认 workspace-write（fail-closed），不再 danger-full-access
+    assert.equal(ordinaryStandard.includes('default_permissions=":danger-full-access"'), false);
+    assert.equal(ordinaryStandard.some((arg) => arg.includes('default_permissions=')), true);
+    assert.equal(ordinaryStandard.includes('sandbox_workspace_write.network_access=true'), false);
+    assert.deepEqual(ordinaryCapabilities, [{
+      capability: 'local-network',
+      requested: false,
+      configApplied: false,
+      expected: 'none',
+      reason: 'not-requested',
+    }]);
+    assert.match(ordinaryStandard.at(-1) ?? '', /未请求/);
+    const freshCapabilities: CliCapabilityExpectation[] = [];
+    const standard = codex.buildArgs('运行交付门禁', {
+      executionPolicy: 'standard',
+      localNetworkAccess: true,
+      onCapabilityExpectation: (expectation) => freshCapabilities.push(expectation),
+    });
+    assert.equal(standard.includes('--sandbox'), false);
+    // P0 修复：standard + network 也走 workspace-write，不是 danger-full-access
+    assert.equal(standard.includes('default_permissions=":danger-full-access"'), false);
+    assert.equal(standard.some((arg) => arg.includes('network.enabled=true')), true);
     assert.deepEqual(standard.slice(0, 2), ['--ask-for-approval', 'untrusted']);
     assert.match(standard.at(-1) ?? '', /没有获得高风险操作审批/);
-    const readonly = codex.buildArgs('分析日志', { executionPolicy: 'read-only' });
+    assert.deepEqual(freshCapabilities, [{
+      capability: 'local-network',
+      requested: true,
+      configApplied: true,
+      expected: 'loopback',
+      reason: 'loopback-config-applied',
+    }]);
+    const readonly = codex.buildArgs('分析日志', {
+      executionPolicy: 'read-only',
+      localNetworkAccess: true,
+    });
     assert.equal(readonly[readonly.indexOf('--sandbox') + 1], 'read-only');
     assert.equal(readonly.includes('--ignore-user-config'), true);
     assert.equal(readonly.includes('mcp_servers={}'), true);
+    assert.equal(readonly.includes('default_permissions=":danger-full-access"'), false);
     const inputOnly = codex.buildArgs('分析已提供日志', { executionPolicy: 'input-only' });
     assert.equal(inputOnly[inputOnly.indexOf('--sandbox') + 1], 'read-only');
     assert.equal(inputOnly.includes('--ignore-user-config'), true);
@@ -402,17 +603,45 @@ test('CLI 按普通、只读和已审批任务使用不同权限边界', () => {
     assert.match(inputOnly.at(-1) ?? '', /不得调用任何工具/);
     const approved = codex.buildArgs('git push', { executionPolicy: 'approved', approvedScope: '只推送 main 分支' });
     assert.deepEqual(approved.slice(0, 2), ['--ask-for-approval', 'never']);
-    assert.equal(approved[approved.indexOf('--sandbox') + 1], 'danger-full-access');
+    assert.equal(approved.includes('--sandbox'), false);
+    assert.equal(approved.includes('default_permissions=":danger-full-access"'), true);
     assert.match(approved.at(-1) ?? '', /只推送 main 分支/);
     assert.match(approved[approved.indexOf('-c') + 1], /developer_instructions=.*只推送 main 分支/);
 
-    delete process.env.CODEX_APPROVED_SANDBOX;
-    const defaultApproved = codex.buildArgs('git push', {
+    process.env.CODEX_APPROVED_SANDBOX = 'workspace-write';
+    const workspaceApproved = codex.buildArgs('git push', {
       executionPolicy: 'approved',
       approvedScope: '只推送 main 分支',
+      localNetworkAccess: true,
     });
-    assert.equal(defaultApproved[defaultApproved.indexOf('--sandbox') + 1], 'workspace-write');
-    process.env.CODEX_APPROVED_SANDBOX = 'danger-full-access';
+    assert.equal(workspaceApproved.includes('--sandbox'), false);
+    assert.equal(workspaceApproved.includes('default_permissions="agent-os-workspace"'), true);
+    assert.equal(workspaceApproved.includes('permissions.agent-os-workspace.network.allow_local_binding=true'), true);
+    delete process.env.CODEX_APPROVED_SANDBOX;
+
+    process.env.CODEX_LOCAL_NETWORK_ACCESS = 'false';
+    const resumeCapabilities: CliCapabilityExpectation[] = [];
+    const noLocalNetwork = codex.buildResumeArgs('继续测试', 'thread-1', {
+      executionPolicy: 'standard',
+      localNetworkAccess: true,
+      onCapabilityExpectation: (expectation) => resumeCapabilities.push(expectation),
+    });
+    assert.equal(noLocalNetwork.includes('default_permissions=":danger-full-access"'), false);
+    assert.equal(noLocalNetwork.includes('permissions.agent-os-workspace.network.allow_local_binding=true'), false);
+    assert.deepEqual(resumeCapabilities, [{
+      capability: 'local-network',
+      requested: true,
+      configApplied: false,
+      expected: 'none',
+      reason: 'disabled-by-env',
+    }]);
+    assert.match(noLocalNetwork.at(-1) ?? '', /本机网络能力：未请求；reason=disabled-by-env/);
+    assert.deepEqual(buildLocalNetworkCapabilityEnv(true, resumeCapabilities[0]), {
+      AGENT_OS_LOCAL_NETWORK_REQUESTED: 'true',
+      AGENT_OS_LOCAL_NETWORK_CONFIG_APPLIED: 'false',
+      AGENT_OS_LOCAL_NETWORK_EXPECTED: 'none',
+      AGENT_OS_LOCAL_NETWORK_REASON: 'disabled-by-env',
+    });
 
     const claude = new ClaudeAdapter();
     const normalClaude = claude.buildArgs('修改 README', { executionPolicy: 'standard' });
@@ -452,6 +681,44 @@ test('CLI 按普通、只读和已审批任务使用不同权限边界', () => {
     else process.env.CODEX_SANDBOX = previousSandbox;
     if (previousApprovedSandbox === undefined) delete process.env.CODEX_APPROVED_SANDBOX;
     else process.env.CODEX_APPROVED_SANDBOX = previousApprovedSandbox;
+    if (previousLocalNetwork === undefined) delete process.env.CODEX_LOCAL_NETWORK_ACCESS;
+    else process.env.CODEX_LOCAL_NETWORK_ACCESS = previousLocalNetwork;
+  }
+});
+
+test('Codex 普通任务预授权问卷 MCP，但不预授权代填答案', () => {
+  const previousMcp = process.env.MCP_ENABLED;
+  delete process.env.MCP_ENABLED;
+  try {
+    const workflowId = '14a8e2a5-12b8-4b9e-b37e-52bb6833d1d0';
+    const args = new CodexAdapter().buildArgs('澄清需求', {
+      executionPolicy: 'standard',
+      localNetworkAccess: true,
+      mcpContextEnv: pickAskMcpContextEnv({
+        AGENT_OS_WORKFLOW_ID: workflowId,
+        AGENT_OS_CHAT_ID: 'oc_chat',
+        AGENT_OS_TOPIC_ID: 'omt_topic',
+        AGENT_OS_OWNER_OPEN_ID: 'ou_owner',
+        AGENT_OS_BOT_ID: 'pm',
+        AGENT_OS_MESSAGE_ID: 'om_message',
+        SECRET_SHOULD_NOT_LEAK: 'nope',
+      }),
+    });
+    assert.equal(args.includes('mcp_servers.agent-os-ask.default_tools_approval_mode="approve"'), true);
+    assert.equal(args.includes('mcp_servers.agent-os-ask.tools.propose_questions.approval_mode="approve"'), true);
+    assert.equal(args.includes('mcp_servers.agent-os-ask.tools.get_questionnaire.approval_mode="approve"'), true);
+    assert.equal(args.includes('mcp_servers.agent-os-ask.tools.record_answers.approval_mode="prompt"'), true);
+    assert.equal(args.includes(`mcp_servers.agent-os-ask.env.AGENT_OS_WORKFLOW_ID="${workflowId}"`), true);
+    assert.equal(args.includes('mcp_servers.agent-os-ask.env.AGENT_OS_CHAT_ID="oc_chat"'), true);
+    assert.equal(args.includes('mcp_servers.agent-os-ask.env.AGENT_OS_BOT_ID="pm"'), true);
+    assert.equal(args.some((flag) => flag.includes('SECRET_SHOULD_NOT_LEAK')), false);
+    assert.equal(args.includes('mcp_servers={}'), false);
+    const readonly = new CodexAdapter().buildArgs('分析日志', { executionPolicy: 'read-only' });
+    assert.equal(readonly.includes('mcp_servers={}'), true);
+    assert.equal(readonly.includes('mcp_servers.agent-os-ask.default_tools_approval_mode="approve"'), false);
+  } finally {
+    if (previousMcp === undefined) delete process.env.MCP_ENABLED;
+    else process.env.MCP_ENABLED = previousMcp;
   }
 });
 

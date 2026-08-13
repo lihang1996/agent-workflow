@@ -75,6 +75,7 @@ export function buildInitialReviewPrompt(task: string, round: number): string {
     '1) 问题与风险（按严重程度）',
     '2) 修改建议',
     '3) 若无明显问题，请在结论中明确写上 [APPROVED]',
+    '4) 完整交付流水线中必须另起一行 [RESULT:done|blocked|failed]：通过或未通过都用 [RESULT:done]；未通过时不要写 [APPROVED]，系统会回传开发。禁止把「发现需改代码」写成 [RESULT:failed]（那会停掉流水线）',
     '',
     `评审目标：${task}`,
   ].join('\n');
@@ -104,6 +105,6 @@ export function buildFollowUpReviewPrompt(task: string, round: number, devResult
     '开发已根据上一轮意见完成修改，说明如下：',
     compactAgentOutput(devResult),
     '',
-    '请复查是否已解决。若通过请写 [APPROVED]；否则继续给出问题与修改建议。',
+    '请复查是否已解决。若通过请写 [APPROVED] 并输出 [RESULT:done]；否则不要写 [APPROVED]，仍输出 [RESULT:done] 让系统继续回传开发。禁止用 [RESULT:failed] 停掉流水线。',
   ].join('\n');
 }

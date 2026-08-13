@@ -1,4 +1,4 @@
-import type { Bot } from '../im/lark.js';
+import type { Bot, CardAction } from '../im/lark.js';
 import {
   createAppContext,
   type AppContext,
@@ -19,12 +19,7 @@ export interface App {
   ctx: AppContext;
   botsById: Map<string, Bot>;
   handleMessage: (msg: import('../im/lark.js').IncomingMessage, bot: Bot) => Promise<void>;
-  handleCardAction: (action: {
-    operatorOpenId: string;
-    messageId: string;
-    value: Record<string, unknown>;
-    formValue: Record<string, unknown>;
-  }) => ReturnType<typeof handleCardAction>;
+  handleCardAction: (action: CardAction) => ReturnType<typeof handleCardAction>;
   reconcileOrphanedCards: () => Promise<void>;
   shutdownActiveRuns: (reason: string) => Promise<void>;
   startScheduler: () => void;

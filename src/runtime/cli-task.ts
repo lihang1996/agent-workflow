@@ -14,9 +14,10 @@ import type { Bot, IncomingMessage } from '../im/lark.js';
 import type { Session } from '../core/session-manager.js';
 import { TaskProgressTracker } from '../core/task-progress.js';
 import { sanitizeErrorForLog, sanitizeForLog } from '../core/log-inspection.js';
-import { hasExplicitStepResult, parseStepResult } from '../core/step-result.js';
+import { hasExplicitStepResult, parseStepResult, type StepResult } from '../core/step-result.js';
 import { displayAgentOutput } from '../core/agent-output.js';
 import { assertWorkdir } from '../core/workdir.js';
+import { TEST_RESOURCE_SENTINEL_ENV } from '../core/test-resource-policy.js';
 import type { AppContext } from './app-context.js';
 import type { ActiveRun } from './types.js';
 import {
@@ -36,6 +37,8 @@ export async function startCliTask(
     prompt: string;
     downloadResources?: boolean;
     workflowId?: string;
+    /** 仅 QA 且经负责人确认的隔离测试资源授权。 */
+    testResourceSentinelAuthorized?: boolean;
     executionPolicy?: CliExecutionPolicy;
     approvedScope?: string;
     /** 是否解析 [RESULT:done|blocked|failed] 标记；仅流水线非 PM 步骤启用 */
@@ -44,7 +47,17 @@ export async function startCliTask(
     hideProtocolOutput?: boolean;
     /** 在成功卡变绿前执行语义/门禁校验；抛错会落失败卡并进入 onFailure。 */
     validateSuccess?: (answer: string) => Promise<void>;
-    onSuccess?: (answer: string) => Promise<void>;
+    /**
+     * 架构师误把 planned findings 标成 [RESULT:failed] 时：
+     * 若 validateSuccess 通过，按 done 继续而不是停掉流水线。
+     */
+    acceptFailedResultIfValidated?: boolean;
+    /**
+     * 评审未通过 / CEO 汇总误标 failed 时：按完成进入 onSuccess，
+     * 而不是走失败卡停掉流水线。
+     */
+    treatFailedResultAsDone?: boolean;
+    onSuccess?: (answer: string, stepResult?: StepResult) => Promise<void>;
     /** 当前任务终态卡已经提交且会话已释放后执行；适合启动同一 Bot 的下一流水线步骤。 */
     afterSuccess?: (answer: string) => Promise<void>;
     onFailure?: (error: Error) => Promise<void>;
@@ -59,11 +72,14 @@ export async function startCliTask(
     msg,
     downloadResources = false,
     workflowId,
+    testResourceSentinelAuthorized = false,
     executionPolicy = 'standard',
     approvedScope,
     resultProtocol = false,
     hideProtocolOutput = resultProtocol,
     validateSuccess,
+    acceptFailedResultIfValidated = false,
+    treatFailedResultAsDone = false,
     onSuccess,
     afterSuccess,
     onFailure,
@@ -144,6 +160,7 @@ export async function startCliTask(
   activeRun = {
     controller,
     ownerOpenId: msg.senderOpenId,
+    ...(workflowId ? { workflowId } : {}),
     bot,
     cardId,
     cardTitle,
@@ -298,6 +315,8 @@ export async function startCliTask(
     onEvent: onCliEvent,
     executionPolicy,
     approvedScope: executionPolicy === 'approved' ? (approvedScope ?? options.prompt) : undefined,
+    // 普通聊天继续无网络；只有有持久化恢复与资源安全协议的交付流水线可访问回环地址。
+    localNetworkAccess: !!workflowId,
     env: {
       AGENT_OS_CHAT_ID: msg.chatId,
       AGENT_OS_TOPIC_ID: topicIdOf(msg),
@@ -305,6 +324,8 @@ export async function startCliTask(
       AGENT_OS_BOT_ID: bot.id,
       AGENT_OS_MESSAGE_ID: msg.messageId,
       ...(workflowId ? { AGENT_OS_WORKFLOW_ID: workflowId } : {}),
+      // 显式覆盖宿主环境，避免全局变量意外泄露到普通聊天或非 QA 步骤。
+      [TEST_RESOURCE_SENTINEL_ENV]: testResourceSentinelAuthorized ? 'true' : '',
     },
   })
     .then(async (result) => {
@@ -325,20 +346,44 @@ export async function startCliTask(
       // 仅流水线非 PM 步骤解析 RESULT 标记（resultProtocol=true 时）；
       // PM 产出的是 Spec 正文，普通聊天/handoff/定时/巡检也不解析，
       // 避免 Agent 在回答中举例 [RESULT:failed] 被误判为任务失败。
-      const stepResult = resultProtocol ? parseStepResult(result.answer) : { kind: 'done' as const };
+      let stepResult = resultProtocol ? parseStepResult(result.answer) : { kind: 'done' as const };
       if (resultProtocol && !hasExplicitStepResult(result.answer)) {
         throw new Error('流水线步骤缺少显式 [RESULT:done|blocked|failed] 终态标记，不能按成功处理。');
       }
       const visibleAnswer = hideProtocolOutput ? displayAgentOutput(result.answer) : result.answer;
       // CLI exit 0 只代表进程完成；结构化门禁也通过后，卡片才允许显示绿色成功。
+      if (stepResult.kind === 'failed' && treatFailedResultAsDone) {
+        console.warn(
+          `[CLI:${bot.id}] 输出了 [RESULT:failed]，本步按完成继续（评审回传或汇总落盘）`,
+        );
+        stepResult = { kind: 'done' };
+      }
       if (stepResult.kind === 'done' && validateSuccess) {
         await validateSuccess(result.answer);
+      } else if (
+        stepResult.kind === 'failed'
+        && acceptFailedResultIfValidated
+        && validateSuccess
+      ) {
+        try {
+          await validateSuccess(result.answer);
+          console.warn(
+            `[CLI:${bot.id}] 输出了 [RESULT:failed]，但本步门禁可通过，已按 [RESULT:done] 继续`,
+          );
+          stepResult = { kind: 'done' };
+        } catch (gateError) {
+          // P1 修复：保留原始 Error 类型和 cause，不要用空 catch 吞掉
+          // FingerprintDriftError / GateResult 校验错误等关键诊断信息。
+          console.error(`[CLI:${bot.id}] 门禁校验失败:`, safeErrorMessage(gateError));
+          // 将原始错误附加到 stepResult.reason，供 onFailure 回调使用。
+          stepResult = { kind: 'failed', reason: safeErrorMessage(gateError) };
+        }
       }
       if (activeRun.heartbeat) clearInterval(activeRun.heartbeat);
       if (!ctx.shuttingDown) {
         if (stepResult.kind !== 'failed' && onSuccess) {
-          // 先原子提交业务/工作流终态；提交失败时不能显示绿色成功卡。
-          await onSuccess(result.answer);
+          // P1 修复：传递已解析的 stepResult，避免 onSuccess 中重复解析导致不一致。
+          await onSuccess(result.answer, stepResult);
         }
       }
 
@@ -428,12 +473,16 @@ export async function startCliTask(
         if (!ctx.shuttingDown && !activeRun.cardSettledByCallback) {
           await finishInterruptedRun(activeRun, detail);
         }
-        if (!ctx.shuttingDown) await reportFailure(new Error(detail));
+        // P1 修复：用户主动取消不是质量缺陷，不要调 reportFailure 触发质量退回开发。
+        // workflow 留在 executing，重启时 resumeRecoverableWorkflows 会恢复为 ready。
+        // 用户可用 /workflow retry 或 /workflow abort 手动控制后续行为。
         return;
       }
       activeRun.terminalStatus = 'failed';
       const message = safeErrorMessage(error);
-      const safeError = new Error(message);
+      // 控制器错误可能携带稳定类型/元数据（例如运行时源码漂移）。回调保留原实例，
+      // 仅卡片与日志使用脱敏 message，避免安全状态机被错误字符串化后误判为普通失败。
+      const callbackError = error instanceof Error ? error : new Error(message);
       console.error(`[CLI:${bot.id}/${adapter.id}] 执行失败:`, message);
       try {
         await cardUpdater.finish(buildTaskCard({
@@ -452,7 +501,7 @@ export async function startCliTask(
       await markSessionIdle(ctx, session.id).catch((stateError) => {
         console.error('[会话] 释放失败任务会话异常:', safeErrorMessage(stateError));
       });
-      await reportFailure(safeError);
+      await reportFailure(callbackError);
     })
     .finally(async () => {
       if (activeRun.heartbeat) clearInterval(activeRun.heartbeat);

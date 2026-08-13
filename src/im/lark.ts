@@ -27,6 +27,10 @@ export interface IncomingMessage {
   rootId: string;
   threadId: string;
   senderOpenId: string;
+  /** 同一租户内跨应用稳定；用于多 Bot 权限判断。 */
+  senderUserId?: string;
+  /** 同一开发者的多个应用间稳定；user_id 缺失时用于多 Bot 权限判断。 */
+  senderUnionId?: string;
   senderType: string;
   mentions: Mention[];
   rawContent: string;
@@ -43,6 +47,8 @@ export interface BotOptions {
 
 export interface CardAction {
   operatorOpenId: string;
+  operatorUserId?: string;
+  operatorUnionId?: string;
   messageId: string;
   value: Record<string, unknown>;
   formValue: Record<string, unknown>;
@@ -85,8 +91,15 @@ export class CreatedDocumentWriteError extends Error {
 /** 解析飞书 card.action.trigger 事件。 */
 export function parseCardAction(data: any): CardAction {
   const value = data?.action?.value;
+  const operator = data?.operator ?? {};
+  const legacyOperator = data?.operator_id ?? {};
+  const operatorOpenId = operator.open_id ?? legacyOperator.open_id ?? '';
+  const operatorUserId = operator.user_id ?? legacyOperator.user_id;
+  const operatorUnionId = operator.union_id ?? legacyOperator.union_id;
   return {
-    operatorOpenId: data?.operator?.open_id ?? data?.operator_id?.open_id ?? '',
+    operatorOpenId,
+    ...(operatorUserId ? { operatorUserId } : {}),
+    ...(operatorUnionId ? { operatorUnionId } : {}),
     messageId: data?.context?.open_message_id ?? data?.open_message_id ?? '',
     value: value && typeof value === 'object' ? value as Record<string, unknown> : {},
     formValue: data?.action?.form_value && typeof data.action.form_value === 'object'
@@ -713,6 +726,8 @@ export async function startBot(opts: BotOptions): Promise<Bot> {
         rootId: m.root_id ?? '',
         threadId: m.thread_id ?? '',
         senderOpenId: data.sender?.sender_id?.open_id ?? '',
+        ...(data.sender?.sender_id?.user_id ? { senderUserId: data.sender.sender_id.user_id } : {}),
+        ...(data.sender?.sender_id?.union_id ? { senderUnionId: data.sender.sender_id.union_id } : {}),
         senderType: data.sender?.sender_type ?? '',
         mentions: parseMentions(m.mentions),
         rawContent,

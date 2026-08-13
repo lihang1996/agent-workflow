@@ -4,8 +4,8 @@
   "description": "Agent OS — 你的个人生产系统（《Agent OS 个人生产系统实战》配套项目）",
   "type": "module",
   "scripts": {
-    "dev": "pnpm start",
-    "start": "tsx watch --include .env src/index.ts",
+    "dev": "tsx watch --include .env src/index.ts",
+    "start": "tsx src/index.ts",
     "start:once": "tsx src/index.ts",
     "start:prod": "pnpm build && pnpm verify:dist-contract && node dist/index.js",
     "probe": "tsx src/probe-lark.ts",
@@ -13,6 +13,7 @@
     "probe:cli": "tsx src/probe-cli.ts",
     "mcp:server": "tsx src/mcp/ask-server.ts",
     "verify:dist-contract": "node scripts/verify-dist-contract.mjs",
+    "verify": "tsc --noEmit && node --import tsx --test --test-concurrency=1 --experimental-test-isolation=none tests/**/*.test.ts",
     "test": "node --import tsx --test --test-concurrency=1 --experimental-test-isolation=none tests/**/*.test.ts"
   },
   "engines": {

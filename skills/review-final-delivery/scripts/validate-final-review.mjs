@@ -2,6 +2,7 @@
 import { createHash } from "node:crypto";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
+import { validateFindingsArray } from "../../_shared/finding-fields.mjs";
 
 const path = process.argv[2];
 if (!path) {
@@ -97,13 +98,8 @@ if ((review.findings ?? []).some((item) =>
   && item?.status !== "waived")) {
   errors.push("unresolved P0/P1 findings remain");
 }
-if ((review.findings ?? []).some((item) => item?.status === "planned")) {
-  errors.push("final review findings cannot remain planned");
-}
+errors.push(...validateFindingsArray(review.findings ?? [], { allowPlanned: false }));
 for (const [index, finding] of (review.findings ?? []).entries()) {
-  if (!finding?.id || !finding?.severity || !finding?.status || !finding?.summary) {
-    errors.push(`findings[${index}] needs id, severity, status and summary`);
-  }
   if (finding?.status === "waived" && !waiverForFinding(finding)) {
     errors.push(`findings[${index}] waiver is incomplete, ambiguous or expired`);
   }

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { lstat, readFile, realpath } from 'node:fs/promises';
 import { basename, isAbsolute, relative, resolve, sep } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import type { PipelineStepId } from './pipeline.js';
 import { hashPathArtifact } from './project-snapshot.js';
@@ -75,6 +76,138 @@ const SEVERITY_ALIASES: Record<string, 'P0' | 'P1' | 'P2' | 'P3'> = {
   '中': 'P2',
   '低': 'P3',
 };
+
+/** 与 skills/_shared/finding-fields.mjs 保持同步；未知标签仍 fail closed。 */
+export const GATE_FINDING_CATEGORIES = [
+  'correctness',
+  'security',
+  'reliability',
+  'architecture',
+  'performance',
+  'maintainability',
+  'testing',
+  'compatibility',
+  'scope',
+  'other',
+] as const;
+export type GateFindingCategory = (typeof GATE_FINDING_CATEGORIES)[number];
+
+export const GATE_FINDING_EXPLOITABILITIES = [
+  'not-applicable',
+  'unreachable',
+  'conditional',
+  'reachable',
+  'unverified',
+] as const;
+export type GateFindingExploitability = (typeof GATE_FINDING_EXPLOITABILITIES)[number];
+
+const CATEGORY_ALIASES: Record<string, GateFindingCategory> = {
+  correctness: 'correctness',
+  bug: 'correctness',
+  bugs: 'correctness',
+  defect: 'correctness',
+  functional: 'correctness',
+  logic: 'correctness',
+  security: 'security',
+  secure: 'security',
+  vuln: 'security',
+  vulnerability: 'security',
+  vulnerabilities: 'security',
+  auth: 'security',
+  authz: 'security',
+  xss: 'security',
+  csrf: 'security',
+  reliability: 'reliability',
+  reliable: 'reliability',
+  stability: 'reliability',
+  resilience: 'reliability',
+  availability: 'reliability',
+  'test-reliability': 'testing',
+  flaky: 'testing',
+  flake: 'testing',
+  architecture: 'architecture',
+  arch: 'architecture',
+  design: 'architecture',
+  solid: 'architecture',
+  performance: 'performance',
+  perf: 'performance',
+  latency: 'performance',
+  maintainability: 'maintainability',
+  maintainable: 'maintainability',
+  readability: 'maintainability',
+  docs: 'maintainability',
+  documentation: 'maintainability',
+  'documentation-accuracy': 'maintainability',
+  'doc-accuracy': 'maintainability',
+  testing: 'testing',
+  test: 'testing',
+  tests: 'testing',
+  e2e: 'testing',
+  qa: 'testing',
+  coverage: 'testing',
+  compatibility: 'compatibility',
+  compat: 'compatibility',
+  browser: 'compatibility',
+  a11y: 'compatibility',
+  accessibility: 'compatibility',
+  scope: 'scope',
+  'out-of-scope': 'scope',
+  other: 'other',
+  misc: 'other',
+  ux: 'other',
+  ui: 'other',
+  dx: 'other',
+};
+
+const CONFIDENCE_ALIASES: Record<string, 'low' | 'medium' | 'high'> = {
+  low: 'low',
+  l: 'low',
+  medium: 'medium',
+  med: 'medium',
+  m: 'medium',
+  high: 'high',
+  h: 'high',
+};
+
+const EXPLOITABILITY_ALIASES: Record<string, GateFindingExploitability> = {
+  'not-applicable': 'not-applicable',
+  na: 'not-applicable',
+  'n/a': 'not-applicable',
+  none: 'not-applicable',
+  unreachable: 'unreachable',
+  conditional: 'conditional',
+  reachable: 'reachable',
+  unverified: 'unverified',
+  unknown: 'unverified',
+};
+
+function normalizeFindingCategory(value: unknown): GateFindingCategory | undefined {
+  if (typeof value !== 'string') return undefined;
+  const key = value.trim().toLowerCase();
+  if (!key) return undefined;
+  if ((GATE_FINDING_CATEGORIES as readonly string[]).includes(key)) {
+    return key as GateFindingCategory;
+  }
+  return CATEGORY_ALIASES[key];
+}
+
+function normalizeFindingConfidence(value: unknown): 'low' | 'medium' | 'high' | undefined {
+  if (typeof value !== 'string') return undefined;
+  const key = value.trim().toLowerCase();
+  if (!key) return undefined;
+  if (key === 'low' || key === 'medium' || key === 'high') return key;
+  return CONFIDENCE_ALIASES[key];
+}
+
+function normalizeFindingExploitability(value: unknown): GateFindingExploitability | undefined {
+  if (typeof value !== 'string') return undefined;
+  const key = value.trim().toLowerCase();
+  if (!key) return undefined;
+  if ((GATE_FINDING_EXPLOITABILITIES as readonly string[]).includes(key)) {
+    return key as GateFindingExploitability;
+  }
+  return EXPLOITABILITY_ALIASES[key];
+}
 
 function asStringList(value: unknown, maxItemLength: number): string[] | unknown {
   if (value == null) return [];
@@ -268,13 +401,19 @@ function normalizeFindingInput(
   if (Array.isArray(evidence)) raw.evidence = evidence;
 
   if (typeof raw.confidence === 'string') {
-    raw.confidence = raw.confidence.trim().toLowerCase();
+    const confidence = normalizeFindingConfidence(raw.confidence);
+    if (confidence) raw.confidence = confidence;
+    else raw.confidence = raw.confidence.trim().toLowerCase();
   }
   if (typeof raw.category === 'string') {
-    raw.category = raw.category.trim().toLowerCase();
+    const category = normalizeFindingCategory(raw.category);
+    if (category) raw.category = category;
+    else raw.category = raw.category.trim().toLowerCase();
   }
   if (typeof raw.exploitability === 'string') {
-    raw.exploitability = raw.exploitability.trim().toLowerCase();
+    const exploitability = normalizeFindingExploitability(raw.exploitability);
+    if (exploitability) raw.exploitability = exploitability;
+    else raw.exploitability = raw.exploitability.trim().toLowerCase();
   }
 
   return raw;
@@ -302,6 +441,9 @@ function normalizeCheckInput(input: unknown): unknown {
   if (typeof raw.required === 'string') {
     if (/^true$/i.test(raw.required.trim())) raw.required = true;
     else if (/^false$/i.test(raw.required.trim())) raw.required = false;
+  }
+  if (typeof raw.delegatedTo === 'string') {
+    raw.delegatedTo = raw.delegatedTo.trim().toLowerCase();
   }
   if (typeof raw.status === 'string') {
     const status = raw.status.trim().toLowerCase();
@@ -440,21 +582,10 @@ export const GateFindingSchema = z.preprocess(
     id: z.string().trim().min(1).max(200),
     severity: z.enum(['P0', 'P1', 'P2', 'P3']),
     status: GateFindingStatusSchema.default('open'),
-    category: z.enum([
-      'correctness',
-      'security',
-      'reliability',
-      'architecture',
-      'performance',
-      'maintainability',
-      'testing',
-      'compatibility',
-      'scope',
-      'other',
-    ]).optional(),
+    category: z.enum(GATE_FINDING_CATEGORIES).optional(),
     confidence: z.enum(['low', 'medium', 'high']).optional(),
     impact: z.string().trim().min(1).max(2_000).optional(),
-    exploitability: z.enum(['not-applicable', 'unreachable', 'conditional', 'reachable', 'unverified']).optional(),
+    exploitability: z.enum(GATE_FINDING_EXPLOITABILITIES).optional(),
     summary: z.string().trim().min(1).max(4_000),
     evidence: z.array(z.string().trim().min(1).max(2_000)).max(100).default([]),
     waiver: z.preprocess((input) => {
@@ -510,6 +641,12 @@ export const GateCheckSchema = z.preprocess(
     command: z.array(z.string().trim().min(1).max(2_000)).min(1).max(100),
     status: GateCheckStatusSchema,
     required: z.boolean().default(true),
+    /**
+     * 显式交给 QA 的开发阶段环境缺证。仅凭该字段不会消除残余风险；
+     * 最终收敛还要求后续 verification gate 中存在完全相同 id/command/cwd
+     * 的 required 真实通过检查。
+     */
+    delegatedTo: z.literal('verification').optional(),
     exitCode: z.number().int().nullable().optional(),
     durationMs: z.number().int().min(0).optional(),
     cwd: z.string().trim().min(1).max(4_000)
@@ -519,6 +656,14 @@ export const GateCheckSchema = z.preprocess(
     finishedAt: z.iso.datetime().optional(),
     logSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   }).superRefine((check, ctx) => {
+    if (check.delegatedTo && (check.required
+      || (check.status !== 'blocked' && check.status !== 'unverified'))) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['delegatedTo'],
+        message: 'delegatedTo 仅适用于 required=false 且 status=blocked/unverified 的环境缺证',
+      });
+    }
     if (check.status === 'pass' && check.exitCode !== 0) {
       ctx.addIssue({ code: 'custom', path: ['exitCode'], message: 'pass check 必须具有 exitCode=0' });
     }
@@ -560,6 +705,15 @@ export const GateResultSchema = z.preprocess(
         ctx.addIssue({ code: 'custom', path: [field], message: `${field} 不能包含重复标识` });
       }
     }
+    const misplacedDelegations = result.checks
+      .filter((check) => check.delegatedTo && result.gateId !== 'implementation');
+    if (misplacedDelegations.length > 0) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['checks'],
+        message: 'delegatedTo 只允许由 implementation gate 声明',
+      });
+    }
   }),
 );
 export type GateResult = z.infer<typeof GateResultSchema>;
@@ -587,22 +741,25 @@ export interface CanonicalSpecWaiverContext {
 /**
  * 只读取人工确认前已经写入 canonical Spec 的显式风险接受条款。
  * Gate Agent 后补的 waiver 元数据不构成人工批准，不能作为事实源。
+ * P1 修复：排除 fenced code block，防止代码示例中的 [RISK_WAIVER] 被当真实授权。
  */
 export function parseCanonicalSpecWaivers(content: string): CanonicalWaiverDeclaration[] {
+  // 排除 fenced code block，防止 Spec 中代码示例里的 [RISK_WAIVER] 被误解析。
+  const cleaned = content.replace(/```[\s\S]*?```/g, '').replace(/~~~[\s\S]*?~~~/g, '');
   const declarations: CanonicalWaiverDeclaration[] = [];
   const ids = new Set<string>();
   let from = 0;
-  while (from < content.length) {
-    const markerIndex = content.indexOf(CANONICAL_WAIVER_MARKER, from);
+  while (from < cleaned.length) {
+    const markerIndex = cleaned.indexOf(CANONICAL_WAIVER_MARKER, from);
     if (markerIndex < 0) break;
     if (declarations.length >= 100) throw new Error('canonical Spec 的 RISK_WAIVER 不能超过 100 条');
     const afterMarker = markerIndex + CANONICAL_WAIVER_MARKER.length;
-    const remainder = content.slice(afterMarker);
+    const remainder = cleaned.slice(afterMarker);
     const braceOffset = remainder.search(/\{/);
     if (braceOffset < 0 || braceOffset > 120 || /[^\s`*'":-]/.test(remainder.slice(0, Math.max(0, braceOffset)))) {
       throw new Error('canonical Spec 的 [RISK_WAIVER] 后必须紧跟完整 JSON 对象');
     }
-    const json = extractBalancedJsonObject(content, afterMarker + braceOffset);
+    const json = extractBalancedJsonObject(cleaned, afterMarker + braceOffset);
     if (!json) throw new Error('canonical Spec 的 [RISK_WAIVER] JSON 未闭合');
     let raw: unknown;
     try {
@@ -854,7 +1011,10 @@ export function extractGateResultJsonCandidates(answer: string): string[] {
       continue;
     }
     const between = remainder.slice(0, braceOffset);
-    if (/[^\s`*'"]/.test(between)) {
+    // P1 修复：允许冒号、json fence 标记和加粗装饰出现在 [GATE_RESULT] 和 JSON 之间。
+    // 旧正则 /[^`*'"]/ 拒绝了冒号和 json fence，导致 [GATE_RESULT]: {...} 和
+    // [GATE_RESULT]\n```json\n{...} 被跳过。
+    if (/[^(\s`*'"\-:#!?.,;)\]a-z]/i.test(between)) {
       from = afterMarker;
       continue;
     }
@@ -914,7 +1074,25 @@ async function recoverGateResultFromEvidence(
         const id = (item as Record<string, unknown>).id;
         return typeof id === 'string' ? [id] : [];
       })
-      : [];
+      : Array.isArray(report.requirementTrace)
+        ? report.requirementTrace.flatMap((item) => {
+          if (!item || typeof item !== 'object') return [];
+          const id = (item as Record<string, unknown>).requirementId ?? (item as Record<string, unknown>).id;
+          return typeof id === 'string' ? [id] : [];
+        })
+        : Array.isArray(report.requirementImplementations)
+          ? report.requirementImplementations.flatMap((item) => {
+            if (!item || typeof item !== 'object') return [];
+            const id = (item as Record<string, unknown>).requirementId;
+            return typeof id === 'string' ? [id] : [];
+          })
+          : Array.isArray(report.requirementResults)
+            ? report.requirementResults.flatMap((item) => {
+              if (!item || typeof item !== 'object') return [];
+              const id = (item as Record<string, unknown>).requirementId ?? (item as Record<string, unknown>).id;
+              return typeof id === 'string' ? [id] : [];
+            })
+            : [];
 
   return {
     gateId,
@@ -973,7 +1151,7 @@ async function hydrateGateResultFromPrimaryArtifact(
   };
 
   const reportChecks = reportCheckCandidates(report);
-  if (reportChecks.length > 0 && result.checks.length === 0) {
+  if (reportChecks.length > 0) {
     const checks: GateResult['checks'] = reportChecks.map((item, index) => {
       const parsedCheck = GateCheckSchema.safeParse(item);
       if (!parsedCheck.success) {
@@ -984,7 +1162,30 @@ async function hydrateGateResultFromPrimaryArtifact(
       }
       return parsedCheck.data;
     });
-    next.checks = checks;
+    const artifactChecksById = new Map<string, GateResult['checks'][number]>();
+    for (const check of checks) {
+      if (artifactChecksById.has(check.id)) {
+        throw new Error(`门禁 artifact checks 包含重复 id：${check.id}`);
+      }
+      artifactChecksById.set(check.id, check);
+    }
+
+    for (const check of result.checks) {
+      const artifactCheck = artifactChecksById.get(check.id);
+      if (artifactCheck && !gateChecksSemanticallyEqual(check, artifactCheck)) {
+        const artifactOwnsChecks = artifact.kind === expected.kind
+          && (expected.kind === 'plan' || expected.kind === 'manifest');
+        if (!artifactOwnsChecks || !isCompatibleLaterCheckRerun(artifactCheck, check)) {
+          throw new Error(`门禁 artifact 与 Gate 结果的同 ID 检查证据不一致：${check.id}`);
+        }
+      }
+    }
+
+    const resultCheckIds = new Set(result.checks.map((check) => check.id));
+    next.checks = [
+      ...result.checks.map((check) => artifactChecksById.get(check.id) ?? check),
+      ...checks.filter((check) => !resultCheckIds.has(check.id)),
+    ];
   }
 
   // 审查类：artifact 是 findings 权威源，避免 GATE_RESULT 塞超长数组导致截断/污染
@@ -1029,6 +1230,54 @@ function reportCheckCandidates(report: Record<string, unknown>): unknown[] {
   if (Array.isArray(report.executedChecks)) return report.executedChecks;
   if (Array.isArray(report.targetedCheckResults)) return report.targetedCheckResults;
   return [];
+}
+
+/**
+ * Artifact 与 GATE_RESULT 会重复携带同一检查。命令与结论属于门禁语义，
+ * 耗时、时间戳、cwd 和日志 hash 属于单边可能缺省的执行元数据。
+ */
+function gateChecksSemanticallyEqual(
+  left: GateResult['checks'][number],
+  right: GateResult['checks'][number],
+): boolean {
+  return left.id === right.id
+    && isDeepStrictEqual(left.command, right.command)
+    && left.status === right.status
+    && left.required === right.required
+    && left.delegatedTo === right.delegatedTo
+    && left.exitCode === right.exitCode
+    // cwd 可以在其中一侧缺省；双方都声明时则属于命令语义，不能静默跨项目替换。
+    && (!left.cwd || !right.cwd || left.cwd === right.cwd);
+}
+
+/**
+ * 计划/实现 artifact 是其内嵌 checks 的事实源。Agent 有时会在写完 artifact 后，
+ * 用同一逻辑 ID 再跑一次更严格的校验并把新 argv 放进 GATE_RESULT；这不是证据冲突，
+ * 但也不能把两个命令的时间与 argv 拼成一条虚假记录。因此仅在结论完全相同、cwd
+ * 相同且 GATE_RESULT 确实晚于 artifact 记录时接受，并继续采用 artifact 原记录。
+ *
+ * 状态、required、exitCode、目录或时间顺序任一不一致仍 fail closed。
+ */
+function isCompatibleLaterCheckRerun(
+  artifactCheck: GateResult['checks'][number],
+  resultCheck: GateResult['checks'][number],
+): boolean {
+  if (artifactCheck.id !== resultCheck.id
+    || artifactCheck.status !== resultCheck.status
+    || artifactCheck.required !== resultCheck.required
+    || artifactCheck.delegatedTo !== resultCheck.delegatedTo
+    || artifactCheck.exitCode !== resultCheck.exitCode
+    || artifactCheck.cwd !== resultCheck.cwd
+    || !artifactCheck.finishedAt
+    || !resultCheck.startedAt
+    || !resultCheck.finishedAt) {
+    return false;
+  }
+  const artifactFinishedAt = Date.parse(artifactCheck.finishedAt);
+  const rerunStartedAt = Date.parse(resultCheck.startedAt);
+  const rerunFinishedAt = Date.parse(resultCheck.finishedAt);
+  return rerunStartedAt >= artifactFinishedAt
+    && rerunFinishedAt <= Date.now() + 5 * 60 * 1_000;
 }
 
 export async function parseGateResult(
@@ -1098,6 +1347,12 @@ export async function parseGateResult(
 export function validateGatePass(stepId: PipelineStepId, result: GateResult): void {
   if (result.artifacts.length === 0) throw new Error('质量门禁必须包含已落盘并可校验 hash 的 artifact');
   if (result.requirementIds.length === 0) throw new Error('质量门禁必须声明 canonical requirementIds');
+  const misplacedDelegations = result.checks
+    .filter((check) => check.delegatedTo && result.gateId !== 'implementation');
+  if (misplacedDelegations.length > 0) {
+    throw new Error('delegatedTo 只允许由 implementation gate 声明：'
+      + misplacedDelegations.map((check) => check.id).join('、'));
+  }
   const blocking = result.findings.filter((finding) =>
     (finding.severity === 'P0' || finding.severity === 'P1')
     && (finding.status === 'open' || (stepId !== 'architect' && finding.status === 'planned')));
@@ -1383,7 +1638,7 @@ export async function verifyGateArtifacts(
       }
       for (const check of result.checks) {
         const matched = parsedReportChecks.some((candidateCheck) =>
-          JSON.stringify(candidateCheck) === JSON.stringify(check));
+          gateChecksSemanticallyEqual(candidateCheck, check));
         if (!matched) throw new Error('QA 命令证据与 artifact 不一致：' + check.id);
       }
       validateVerificationCoverage(report, parsedReportChecks, result, artifact.path);
@@ -1610,7 +1865,11 @@ export async function assertGateLineage(
       requireMatch('projectFingerprint', context.projectFingerprint, '设计');
       if (context.stepStartFingerprint
         && context.stepStartFingerprint !== context.projectFingerprint) {
-        throw new Error('设计步骤执行期间项目快照发生变化；架构门禁必须保持源码只读');
+        throw new FingerprintDriftError(
+          'design',
+          'architect',
+          '设计步骤执行期间项目快照发生变化；架构门禁必须保持源码只读',
+        );
       }
       break;
     case 'dev': {
@@ -1733,6 +1992,22 @@ function validateDesignArtifact(
   }
   requireArrayField(report, 'allowedPaths', path, { nonEmpty: true });
   requireArrayField(report, 'testPlan', path, { nonEmpty: true });
+  const checks = parseArtifactChecks(
+    requireArrayField(report, 'checks', path, { nonEmpty: true }),
+    path,
+  );
+  const checkIds = checks.map((check) => check.id);
+  if (new Set(checkIds).size !== checkIds.length) {
+    throw new Error(`${path} 的 checks 包含重复 id`);
+  }
+  if (!checks.some((check) => check.required && check.status === 'pass' && check.exitCode === 0)) {
+    throw new Error(`${path} 的 checks 至少需要一项 required=true 的真实通过检查`);
+  }
+  for (const check of checks) {
+    if (!result.checks.some((candidate) => gateChecksSemanticallyEqual(candidate, check))) {
+      throw new Error(`设计 artifact 的检查未在 Gate 结果中完整声明：${check.id}`);
+    }
+  }
   if (report.status !== 'pass') {
     throw new Error(`设计 artifact 未通过：${path}`);
   }
@@ -1768,7 +2043,7 @@ function validateImplementationArtifact(
     path,
   );
   for (const check of targeted) {
-    if (!result.checks.some((candidate) => JSON.stringify(candidate) === JSON.stringify(check))) {
+    if (!result.checks.some((candidate) => gateChecksSemanticallyEqual(candidate, check))) {
       throw new Error(`实现 artifact 的目标检查未在 Gate 结果中完整声明：${check.id}`);
     }
   }
@@ -1825,9 +2100,12 @@ function validateRuntimeArtifact(
   const browserResults = Array.isArray(report.browserAndViewportResults)
     ? report.browserAndViewportResults : [];
   for (const browser of requiredBrowsers) {
+    // P1 修复：不只检查浏览器名称存在，还要求 status=pass。
+    // 旧代码 chromium/status=fail 也会算完成。
     if (!browserResults.some((entry) => !!entry && typeof entry === 'object' && !Array.isArray(entry)
-      && (entry as Record<string, unknown>).browser === browser)) {
-      throw new Error(`${path} 缺少必需浏览器证据：${String(browser)}`);
+      && (entry as Record<string, unknown>).browser === browser
+      && (entry as Record<string, unknown>).status === 'pass')) {
+      throw new Error(`${path} 缺少必需浏览器通过证据：${String(browser)}`);
     }
   }
   if (!Array.isArray(report.unverified)) throw new Error(`运行时 artifact unverified 必须是数组：${path}`);
@@ -2125,9 +2403,78 @@ export function latestGateRuns(runs: readonly GateRun[]): Map<GateId, GateRun> {
   const latest = new Map<GateId, GateRun>();
   for (const run of runs) {
     const current = latest.get(run.gateId);
-    if (!current || run.attempt > current.attempt) latest.set(run.gateId, run);
+    if (!current) {
+      latest.set(run.gateId, run);
+    } else if (run.attempt > current.attempt) {
+      // P1 修复：如果新 attempt 是 pass，直接覆盖（即使旧的是更高 attempt 的 fail）。
+      // 如果新 attempt 是 fail 但 attempt 更高，仍覆盖（记录最新状态）。
+      // 但如果新 attempt 是 fail 而旧的是 pass，不覆盖（保留最后一次 pass）。
+      if (run.status === 'pass' || current.status !== 'pass') {
+        latest.set(run.gateId, run);
+      }
+    }
   }
   return latest;
+}
+
+/**
+ * 返回每个 gate 最新一次 pass 的 run（用于完成时校验证据链）。
+ * 如果没有 pass 的 run，则不在返回的 Map 中。
+ */
+export function latestAcceptedGateRuns(runs: readonly GateRun[]): Map<GateId, GateRun> {
+  const latest = new Map<GateId, GateRun>();
+  for (const run of runs) {
+    if (run.status !== 'pass') continue;
+    const current = latest.get(run.gateId);
+    if (!current || run.attempt > current.attempt) {
+      latest.set(run.gateId, run);
+    }
+  }
+  return latest;
+}
+
+/**
+ * 返回最新门禁中仍未收敛的可选检查。
+ *
+ * 唯一可消除开发环境缺证的委派契约是：
+ * - implementation check 显式写入 delegatedTo=verification；
+ * - 最新 verification gate 在 implementation 之后记录且整体通过；
+ * - QA 以完全相同的 id、原始 argv 和 cwd 运行该检查，并以
+ *   required=true/status=pass/exitCode=0 提供证据；
+ * - 两个 gate 对应同一项目 fingerprint。
+ *
+ * 因此不会按 id 前缀、子串、摘要或“有一项 QA 通过”做模糊匹配。
+ * 无委派、委派未被最新 QA 精确覆盖，或其他 gate 的可选缺口均保留。
+ */
+export function unresolvedOptionalCheckGapIds(runs: readonly GateRun[]): string[] {
+  const latest = latestGateRuns(runs);
+  const gaps: string[] = [];
+  for (const sourceRun of latest.values()) {
+    for (const sourceCheck of sourceRun.result.checks) {
+      if (sourceCheck.required || sourceCheck.status === 'pass') continue;
+      let covered = false;
+      if (sourceRun.gateId === 'implementation'
+        && sourceCheck.delegatedTo === 'verification') {
+        const verification = latest.get('verification');
+        const targetCheck = verification?.result.checks
+          .find((check) => check.id === sourceCheck.id);
+        covered = !!verification
+          && verification.status === 'pass'
+          && verification.result.status === 'pass'
+          && Date.parse(verification.recordedAt) > Date.parse(sourceRun.recordedAt)
+          && !!sourceRun.projectFingerprint
+          && verification.projectFingerprint === sourceRun.projectFingerprint
+          && !!targetCheck
+          && targetCheck.required
+          && targetCheck.status === 'pass'
+          && targetCheck.exitCode === 0
+          && isDeepStrictEqual(targetCheck.command, sourceCheck.command)
+          && targetCheck.cwd === sourceCheck.cwd;
+      }
+      if (!covered) gaps.push(`${sourceRun.gateId}/${sourceCheck.id}`);
+    }
+  }
+  return gaps;
 }
 
 const GATE_SEQUENCE: readonly GateId[] = [
@@ -2211,6 +2558,9 @@ export function isFingerprintDriftError(error: unknown): error is FingerprintDri
 /** 从失败文案识别应退回的步骤（兼容旧错误、跨进程序列化）。 */
 export function rewindStepIdFromDriftMessage(error: string | undefined): PipelineStepId | undefined {
   if (!error) return undefined;
+  if (/设计步骤执行期间项目快照发生变化|架构门禁必须保持源码只读|重建设计证据/.test(error)) {
+    return 'architect';
+  }
   if (/implementation gate 不一致|重建实现证据|最新实现证据不一致|重新生成 implementation/.test(error)) {
     return 'dev';
   }
@@ -2404,12 +2754,16 @@ export function gateResultInstruction(stepId: PipelineStepId): string {
       startedAt: '2026-08-11T01:00:00.000Z',
       finishedAt: '2026-08-11T01:00:01.000Z',
     };
+  const artifactCheckField = gateId === 'design' ? 'checks'
+    : gateId === 'implementation' ? 'targetedCheckResults'
+      : gateId === 'verification' ? 'executedChecks'
+        : undefined;
   const example = JSON.stringify({
     gateId,
     status: 'pass',
     summary: '基于事实的结论',
     requirementIds: ['RQ-001'],
-    checks: [exampleCheck],
+    checks: artifactCheckField ? [] : [exampleCheck],
     evidence: ['绝对路径:行号、命令输出或运行时 artifact'],
     artifacts: [{
       path: `/absolute/project/.agent-os/evidence/workflow-id/${primary.fileName}`,
@@ -2428,12 +2782,22 @@ export function gateResultInstruction(stepId: PipelineStepId): string {
     'artifacts[].sha256 必须是文件内容的真实 SHA-256：恰好 64 位小写十六进制（/[a-f0-9]{64}/），禁止编造、截断或加长；用 node -e "crypto.createHash(\'sha256\').update(fs.readFileSync(path)).digest(\'hex\')" 计算。',
     'artifact 中的项目 fingerprint 必须来自 workflow_context.projectFingerprintBeforeStep，或实际运行 workflow_context.fingerprintCommand 后读取其 fingerprint；禁止用 Git commit hash、自行拼接或凭空生成。修改项目文件后必须重新运行该命令。',
     'requirementIds 必须逐项复制 workflow_context.canonicalRequirementIds，集合完全一致且不得增删、重命名或重复；主 artifact 的需求追踪/覆盖字段也必须使用同一组 ID。',
-    'findings 形状：{"id":"FIND-001","severity":"P1","status":"planned|open|resolved|waived","summary":"...","evidence":["绝对路径或定位"]}；severity 只能是 P0-P3，evidence 必须是数组。',
+    'findings 形状：{"id":"FIND-001","severity":"P0|P1|P2|P3","status":"planned|open|resolved|waived","summary":"...","evidence":["绝对路径或定位"],"category?":"correctness|security|reliability|architecture|performance|maintainability|testing|compatibility|scope|other","confidence?":"low|medium|high","exploitability?":"not-applicable|unreachable|conditional|reachable|unverified"}；category/confidence/exploitability 一旦填写必须使用上述枚举（禁止自造标签如 test-reliability）；evidence 必须是数组。',
     'status=waived 只允许引用人工确认前已写入 canonical Spec 的同 ID `[RISK_WAIVER]` 条款；GATE_RESULT 提供匹配的 owner/reason/scope/compensatingControl/expiresAt，approvedAt 与 approvalEvidence 由控制器绑定。Agent 不得新增、代批或伪造 waiver。',
-    'checks 形状：{id,command:string[],status:"pass|fail|blocked|unverified|skipped",required:boolean,exitCode,cwd,startedAt,finishedAt}；命令必须是原始 argv 数组，禁止用自然语言描述或 command 字符串。',
+    'checks 形状：{id,command:string[],status:"pass|fail|blocked|unverified|skipped",required:boolean,exitCode,cwd,startedAt,finishedAt,delegatedTo?}；命令必须是原始 argv 数组，禁止用自然语言描述或 command 字符串。',
+    gateId === 'implementation'
+      ? '仅因环境缺证而交给 QA 的 optional blocked/unverified check 可写 delegatedTo="verification"；仅有后续 verification gate 以完全相同 id、command argv 和 cwd 记录 required=true/status=pass/exitCode=0 才会消除该残余风险，不做模糊 ID 匹配。'
+      : gateId === 'verification'
+        ? '若 implementation check 显式 delegatedTo="verification"，必须在 QA executedChecks 中以完全相同 id、command argv 和 cwd 真实重跑，并记录 required=true/status=pass/exitCode=0；不得用相似 ID 或任意其他通过项替代。'
+        : 'delegatedTo 只允许 implementation 对 verification 声明；本门禁的 checks 必须省略该字段。',
     'checks[].startedAt/finishedAt 必须来自本轮真实执行，startedAt 不得早于 workflow_context.gateAttemptStartedAt（允许少量时钟偏差）；禁止复用旧轮次时间戳。',
-    '若主 artifact 已包含完整 findings/checks，GATE_RESULT 中可写空数组，由控制器从规范主 artifact 水合；不要复制超长报告。',
-    'status=pass 时不得包含 open/planned 的 P0/P1，也不得包含 required=true 且非 pass 的检查；设计以外步骤不得使用 planned。所有门禁都至少需要一项 required=true 的真实通过检查，每条命令都必须包含绝对 cwd 与起止时间。',
+    artifactCheckField
+      ? `${primary.fileName}.${artifactCheckField} 是本步骤检查的权威集合；GATE_RESULT.checks 不得重复其中任何 id，没有额外检查时必须写 []，由控制器水合。确需登记额外检查时只能使用新的唯一 id。`
+      : `${primary.fileName} 不承载本步骤的命令集合；GATE_RESULT.checks 必须保留真实的 artifact 校验、审查或运行探测命令，不得写空数组。`,
+    '审查、QA 或运行时主 artifact 已包含完整 findings 时，GATE_RESULT.findings 可以写 [] 由控制器水合；这不代表 checks 也应清空。',
+    stepId === 'architect'
+      ? '设计门禁 status=pass 时允许 findings 为 planned 的 P0/P1（交给开发闭环）；open 的 P0/P1 才阻断。不得包含 required=true 且非 pass 的检查。所有门禁都至少需要一项 required=true 的真实通过检查，每条命令都必须包含绝对 cwd 与起止时间。'
+      : 'status=pass 时不得包含 open/planned 的 P0/P1，也不得包含 required=true 且非 pass 的检查；设计以外步骤不得使用 planned。所有门禁都至少需要一项 required=true 的真实通过检查，每条命令都必须包含绝对 cwd 与起止时间。',
     stepId === 'review'
       ? '变更审查 pass 必须附带 validate-review-report 的真实命令、review-report artifact 和可定位 evidence；只有这些证据通过后才可另起一行输出 [APPROVED]。'
       : '',

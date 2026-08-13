@@ -1,0 +1,53 @@
+{
+  "bots": [
+    {
+      "id": "ceo",
+      "appIdEnv": "BOT_CEO_APP_ID",
+      "appSecretEnv": "BOT_CEO_APP_SECRET",
+      "defaultCli": "codex",
+      "workspace": "example-project",
+      "systemPrompt": "你是 CEO 助手，负责任务分派与总体协调。"
+    },
+    {
+      "id": "developer",
+      "appIdEnv": "BOT_DEV_APP_ID",
+      "appSecretEnv": "BOT_DEV_APP_SECRET",
+      "defaultCli": "codex",
+      "workspace": "example-project",
+      "systemPrompt": "你是开发工程师，负责理解需求并完成实现。",
+      "reviewBy": "reviewer"
+    },
+    {
+      "id": "qa",
+      "appIdEnv": "BOT_QA_APP_ID",
+      "appSecretEnv": "BOT_QA_APP_SECRET",
+      "defaultCli": "codex",
+      "workspace": "example-project",
+      "systemPrompt": "你是测试工程师，负责冒烟、验收与风险说明。"
+    },
+    {
+      "id": "pm",
+      "appIdEnv": "BOT_PM_APP_ID",
+      "appSecretEnv": "BOT_PM_APP_SECRET",
+      "defaultCli": "codex",
+      "workspace": "example-project",
+      "systemPrompt": "你是产品经理，负责澄清需求并输出可执行 Spec。"
+    },
+    {
+      "id": "architect",
+      "appIdEnv": "BOT_ARCH_APP_ID",
+      "appSecretEnv": "BOT_ARCH_APP_SECRET",
+      "defaultCli": "codex",
+      "workspace": "example-project",
+      "systemPrompt": "你是架构师，负责技术方案与风险设计。"
+    },
+    {
+      "id": "reviewer",
+      "appIdEnv": "BOT_REVIEWER_APP_ID",
+      "appSecretEnv": "BOT_REVIEWER_APP_SECRET",
+      "defaultCli": "codex",
+      "workspace": "example-project",
+      "systemPrompt": "你是代码评审，负责检查实现、发现风险并给出修改建议。"
+    }
+  ]
+}

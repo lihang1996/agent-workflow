@@ -1,6 +1,6 @@
 import { codexMcpFlags } from '../mcp/config.js';
 import {
-  codexSandboxFor,
+  codexRuntimePlan,
   instructionsForExecutionPolicy,
   promptForExecutionPolicy,
 } from './execution-policy.js';
@@ -98,38 +98,50 @@ export class CodexAdapter implements CliAdapter {
   /** 新开 Codex 会话。 */
   buildArgs(prompt: string, options: CliBuildOptions = {}): string[] {
     const policy = options.executionPolicy ?? 'standard';
+    const runtime = codexRuntimePlan(policy, options.localNetworkAccess === true);
+    options.onCapabilityExpectation?.(runtime.expectation);
     return [
       '--ask-for-approval',
       codexApprovalPolicyFor(policy),
       '-c',
-      `developer_instructions=${JSON.stringify(instructionsForExecutionPolicy(policy, options.approvedScope))}`,
+      `developer_instructions=${JSON.stringify(instructionsForExecutionPolicy(
+        policy,
+        options.approvedScope,
+        runtime.expectation,
+      ))}`,
+      ...runtime.prefixArgs,
       'exec',
       '--skip-git-repo-check',
       '--json',
-      '--sandbox',
-      codexSandboxFor(policy),
-      ...mcpFlagsFor(policy),
-      promptForExecutionPolicy(prompt, policy, options.approvedScope),
+      ...sandboxFlagArgs(runtime.sandboxFlag),
+      ...mcpFlagsFor(policy, options.mcpContextEnv),
+      promptForExecutionPolicy(prompt, policy, options.approvedScope, runtime.expectation),
     ];
   }
 
-  /** 恢复会话；--sandbox 必须挂在 exec 上。 */
+  /** 恢复会话；若仍使用旧 `--sandbox`，必须挂在 exec 上。 */
   buildResumeArgs(prompt: string, sessionId: string, options: CliBuildOptions = {}): string[] {
     const policy = options.executionPolicy ?? 'standard';
+    const runtime = codexRuntimePlan(policy, options.localNetworkAccess === true);
+    options.onCapabilityExpectation?.(runtime.expectation);
     return [
       '--ask-for-approval',
       codexApprovalPolicyFor(policy),
       '-c',
-      `developer_instructions=${JSON.stringify(instructionsForExecutionPolicy(policy, options.approvedScope))}`,
+      `developer_instructions=${JSON.stringify(instructionsForExecutionPolicy(
+        policy,
+        options.approvedScope,
+        runtime.expectation,
+      ))}`,
+      ...runtime.prefixArgs,
       'exec',
       '--skip-git-repo-check',
-      '--sandbox',
-      codexSandboxFor(policy),
-      ...mcpFlagsFor(policy),
+      ...sandboxFlagArgs(runtime.sandboxFlag),
+      ...mcpFlagsFor(policy, options.mcpContextEnv),
       'resume',
       '--json',
       sessionId,
-      promptForExecutionPolicy(prompt, policy, options.approvedScope),
+      promptForExecutionPolicy(prompt, policy, options.approvedScope, runtime.expectation),
     ];
   }
 
@@ -156,6 +168,12 @@ export class CodexAdapter implements CliAdapter {
         (typeof event.error?.message === 'string' && event.error.message)
         || (typeof event.message === 'string' && event.message)
         || 'Codex 执行失败';
+      // Codex CLI 有内置重连机制；"Reconnecting..." 消息表示正在重试，不是最终失败。
+      // 只有在明确不可恢复时才返回 error 事件，否则让重连机制完成其工作。
+      if (message.includes('Reconnecting')) {
+        console.warn(`[Codex] ${message}（等待自动重连）`);
+        return [];
+      }
       return [{
         type: 'error',
         message,
@@ -282,14 +300,18 @@ export class CodexAdapter implements CliAdapter {
   }
 }
 
-function mcpFlagsFor(policy: CliExecutionPolicy): string[] {
+function sandboxFlagArgs(sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'): string[] {
+  return sandbox ? ['--sandbox', sandbox] : [];
+}
+
+function mcpFlagsFor(policy: CliExecutionPolicy, contextEnv?: Record<string, string>): string[] {
   if (policy === 'input-only') {
     return ['--ignore-user-config', '--ignore-rules', '--ephemeral', '-c', 'mcp_servers={}'];
   }
   if (policy === 'read-only') {
     return ['--ignore-user-config', '-c', 'mcp_servers={}'];
   }
-  return codexMcpFlags();
+  return codexMcpFlags(contextEnv);
 }
 
 function codexApprovalPolicyFor(policy: CliExecutionPolicy): 'untrusted' | 'never' {

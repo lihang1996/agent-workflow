@@ -17,6 +17,7 @@ export function snapshotActiveRuns(ctx: AppContext): PersistedActiveRun[] {
         botId: run.bot.id,
         cardId: run.cardId,
         cardTitle: run.cardTitle,
+        ...(run.workflowId ? { workflowId: run.workflowId } : {}),
         progress: Math.min(90, Math.round(snap.elapsedMs / 1_000)),
         detail: snap.current,
         activities: snap.activities.slice(0, 5).map((a) => a.label),
@@ -52,24 +53,28 @@ export async function flushPersistActiveRuns(ctx: AppContext): Promise<void> {
 }
 
 /** 构造「已中断」失败/取消卡片。 */
-export function interruptedCard(run: ActiveRun, detail: string) {
+export function interruptedCard(run: ActiveRun, detail: string, recoverable = false) {
   return buildTaskCard({
     title: run.cardTitle,
-    status: 'cancelled',
+    status: recoverable ? 'blocked' : 'cancelled',
     detail,
     progress: run.tracker.snapshot(),
   });
 }
 
 /** 把进行中任务卡片刷成取消；已成功的跳过。 */
-export async function finishInterruptedRun(run: ActiveRun, detail: string): Promise<void> {
+export async function finishInterruptedRun(
+  run: ActiveRun,
+  detail: string,
+  recoverable = false,
+): Promise<void> {
   if (run.terminalStatus) return;
   run.terminalStatus = 'interrupted';
   try {
-    await run.cardUpdater.finish(interruptedCard(run, detail));
+    await run.cardUpdater.finish(interruptedCard(run, detail, recoverable));
   } catch {
     try {
-      await run.bot.updateCard(run.cardId, interruptedCard(run, detail));
+      await run.bot.updateCard(run.cardId, interruptedCard(run, detail, recoverable));
     } catch {
       await run.cardUpdater.cancel();
     }
@@ -91,10 +96,13 @@ export async function reconcileOrphanedCards(ctx: AppContext): Promise<void> {
       continue;
     }
     try {
+      const recoverable = !!orphan.workflowId;
       await bot.updateCard(orphan.cardId, buildTaskCard({
         title: orphan.cardTitle,
-        status: 'cancelled',
-        detail: '上次服务异常退出，任务已中断',
+        status: recoverable ? 'blocked' : 'cancelled',
+        detail: recoverable
+          ? '上次服务异常退出；持久化流水线会自动恢复，并从当前步骤重新执行。'
+          : '上次服务异常退出，任务已中断',
       }));
       console.log(`[任务] 已收尾遗留卡片 bot=${orphan.botId} card=${orphan.cardId}`);
     } catch (error) {
@@ -127,7 +135,9 @@ export async function shutdownActiveRuns(ctx: AppContext, reason: string): Promi
     `[任务] 停机收尾：共 ${entries.length} 个任务，中断 ${toInterrupt.length} 个（已有终态 ${entries.length - toInterrupt.length} 个跳过）`,
   );
   for (const [, run] of toInterrupt) {
-    run.interruptReason = reason;
+    run.interruptReason = run.workflowId
+      ? `${reason}；持久化流水线会在服务恢复后从当前步骤重新执行。`
+      : reason;
     run.controller.abort();
   }
 
@@ -139,7 +149,11 @@ export async function shutdownActiveRuns(ctx: AppContext, reason: string): Promi
   for (const [sessionId, run] of entries) {
     if (run.heartbeat) clearInterval(run.heartbeat);
     if (!run.terminalStatus) {
-      await finishInterruptedRun(run, reason);
+      await finishInterruptedRun(
+        run,
+        run.interruptReason ?? reason,
+        !!run.workflowId,
+      );
     }
     ctx.activeRuns.delete(sessionId);
     try {

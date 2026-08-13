@@ -51,6 +51,10 @@ description: "在交付包含浏览器界面、HTTP API、公开输入、缓存�
 `browserAndViewportResults`、`accessibilityResults`、`httpContractResults`、
 `securityAndCacheResults`、`performanceResults`、`evidenceArtifacts`、`findings`、`waivers`、
 `unverified` 和 `status`。
+`findings[]` 必须与控制器对齐：`severity=P0|P1|P2|P3`，`status=open|resolved|waived`
+（运行时审计不得保留 `planned`），可选 `category` 只能是
+`correctness|security|reliability|architecture|performance|maintainability|testing|compatibility|scope|other`，
+可选 `confidence=low|medium|high`，安全类 P0/P1 还需合法 `exploitability`。
 `verificationHash` 必须等于最新 `verification-report.json` 的文件 SHA-256，
 `projectFingerprint` 必须等于本轮运行时审计的项目快照，`buildHash` 必须等于该 QA 报告中
 登记的 `buildHash`；有独立构建产物时使用 `workflow_context.hashPathCommandPrefix` 复核实际

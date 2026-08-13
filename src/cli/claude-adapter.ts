@@ -139,12 +139,13 @@ function parseStats(event: ClaudeEvent): CliRunStats | undefined {
     : undefined;
 }
 
-function outputArgs(prompt: string, policy: CliExecutionPolicy, approvedScope?: string): string[] {
+function outputArgs(prompt: string, options: CliBuildOptions = {}): string[] {
+  const policy = options.executionPolicy ?? 'standard';
   return [
     "-p",
-    promptForExecutionPolicy(prompt, policy, approvedScope),
+    promptForExecutionPolicy(prompt, policy, options.approvedScope),
     '--append-system-prompt',
-    instructionsForExecutionPolicy(policy, approvedScope),
+    instructionsForExecutionPolicy(policy, options.approvedScope),
     "--output-format",
     "stream-json",
     "--verbose",
@@ -157,7 +158,7 @@ function outputArgs(prompt: string, policy: CliExecutionPolicy, approvedScope?: 
     ...(policy === 'input-only' ? [] : ['--settings', ensureClaudePermissionSettingsFile()]),
     ...(policy === 'read-only' || policy === 'input-only'
       ? ['--mcp-config', '{"mcpServers":{}}', '--strict-mcp-config']
-      : claudeMcpFlags()),
+      : claudeMcpFlags(options.mcpContextEnv)),
   ];
 }
 
@@ -179,14 +180,14 @@ export class ClaudeAdapter implements CliAdapter {
   readonly displayName = "Claude Code";
 
   buildArgs(prompt: string, options: CliBuildOptions = {}): string[] {
-    return outputArgs(prompt, options.executionPolicy ?? 'standard', options.approvedScope);
+    return outputArgs(prompt, options);
   }
 
   buildResumeArgs(prompt: string, sessionId: string, options: CliBuildOptions = {}): string[] {
     return [
       "--resume",
       sessionId,
-      ...outputArgs(prompt, options.executionPolicy ?? 'standard', options.approvedScope),
+      ...outputArgs(prompt, options),
     ];
   }
 

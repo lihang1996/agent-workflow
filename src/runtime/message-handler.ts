@@ -11,6 +11,7 @@ import { collabTopicKey } from '../core/collab.js';
 import { requestTaskAbort } from '../core/task-abort.js';
 import { assertWorkdir } from '../core/workdir.js';
 import { isDeliveryMutationTask } from '../core/delivery-policy.js';
+import { DEFAULT_PIPELINE_STEPS } from '../core/pipeline.js';
 import {
   formatScheduleInterval,
   formatScheduleRunStatus,
@@ -30,14 +31,16 @@ import {
   canControlOwnedResource,
   isAuthorizedOperator,
 } from '../core/access.js';
+import { IdentityRegistry, type UserIdentity } from '../core/identity-registry.js';
 import { resolveMentions } from '../im/message-parser.js';
-import { isAddressedToBot, type Bot, type IncomingMessage } from '../im/lark.js';
+import { isAddressedToBot, type Bot, type CardAction, type IncomingMessage } from '../im/lark.js';
 import {
   buildApprovalCard,
   buildQuestionnaireCard,
   buildSpecConfirmationCard,
   buildSpecReviewCard,
   buildSpecStatusCard,
+  buildStepBlockedActionCard,
 } from '../im/workflow-card.js';
 import type { AppContext } from './app-context.js';
 import {
@@ -47,7 +50,12 @@ import {
 import { startCliTask } from './cli-task.js';
 import { runCollabReview } from './collab-runner.js';
 import { rewindStepIdFromDriftMessage } from '../core/quality-gates.js';
+import {
+  findMisroutedEnvironmentBlock,
+  requiresTestResourceAuthorization,
+} from '../core/step-result.js';
 import { assertManualWorkflowRetryAllowed } from '../core/workflow-store.js';
+import { processRuntimeSourceGuard } from '../core/runtime-source-guard.js';
 import {
   abortBlockedWorkflow,
   handOffBlockedWorkflowIfQualityFix,
@@ -87,7 +95,15 @@ export async function handleMessage(
     console.log(`[忽略] bot=${bot.id} 未被 @`);
     return;
   }
-  if (!isAuthorizedOperator({ senderOpenId: msg.senderOpenId, chatType: msg.chatType })) {
+  const operator = messageIdentity(msg);
+  const identities = ctx.identities ?? (ctx.identities = new IdentityRegistry());
+  await identities.observe(operator);
+  if (!isAuthorizedOperator({
+    senderOpenId: msg.senderOpenId,
+    senderUserId: msg.senderUserId,
+    senderUnionId: msg.senderUnionId,
+    chatType: msg.chatType,
+  }, identities)) {
     console.warn(`[拒绝] bot=${bot.id} 未授权用户 sender=${msg.senderOpenId || '(空)'}`);
     await bot.reply(msg.messageId, '当前用户没有操作这个 Agent OS 的权限。', !!msg.threadId || !!msg.rootId);
     return;
@@ -260,7 +276,7 @@ export async function handleMessage(
     try {
       const questionnaire = await ctx.questionnaires.get(command.arg.trim());
       if (!questionnaire) throw new Error(`问卷不存在: ${command.arg.trim()}`);
-      assertQuestionnaireAccess(questionnaire, msg.senderOpenId, msg.chatId, topicIdOf(msg));
+      assertQuestionnaireAccess(ctx, questionnaire, operator, msg.chatId, topicIdOf(msg));
       await bot.replyCard(msg.messageId, buildQuestionnaireCard(questionnaire), hasThread);
     } catch (error) {
       await bot.reply(msg.messageId, (error as Error).message, hasThread);
@@ -297,7 +313,7 @@ export async function handleMessage(
       try {
         const spec = ctx.specs.get(specId);
         if (!spec || spec.chatId !== msg.chatId || spec.topicId !== topicIdOf(msg)) throw new Error(`找不到本话题 Spec：${specId}`);
-        assertSpecOwner(spec.ownerOpenId, msg.senderOpenId);
+        assertSpecOwner(ctx, spec.ownerOpenId, operator);
         const published = await publishSpecToDoc(ctx, spec.id);
         await bot.replyCard(msg.messageId, buildSpecReviewCard(published), hasThread);
       } catch (error) {
@@ -575,7 +591,7 @@ export async function handleMessage(
         return;
       }
       try {
-        assertCanControlOwnedResource(job.ownerOpenId, msg.senderOpenId);
+        assertCanControlOwnedResource(job.ownerOpenId, operator, ctx.identities);
         if (operation === 'remove') {
           if (job.lastStatus === 'running') throw new Error('定时任务正在执行，请等待本轮结束或先停止对应任务卡片。');
           await ctx.schedules.remove(job.id);
@@ -690,34 +706,59 @@ export async function handleMessage(
       try {
         const workflow = ctx.workflows.get(workflowId);
         if (!workflow) throw new Error(`工作流不存在: ${workflowId}`);
-        assertCanControlOwnedResource(workflow.message.senderOpenId, msg.senderOpenId);
+        assertCanControlOwnedResource(workflow.message.senderOpenId, operator, ctx.identities);
         if (workflow.status === 'failed') {
           assertManualWorkflowRetryAllowed(workflow);
-          const rewindTo = rewindStepIdFromDriftMessage(workflow.error);
+          const currentStepId = workflow.stepIds[workflow.nextStepIndex];
+          const misrouted = findMisroutedEnvironmentBlock(currentStepId, workflow.priorOutputs);
+          const requiresResourceApproval = !!misrouted && requiresTestResourceAuthorization([
+            misrouted.reason,
+            workflow.priorOutputs[`blocked_${misrouted.sourceStepId}`],
+          ].filter(Boolean).join('\n'));
+          const driftRewindTo = rewindStepIdFromDriftMessage(workflow.error);
+          const rewindTo = misrouted?.sourceStepId ?? driftRewindTo;
           const nextStepIndex = rewindTo && workflow.stepIds.includes(rewindTo)
             ? workflow.stepIds.indexOf(rewindTo)
             : workflow.nextStepIndex;
+          const nextPrior = { ...workflow.priorOutputs };
+          if (misrouted) {
+            delete nextPrior.quality_fix_request;
+            delete nextPrior.blocked_workdir;
+          } else if (driftRewindTo) {
+            nextPrior.fingerprint_drift = workflow.error ?? `退回 ${driftRewindTo} 重建证据`;
+          }
           const restored = await ctx.workflows.updateIfStatus(workflowId, 'failed', {
-            status: 'ready',
-            error: undefined,
+            status: requiresResourceApproval ? 'awaiting_step_unblock' : 'ready',
+            error: requiresResourceApproval ? misrouted?.reason : undefined,
             nextStepIndex,
-            ...(rewindTo ? {
-              priorOutputs: {
-                ...workflow.priorOutputs,
-                fingerprint_drift: workflow.error ?? `退回 ${rewindTo} 重建证据`,
-              },
-            } : {}),
+            ...(misrouted || driftRewindTo ? { priorOutputs: nextPrior } : {}),
           });
           if (!restored) throw new Error(`工作流当前状态为 ${ctx.workflows.get(workflowId)?.status ?? 'unknown'}，无法重试。`);
+          if (requiresResourceApproval) {
+            await resendBlockedCard(ctx, workflowId);
+            await bot.reply(
+              msg.messageId,
+              `检测到旧版本曾把 QA 环境阻塞误转开发；已恢复到 ${misrouted?.sourceStepId}，请在新卡片确认隔离测试库后授权重试。`,
+              hasThread,
+            );
+            return;
+          }
           const stepName = restored.stepIds[restored.nextStepIndex] ?? '(结束)';
-          const hint = rewindTo
-            ? `（检测到证据指纹漂移，已退回 ${rewindTo} 重建后再继续）`
-            : '';
-          await bot.reply(
-            msg.messageId,
-            `工作流已从失败恢复，正在从步骤 ${stepName} 继续…${hint}`,
-            hasThread,
-          );
+          const hint = misrouted
+            ? `（检测到环境阻塞曾被误转开发，已回到 ${misrouted.sourceStepId} 重试）`
+            : driftRewindTo
+              ? `（检测到证据指纹漂移，已退回 ${driftRewindTo} 重建后再继续）`
+              : '';
+          // P1 修复：通知失败不应阻止续跑；workflow 已在 ready，续跑必须执行。
+          try {
+            await bot.reply(
+              msg.messageId,
+              `工作流已从失败恢复，正在从步骤 ${stepName} 继续…${hint}`,
+              hasThread,
+            );
+          } catch (notifyError) {
+            console.error('[工作流] retry 通知发送失败，仍继续续跑:', (notifyError as Error).message);
+          }
           void continueDeliveryWorkflow(ctx, workflowId).catch(async (error) => {
             const message = (error as Error).message;
             console.error(`[工作流] retry 续跑失败:`, message);
@@ -917,13 +958,11 @@ function buildHelpText(bot: Bot): string {
 /** 卡片「停止任务」按钮：仅发起人可停。 */
 export async function handleCardAction(
   ctx: AppContext,
-  action: {
-    operatorOpenId: string;
-    messageId: string;
-    value: Record<string, unknown>;
-    formValue: Record<string, unknown>;
-  },
+  action: CardAction,
 ) {
+  const operator = cardActionIdentity(action);
+  const identities = ctx.identities ?? (ctx.identities = new IdentityRegistry());
+  await identities.observe(operator);
   if (
     action.value.action === 'approve_high_risk'
     || action.value.action === 'reject_high_risk'
@@ -934,7 +973,7 @@ export async function handleCardAction(
       let approval = ctx.approvals.get(approvalId);
       if (!approval) throw new Error('审批不存在或已被删除。');
       try {
-        assertOwnedBy(approval.ownerOpenId, action.operatorOpenId);
+        assertOwnedBy(approval.ownerOpenId, operator, ctx.identities);
       } catch {
         return { toast: { type: 'warning' as const, content: '只有指定负责人可以处理该审批。' } };
       }
@@ -945,7 +984,18 @@ export async function handleCardAction(
         throw new Error('只能在最初绑定的审批卡上处理该任务。');
       }
       if (action.value.action === 'reject_high_risk') {
-        const rejected = await ctx.approvals.reject(approval.id, action.operatorOpenId);
+        const rejected = await ctx.approvals.reject(
+          approval.id,
+          action.operatorOpenId,
+          (ownerOpenId) => {
+            try {
+              assertOwnedBy(ownerOpenId, operator, ctx.identities);
+              return true;
+            } catch {
+              return false;
+            }
+          },
+        );
         await settleApprovalSchedule(ctx, rejected, 'skipped', '负责人拒绝审批').catch((error) => {
           console.error(`[审批] ${rejected.id} 拒绝结算失败:`, sanitizeErrorForLog(error));
         });
@@ -973,7 +1023,7 @@ export async function handleCardAction(
           card: { type: 'raw' as const, data: buildApprovalCard(approval) },
         };
       }
-      const executing = await executeApprovedAction(ctx, approval.id, action.operatorOpenId);
+      const executing = await executeApprovedAction(ctx, approval.id, operator);
       if (executing.status === 'failed') {
         return {
           toast: { type: 'error' as const, content: `启动失败：${executing.executionError ?? '未知错误'}，可在卡片上重试。` },
@@ -1006,7 +1056,7 @@ export async function handleCardAction(
       if (spec.status !== 'in_review') throw new Error(`当前 Spec 状态为 ${spec.status}，无法处理评审。`);
 
       if (action.value.action === 'approve_spec_review') {
-        assertSpecApprovalAuthority(spec, action.operatorOpenId);
+        assertSpecApprovalAuthority(ctx, spec, operator);
         const approved = await approveSpecReview(ctx, spec.id);
         return {
           toast: { type: 'success' as const, content: '产品评审已通过，内部交付小队开始执行。' },
@@ -1014,7 +1064,7 @@ export async function handleCardAction(
         };
       }
 
-      assertSpecOwner(spec.ownerOpenId, action.operatorOpenId);
+      assertSpecOwner(ctx, spec.ownerOpenId, operator);
       const comment = typeof action.formValue.reviewComment === 'string'
         ? action.formValue.reviewComment.trim()
         : '';
@@ -1039,7 +1089,7 @@ export async function handleCardAction(
     try {
       const spec = ctx.specs.get(specId);
       if (!spec) throw new Error('Spec 不存在或已被删除。');
-      assertSpecApprovalAuthority(spec, action.operatorOpenId);
+      assertSpecApprovalAuthority(ctx, spec, operator);
       assertCurrentSpecCard(spec, action.value);
       await confirmSpecAndStartDelivery(ctx, spec.id);
       const latest = ctx.specs.get(specId);
@@ -1061,7 +1111,7 @@ export async function handleCardAction(
     try {
       const spec = ctx.specs.get(specId);
       if (!spec) throw new Error('Spec 不存在或已被删除。');
-      assertSpecOwner(spec.ownerOpenId, action.operatorOpenId);
+      assertSpecOwner(ctx, spec.ownerOpenId, operator);
       assertCurrentSpecCard(spec, action.value);
       const published = await publishSpecToDoc(ctx, spec.id);
       return {
@@ -1084,9 +1134,9 @@ export async function handleCardAction(
       const spec = ctx.specs.get(specId);
       if (!spec) throw new Error('Spec 不存在或已被删除。');
       if (action.value.action === 'confirm_spec') {
-        assertSpecApprovalAuthority(spec, action.operatorOpenId);
+        assertSpecApprovalAuthority(ctx, spec, operator);
       } else {
-        assertSpecOwner(spec.ownerOpenId, action.operatorOpenId);
+        assertSpecOwner(ctx, spec.ownerOpenId, operator);
       }
       assertCurrentSpecCard(spec, action.value);
       if (spec.status !== 'pending_confirmation') {
@@ -1129,7 +1179,7 @@ export async function handleCardAction(
     try {
       const questionnaire = await ctx.questionnaires.get(questionnaireId);
       if (!questionnaire) throw new Error('问卷不存在或已被删除。');
-      assertQuestionnaireAccess(questionnaire, action.operatorOpenId);
+      assertQuestionnaireAccess(ctx, questionnaire, operator);
       assertCurrentQuestionnaireCard(questionnaire, action.value);
       const answers: Record<string, string | string[]> = {};
       for (const question of questionnaire.questions) {
@@ -1162,6 +1212,7 @@ export async function handleCardAction(
   if (
     action.value.action === 'retry_blocked_step'
     || action.value.action === 'retry_blocked_step_with_workdir'
+    || action.value.action === 'authorize_test_resource_and_retry'
     || action.value.action === 'abort_blocked_workflow'
   ) {
     const workflowId = typeof action.value.workflowId === 'string' ? action.value.workflowId : '';
@@ -1169,7 +1220,7 @@ export async function handleCardAction(
     try {
       const workflow = ctx.workflows.get(workflowId);
       if (!workflow) throw new Error('工作流不存在或已被删除。');
-      assertCanControlOwnedResource(workflow.message.senderOpenId, action.operatorOpenId);
+      assertCanControlOwnedResource(workflow.message.senderOpenId, operator, ctx.identities);
 
       // 防止旧阻塞卡重放到新阻塞步骤：必须携带 stepId + blockVersion 且与当前一致
       const cardStepId = typeof action.value.stepId === 'string' ? action.value.stepId : '';
@@ -1177,16 +1228,43 @@ export async function handleCardAction(
       if (!cardStepId || !cardBlockVersion) {
         throw new Error('这张阻塞卡缺少版本信息，请重新触发阻塞或联系管理员。');
       }
-      if (workflow.status === 'awaiting_step_unblock') {
-        const currentStepId = workflow.stepIds[workflow.nextStepIndex];
-        if (cardStepId !== currentStepId || cardBlockVersion !== workflow.updatedAt) {
-          throw new Error('这张阻塞卡已过期，流水线当前阻塞步骤与卡片不匹配。');
-        }
+      const cardStepTitle = DEFAULT_PIPELINE_STEPS.find((step) => step.id === cardStepId)?.title
+        ?? cardStepId;
+      if (workflow.status !== 'awaiting_step_unblock') {
+        return {
+          toast: { type: 'info' as const, content: `流水线当前状态为 ${workflow.status}，旧阻塞卡已失效。` },
+          card: {
+            type: 'raw' as const,
+            data: buildStepBlockedActionCard({
+              stepTitle: cardStepTitle,
+              state: 'inactive',
+              detail: `流水线当前状态为 ${workflow.status}，未重复执行任何操作。`,
+            }),
+          },
+        };
+      }
+      const currentStepId = workflow.stepIds[workflow.nextStepIndex];
+      if (cardStepId !== currentStepId || cardBlockVersion !== workflow.updatedAt) {
+        throw new Error('这张阻塞卡已过期，流水线当前阻塞步骤与卡片不匹配。');
       }
 
       if (action.value.action === 'abort_blocked_workflow') {
         await abortBlockedWorkflow(ctx, workflowId);
-        return { toast: { type: 'info' as const, content: '已终止阻塞中的流水线。' } };
+        return {
+          toast: { type: 'info' as const, content: '已终止阻塞中的流水线。' },
+          card: {
+            type: 'raw' as const,
+            data: buildStepBlockedActionCard({
+              stepTitle: cardStepTitle,
+              state: 'aborted',
+            }),
+          },
+        };
+      }
+
+      // 陈旧进程不能先把卡片切成“重试中”再异步失败；新进程校验通过后才接受重试。
+      if (workflow.priorOutputs.runtime_source_changed !== undefined) {
+        await (ctx.runtimeSourceGuard ?? processRuntimeSourceGuard).assertCurrent();
       }
 
       // 代码缺陷误进绑目录卡：点「重试」也改为记 bug 并移交开发/架构
@@ -1196,10 +1274,65 @@ export async function handleCardAction(
             type: 'info' as const,
             content: '这是代码缺陷而非目录问题，已转交开发/架构修复。',
           },
+          card: {
+            type: 'raw' as const,
+            data: buildStepBlockedActionCard({
+              stepTitle: cardStepTitle,
+              state: 'rerouted',
+              detail: '这是代码缺陷而非目录问题，已转交开发/架构修复。',
+            }),
+          },
+        };
+      }
+
+      if (action.value.action === 'authorize_test_resource_and_retry') {
+        // migration/TRUNCATE/DROP 属于高风险操作，只认当前负责人；普通白名单不能代批。
+        assertOwnedBy(workflow.message.senderOpenId, operator, ctx.identities);
+        const authorizationEvidence = [
+          workflow.error,
+          workflow.priorOutputs.quality_fix_request,
+          ...Object.entries(workflow.priorOutputs)
+            .filter(([key]) => key.startsWith('blocked_'))
+            .map(([, value]) => value),
+        ].filter(Boolean).join('\n');
+        if (!requiresTestResourceAuthorization(authorizationEvidence)) {
+          throw new Error('当前阻塞不涉及 migration/TRUNCATE/DROP 等测试资源操作，不能附加该授权。');
+        }
+        const initiator = ctx.botsById.get(workflow.initiatorBotId);
+        runWorkflowContinuation(
+          resumeBlockedWorkflowStep(ctx, workflowId, { authorizeTestResource: true }),
+          `授权隔离测试资源并重试 workflow=${workflowId}`,
+          (error) => {
+            notifyBlockedRetryFailure(
+              ctx,
+              workflowId,
+              initiator,
+              action.messageId,
+              `授权后的 QA 重试失败：${error.message}`,
+            );
+          },
+        );
+        return {
+          toast: {
+            type: 'info' as const,
+            content: '已授权本流水线对通过隔离预检的测试资源执行迁移/清理，正在重试 QA。',
+          },
+          card: {
+            type: 'raw' as const,
+            data: buildStepBlockedActionCard({
+              stepTitle: cardStepTitle,
+              state: 'authorized-retrying',
+              detail: '授权仅用于当前工作流中通过隔离预检的测试资源；开发库和生产库仍会被拒绝。',
+            }),
+          },
         };
       }
 
       const workdir = action.value.action === 'retry_blocked_step_with_workdir'
+        && !findMisroutedEnvironmentBlock(
+          workflow.stepIds[workflow.nextStepIndex],
+          workflow.priorOutputs,
+        )
         ? (typeof action.value.workdir === 'string' && action.value.workdir.trim()
           ? action.value.workdir.trim()
           : workflow.priorOutputs.blocked_workdir)
@@ -1209,18 +1342,38 @@ export async function handleCardAction(
         resumeBlockedWorkflowStep(ctx, workflowId, workdir ? { workdir } : undefined),
         `重试阻塞步骤 workflow=${workflowId}`,
         (error) => {
-          // 异步失败时通知飞书用户，避免只写终端
-          initiator?.reply(
+          notifyBlockedRetryFailure(
+            ctx,
+            workflowId,
+            initiator,
             action.messageId,
             `重试阻塞步骤失败：${error.message}`,
-            true,
-          ).catch(() => undefined);
+          );
         },
       );
+      const authorizationEvidence = [
+        workflow.error,
+        workflow.priorOutputs.quality_fix_request,
+        ...Object.entries(workflow.priorOutputs)
+          .filter(([key]) => key.startsWith('blocked_'))
+          .map(([, value]) => value),
+      ].filter(Boolean).join('\n');
       return {
         toast: {
           type: 'info' as const,
           content: workdir ? `已绑定 ${workdir}，正在重试当前步骤…` : '正在按当前话题目录重试当前步骤…',
+        },
+        card: {
+          type: 'raw' as const,
+          data: buildStepBlockedActionCard({
+            stepTitle: cardStepTitle,
+            state: 'retrying',
+            detail: workdir
+              ? `已绑定目录 ${workdir}。`
+              : requiresTestResourceAuthorization(authorizationEvidence)
+                ? '本次是普通重试，未附加 migration/TRUNCATE/DROP 测试资源授权；需要时流水线会再次请求负责人确认。'
+                : '正在使用当前话题绑定的项目目录重新执行。',
+          }),
         },
       };
     } catch (error) {
@@ -1240,7 +1393,7 @@ export async function handleCardAction(
   if (!run) {
     return { toast: { type: 'info' as const, content: '任务已经结束，无需再次停止。' } };
   }
-  if (!canControlOwnedResource(run.ownerOpenId, action.operatorOpenId)) {
+  if (!canControlOwnedResource(run.ownerOpenId, operator, ctx.identities)) {
     return { toast: { type: 'warning' as const, content: '只有任务发起人或授权用户可以停止它。' } };
   }
   if (run.controller.signal.aborted) {
@@ -1254,7 +1407,7 @@ export async function handleCardAction(
   run.cardSettledByCallback = true;
   const detail = '本次任务已停止。你可以继续在当前话题里提问。';
   run.interruptReason = detail;
-  const outcome = requestTaskAbort(ctx.activeRuns, sessionId, action.operatorOpenId);
+  const outcome = requestTaskAbort(ctx.activeRuns, sessionId, operator, ctx.identities);
   if (outcome !== 'stopped' && outcome !== 'already_stopping') {
     return { toast: { type: 'info' as const, content: '任务已经结束，无需再次停止。' } };
   }
@@ -1266,20 +1419,21 @@ export async function handleCardAction(
 }
 
 /** 指定负责人优先；未指定时由提出需求的人确认。 */
-function assertSpecOwner(specOwnerOpenId: string, operatorOpenId: string): void {
-  assertCanControlOwnedResource(specOwnerOpenId, operatorOpenId);
+function assertSpecOwner(ctx: AppContext, specOwnerOpenId: string, operator: UserIdentity): void {
+  assertCanControlOwnedResource(specOwnerOpenId, operator, ctx.identities);
 }
 
 /** 含风险接受条款的 Spec 与高风险执行使用同一负责人边界，普通白名单不能代拍板。 */
 function assertSpecApprovalAuthority(
+  ctx: AppContext,
   spec: import('../core/spec-store.js').ProductSpec,
-  operatorOpenId: string,
+  operator: UserIdentity,
 ): void {
   if (spec.content.includes('[RISK_WAIVER]')) {
-    assertOwnedBy(spec.ownerOpenId, operatorOpenId);
+    assertOwnedBy(spec.ownerOpenId, operator, ctx.identities);
     return;
   }
-  assertSpecOwner(spec.ownerOpenId, operatorOpenId);
+  assertSpecOwner(ctx, spec.ownerOpenId, operator);
 }
 
 async function releaseCreatingSession(
@@ -1303,18 +1457,35 @@ function assertCurrentSpecCard(
 }
 
 function assertQuestionnaireAccess(
+  ctx: AppContext,
   questionnaire: import('../core/questionnaire-store.js').Questionnaire,
-  operatorOpenId: string,
+  operator: UserIdentity,
   chatId?: string,
   topicId?: string,
 ): void {
-  assertCanControlOwnedResource(questionnaire.ownerOpenId ?? '', operatorOpenId);
+  assertCanControlOwnedResource(questionnaire.ownerOpenId ?? '', operator, ctx.identities);
   if (chatId && questionnaire.chatId && questionnaire.chatId !== chatId) {
     throw new Error('问卷不属于当前会话。');
   }
   if (topicId && questionnaire.topicId && questionnaire.topicId !== topicId) {
     throw new Error('问卷不属于当前话题。');
   }
+}
+
+function messageIdentity(msg: IncomingMessage): UserIdentity {
+  return {
+    openId: msg.senderOpenId,
+    userId: msg.senderUserId,
+    unionId: msg.senderUnionId,
+  };
+}
+
+function cardActionIdentity(action: CardAction): UserIdentity {
+  return {
+    openId: action.operatorOpenId,
+    userId: action.operatorUserId,
+    unionId: action.operatorUnionId,
+  };
 }
 
 function assertCurrentQuestionnaireCard(
@@ -1339,4 +1510,22 @@ function runWorkflowContinuation(
     console.error(`[工作流] ${label}失败:`, sanitizeErrorForLog(err));
     onError?.(err);
   });
+}
+
+function notifyBlockedRetryFailure(
+  ctx: AppContext,
+  workflowId: string,
+  initiator: Bot | undefined,
+  messageId: string,
+  message: string,
+): void {
+  void (async () => {
+    await initiator?.reply(messageId, message, true).catch(() => undefined);
+    // 回调卡已结算为不可交互状态；若认领前失败，补发一张新的可操作阻塞卡。
+    if (ctx.workflows.get(workflowId)?.status === 'awaiting_step_unblock') {
+      await resendBlockedCard(ctx, workflowId).catch((error) => {
+        console.error(`[工作流] ${workflowId} 重试失败后的阻塞卡恢复失败:`, sanitizeErrorForLog(error));
+      });
+    }
+  })();
 }

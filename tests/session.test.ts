@@ -9,6 +9,7 @@ import { JsonSessionStore, type SessionStore } from '../src/core/session-store.j
 import { JsonTopicStore } from '../src/core/topic-store.js';
 import type { AppContext } from '../src/runtime/app-context.js';
 import {
+  interruptedCard,
   persistActiveRuns,
   reconcileOrphanedCards,
   shutdownActiveRuns,
@@ -272,6 +273,33 @@ test('遗留任务卡刷新失败时保留快照供下次重试', async () => {
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('持久化流水线遇到服务重启时展示为可恢复阻塞，而不是用户取消', async () => {
+  const workflowId = '11111111-1111-4111-8111-111111111111';
+  const progress = {
+    current: '评审中', elapsedMs: 1_000, toolCount: 1, completedCount: 1, activities: [],
+  };
+  const card = interruptedCard({
+    workflowId,
+    cardTitle: '代码评审 · Codex',
+    tracker: { snapshot: () => progress },
+  } as unknown as import('../src/runtime/types.js').ActiveRun,
+  '服务已停止（SIGTERM）；持久化流水线会自动恢复。', true) as any;
+  assert.equal(card.header.template, 'orange');
+  assert.match(card.header.title.content, /已阻塞/);
+  assert.doesNotMatch(card.header.title.content, /已取消/);
+
+  const ctx = {
+    activeRuns: new Map([['session-workflow', {
+      workflowId,
+      bot: { id: 'reviewer' },
+      cardId: 'om-workflow',
+      cardTitle: '代码评审 · Codex',
+      tracker: { snapshot: () => progress },
+    }]]),
+  } as unknown as AppContext;
+  assert.equal(snapshotActiveRuns(ctx)[0].workflowId, workflowId);
 });
 
 test('停机收尾等待终态任务续跑，但不会把失败终态重绘为取消', async () => {

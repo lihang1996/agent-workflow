@@ -1,9 +1,30 @@
 export type CliId = "claude" | "codex";
 export type CliExecutionPolicy = 'standard' | 'read-only' | 'input-only' | 'approved';
 
+/**
+ * 适配器在构建命令行时给出的能力预期。
+ * `expected` 只是启动前预期，不代表下游 CLI 已实际授予该能力。
+ */
+export interface CliCapabilityExpectation {
+  capability: 'local-network';
+  requested: boolean;
+  configApplied: boolean;
+  expected: 'none' | 'loopback' | 'sandbox-provided' | 'adapter-managed';
+  reason: string;
+}
+
 export interface CliBuildOptions {
   executionPolicy?: CliExecutionPolicy;
   approvedScope?: string;
+  /** 仅持久化交付流水线请求本机回环网络，用于项目服务、浏览器和测试库。 */
+  localNetworkAccess?: boolean;
+  /** 接收本次参数构建实际采用的能力预期，供 runner 记录日志并传递给子进程。 */
+  onCapabilityExpectation?: (expectation: CliCapabilityExpectation) => void;
+  /**
+   * 注入内置提问 MCP 的任务上下文。Codex 会用 `-c mcp_servers.*.env` 覆盖 MCP 子进程环境，
+   * 只靠 CLI 进程 env 传 AGENT_OS_WORKFLOW_ID 等字段到不了 ask-server。
+   */
+  mcpContextEnv?: Record<string, string>;
 }
 
 export interface CliRunStats {

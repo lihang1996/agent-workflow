@@ -80,6 +80,7 @@ export type ApprovalRequest = z.infer<typeof ApprovalSchema>;
 
 export type ApprovalExecutionOutcome = 'succeeded' | 'failed';
 export type ApprovalWorkflowState = 'running' | ApprovalExecutionOutcome;
+export type ApprovalOwnerMatcher = (ownerOpenId: string, operatorOpenId: string) => boolean;
 
 const DEFAULT_APPROVAL_TTL_MS = 30 * 60 * 1_000;
 
@@ -163,9 +164,13 @@ export class JsonApprovalStore {
   }
 
   /** 拒绝待审批任务；负责人校验与状态切换在同一个临界区完成。 */
-  async reject(id: string, decidedBy: string): Promise<ApprovalRequest> {
+  async reject(
+    id: string,
+    decidedBy: string,
+    ownerMatches?: ApprovalOwnerMatcher,
+  ): Promise<ApprovalRequest> {
     return this.enqueueMutation(async () => {
-      const current = this.requireOwner(id, decidedBy);
+      const current = this.requireOwner(id, decidedBy, ownerMatches);
       if (await this.expireCurrentIfNeeded(current)) throw new Error('审批已过期，请重新发起。');
       if (current.status !== 'pending') throw new Error(`审批已处理：${current.status}`);
       const now = this.now().toISOString();
@@ -185,9 +190,13 @@ export class JsonApprovalStore {
    * 首次批准或失败重试都会原子进入 executing。
    * executionAttempt 用于阻止上一轮异步回调覆盖新一轮结果。
    */
-  async beginExecution(id: string, decidedBy: string): Promise<ApprovalRequest> {
+  async beginExecution(
+    id: string,
+    decidedBy: string,
+    ownerMatches?: ApprovalOwnerMatcher,
+  ): Promise<ApprovalRequest> {
     return this.enqueueMutation(async () => {
-      const current = this.requireOwner(id, decidedBy);
+      const current = this.requireOwner(id, decidedBy, ownerMatches);
       if (await this.expireCurrentIfNeeded(current)) throw new Error('审批已过期，请重新发起。');
       if (!current.cardMessageId) throw new Error('审批卡绑定缺失，请重新发起审批。');
       if (current.status !== 'pending' && current.status !== 'approved' && current.status !== 'failed') {
@@ -354,9 +363,13 @@ export class JsonApprovalStore {
     return current;
   }
 
-  private requireOwner(id: string, operatorOpenId: string): ApprovalRequest {
+  private requireOwner(
+    id: string,
+    operatorOpenId: string,
+    ownerMatches: ApprovalOwnerMatcher = (owner, operator) => owner === operator,
+  ): ApprovalRequest {
     const current = this.require(id);
-    if (!operatorOpenId || current.ownerOpenId !== operatorOpenId) {
+    if (!operatorOpenId || !ownerMatches(current.ownerOpenId, operatorOpenId)) {
       throw new Error('只有指定负责人可以处理该审批。');
     }
     return current;
