@@ -51,6 +51,8 @@ description: "在已批准交付契约和风险方案下实现功能、修复、
 `fingerprintBefore`、`fingerprintAfter`、`changedFiles`、`requirementImplementations`、
 `riskControls`、`testsAddedOrChanged`、`targetedCheckResults`、`deviations` 和 `status`。
 把结构化输出保存到控制器提供的 `evidenceRoot`，计算真实 SHA-256，并写入 `[GATE_RESULT].artifacts`。
+`checks[].command` 每个数组元素上限 10000 字符。长内联脚本（如 `node -e '...'` 或 `/bin/zsh -lc '...'`）
+必须先写入临时文件（如 `evidenceRoot/check-xxx.mjs`），再用 `node check-xxx.mjs` 作为 command，避免超限截断。
 `targetedCheckResults` 是实现检查的权威集合；`[GATE_RESULT].checks` 不得重复其中任何 ID，
 没有额外检查时必须写空数组，由控制器从 artifact 水合。若需登记 artifact 校验等额外命令，
 必须使用新的唯一 ID；禁止只复制部分目标检查或为同一检查编造另一份元数据。

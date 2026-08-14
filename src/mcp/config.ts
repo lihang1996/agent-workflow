@@ -1,8 +1,9 @@
 /**
- * MCP 配置：内置「结构化提问」server，注入 Claude / Codex。
+ * MCP 配置：内置「结构化提问」server，注入 Claude / Codex / Cursor。
  */
 import { createHash } from 'node:crypto';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -139,6 +140,111 @@ export function claudeMcpFlags(contextEnv: Record<string, string> = {}): string[
   const flags = ['--mcp-config', ensureClaudeMcpConfigFile(contextEnv)];
   if (isMcpStrict()) flags.push('--strict-mcp-config');
   return flags;
+}
+
+/**
+ * Cursor `--add-dir` / `--workspace` 会变成可写 workspace root。
+ * 不能放在 Agent OS 仓库的 `data/` 里，否则 `--force` 可能改控制器文件。
+ * 按本仓库路径分桶，避免多份 Agent OS 抢同一临时目录。
+ */
+export function cursorRuntimeRoot(): string {
+  const instance = createHash('sha256').update(AGENT_OS_ROOT).digest('hex').slice(0, 8);
+  return join(tmpdir(), 'agent-os', `cursor-${instance}`);
+}
+
+/**
+ * overlay 目录身份：包含 MESSAGE_ID 以完全隔离每条消息。
+ * 旧设计（不含 MESSAGE_ID）会导致同一 workflow 的不同消息覆盖同一目录，
+ * 虽然实测 Cursor 启动后不会重新扫描 MCP，但为安全起见完全隔离。
+ */
+function cursorOverlayScopeEnv(env: Record<string, string>): Record<string, string> {
+  // 包含所有上下文字段，确保每条消息独立
+  return pickAskMcpContextEnv(env);
+}
+
+/**
+ * Cursor CLI 没有 `--mcp-config`，只扫描 workspace / 全局的 mcp.json。
+ * 把问卷 MCP 写到隔离 overlay，再通过 `--add-dir` 挂成额外 workspace root。
+ * `--approve-mcps` 会放行整个 server，因此 overlay 里强制拒绝 record_answers。
+ */
+export function ensureCursorMcpOverlay(contextEnv: Record<string, string> = {}): string {
+  const env = pickAskMcpContextEnv(contextEnv);
+  const scope = cursorOverlayScopeEnv(env);
+  const suffix = Object.keys(scope).length === 0
+    ? 'runtime'
+    : createHash('sha256').update(JSON.stringify(scope)).digest('hex').slice(0, 12);
+  const overlayDir = join(cursorRuntimeRoot(), `mcp-${suffix}`);
+  const cursorDir = join(overlayDir, '.cursor');
+  mkdirSync(cursorDir, { recursive: true });
+  const server = bundledAskServer(env);
+  const body = `${JSON.stringify({
+    mcpServers: {
+      'agent-os-ask': {
+        command: server.command,
+        ...(server.args?.length ? { args: server.args } : {}),
+        env: {
+          ...server.env,
+          AGENT_OS_MCP_DENY_RECORD_ANSWERS: '1',
+        },
+      },
+    },
+  }, null, 2)}\n`;
+  writeFileSync(join(cursorDir, 'mcp.json'), body, 'utf8');
+  writeFileSync(join(overlayDir, 'mcp.json'), body, 'utf8');
+  return overlayDir;
+}
+
+export function cursorMcpFlags(contextEnv: Record<string, string> = {}): string[] {
+  if (!isMcpEnabled()) return [];
+  return ['--add-dir', ensureCursorMcpOverlay(contextEnv), '--approve-mcps'];
+}
+
+/** 仅输入分析：把 Cursor workspace 指到空目录，避免 --mode ask 仍能读用户仓库。 */
+export function ensureCursorInputOnlyWorkspace(): string {
+  const dir = join(cursorRuntimeRoot(), 'input-only');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, 'README.txt'),
+    'Agent OS input-only jail. Do not read user project files from here.\n',
+    'utf8',
+  );
+  return dir;
+}
+
+/**
+ * `--approve-mcps` 会放行当前工作区全部 MCP，不只是问卷 overlay。
+ * 项目 `.cursor/mcp.json` 和 `~/.cursor/mcp.json` 都会被 Cursor 加载。
+ */
+export function warnIfCursorProjectMcps(cwd: string): void {
+  const globalPath = join(homedir(), '.cursor', 'mcp.json');
+  const candidates = [
+    join(cwd, '.cursor', 'mcp.json'),
+    join(cwd, 'mcp.json'),
+    globalPath,
+  ];
+  for (const path of candidates) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(path, 'utf8'));
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== 'object') continue;
+    const record = parsed as Record<string, unknown>;
+    const servers = record.mcpServers ?? (isRecord(record.mcp) ? record.mcp.servers : undefined);
+    if (!servers || typeof servers !== 'object') continue;
+    const names = Object.keys(servers).filter((name) => name !== 'agent-os-ask');
+    if (names.length === 0) continue;
+    const scope = path === globalPath ? '全局' : '项目';
+    console.warn(
+      `[MCP] Cursor --approve-mcps 会一并放行${scope} MCP（${path}）：${names.join(', ')}。`
+      + '只有问卷 overlay 设置了 AGENT_OS_MCP_DENY_RECORD_ANSWERS。',
+    );
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
 }
 
 export function codexMcpFlags(contextEnv: Record<string, string> = {}): string[] {

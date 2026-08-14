@@ -59,6 +59,8 @@ description: "在功能、修复、重构或迁移完成实现后、进入 QA �
 `exploitability=not-applicable|unreachable|conditional|reachable|unverified`。
 把文件保存到 `evidenceRoot`，计算真实 SHA-256，并作为 `review-report` 写入
 `[GATE_RESULT].artifacts`；finding 摘要必须与 artifact 一致。
+`checks[].command` 每个数组元素上限 10000 字符。长内联脚本（如 `node -e '...'` 或 `/bin/zsh -lc '...'`）
+必须先写入临时文件（如 `evidenceRoot/check-xxx.mjs`），再用 `node check-xxx.mjs` 作为 command，避免超限截断。
 
 基线不明、manifest 与真实变更无法调和、当前 fingerprint 与实现证据不一致、
 未覆盖完整变更集、校验脚本失败或仅输出文本批准时阻止进入 QA（`[RESULT:failed]`，审查本身无法完成）。

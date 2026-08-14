@@ -28,9 +28,17 @@ import { highRiskClasses, highRiskToolCallReason, isHighRiskTask } from '../src/
 import { assertWorkdir } from '../src/core/workdir.js';
 import { ClaudeAdapter } from '../src/cli/claude-adapter.js';
 import { CodexAdapter } from '../src/cli/codex-adapter.js';
+import { CursorAdapter } from '../src/cli/cursor-adapter.js';
 import { buildLocalNetworkCapabilityEnv } from '../src/cli/runner.js';
 import type { CliCapabilityExpectation } from '../src/cli/types.js';
-import { pickAskMcpContextEnv } from '../src/mcp/config.js';
+import {
+  AGENT_OS_ROOT,
+  cursorRuntimeRoot,
+  ensureCursorInputOnlyWorkspace,
+  ensureCursorMcpOverlay,
+  pickAskMcpContextEnv,
+  warnIfCursorProjectMcps,
+} from '../src/mcp/config.js';
 import { buildApprovalCard } from '../src/im/workflow-card.js';
 import type { Bot, IncomingMessage } from '../src/im/lark.js';
 import type { AppContext } from '../src/runtime/app-context.js';
@@ -287,6 +295,29 @@ test('启动恢复和停机期间拒绝新事件', async () => {
   assert.equal(app.isReady(), false);
   await app.handleMessage(msg, bot);
   assert.match(replies.at(-1) ?? '', /正在停止/);
+});
+
+test('停机时立刻断开飞书 Bot 长连接', () => {
+  const app = createApp({
+    config: {
+      defaultCliId: 'claude', collabMaxRounds: 2, pipelineSteps: [],
+      shutdownGraceMs: 1_000, activeRunPersistDebounceMs: 10, progressHeartbeatMs: 1_000,
+    },
+  } as unknown as CreateAppDeps);
+  let disconnected = 0;
+  app.botsById.set('ceo', {
+    id: 'ceo',
+    disconnect: () => { disconnected += 1; },
+  } as unknown as Bot);
+  app.botsById.set('pm', {
+    id: 'pm',
+    disconnect: () => { disconnected += 1; },
+  } as unknown as Bot);
+  app.pauseEventHandling();
+  app.disconnectBots();
+  app.disconnectBots();
+  assert.equal(disconnected, 2);
+  assert.equal(app.isReady(), false);
 });
 
 test('常见破坏性命令会进入审批', () => {
@@ -674,6 +705,76 @@ test('CLI 按普通、只读和已审批任务使用不同权限边界', () => {
     assert.equal(approvedClaude.includes('--dangerously-skip-permissions'), true);
     assert.equal(approvedClaude.includes('--settings'), true);
     assert.match(approvedClaude[approvedClaude.indexOf('--append-system-prompt') + 1], /只推送 main 分支/);
+
+    const previousCursorCli = process.env.CURSOR_CLI;
+    const previousCursorSandbox = process.env.CURSOR_SANDBOX;
+    const previousCursorModel = process.env.CURSOR_MODEL;
+    delete process.env.CURSOR_CLI;
+    delete process.env.CURSOR_SANDBOX;
+    delete process.env.CURSOR_MODEL;
+    try {
+      const cursor = new CursorAdapter();
+      assert.equal(cursor.command, 'agent');
+      const cursorCapabilities: CliCapabilityExpectation[] = [];
+      const normalCursor = cursor.buildArgs('修改 README', {
+        executionPolicy: 'standard',
+        onCapabilityExpectation: (expectation) => cursorCapabilities.push(expectation),
+      });
+      assert.equal(normalCursor.includes('-p'), true);
+      assert.equal(normalCursor.includes('--force'), true);
+      assert.equal(normalCursor.includes('--trust'), true);
+      assert.equal(normalCursor.includes('--auto-review'), false);
+      assert.equal(normalCursor[normalCursor.indexOf('--model') + 1], 'cursor-grok-4.6-high');
+      assert.equal(normalCursor[normalCursor.indexOf('--output-format') + 1], 'stream-json');
+      assert.equal(normalCursor[normalCursor.indexOf('--sandbox') + 1], 'disabled');
+      assert.equal(normalCursor.includes('--mode'), false);
+      assert.deepEqual(cursorCapabilities, [{
+        capability: 'local-network',
+        requested: false,
+        configApplied: true,
+        expected: 'sandbox-provided',
+        reason: 'sandbox-provides-network',
+      }]);
+      const readCursor = cursor.buildArgs('分析日志', {
+        executionPolicy: 'read-only',
+        localNetworkAccess: true,
+      });
+      assert.equal(readCursor[readCursor.indexOf('--mode') + 1], 'ask');
+      assert.equal(readCursor.includes('--force'), false);
+      assert.equal(readCursor[readCursor.indexOf('--sandbox') + 1], 'enabled');
+      assert.equal(readCursor.includes('--approve-mcps'), false);
+      assert.equal(readCursor.includes('--add-dir'), false);
+      const inputCursor = cursor.buildArgs('分析已提供日志', { executionPolicy: 'input-only' });
+      assert.equal(inputCursor[inputCursor.indexOf('--mode') + 1], 'ask');
+      assert.equal(inputCursor.includes('--force'), false);
+      assert.equal(inputCursor.includes('--workspace'), true);
+      assert.match(inputCursor[inputCursor.indexOf('--workspace') + 1] ?? '', /input-only/);
+      assert.match(inputCursor.at(-1) ?? '', /不得调用任何工具/);
+      assert.match(inputCursor.at(-1) ?? '', /空隔离目录/);
+      const approvedCursor = cursor.buildArgs('git push', {
+        executionPolicy: 'approved',
+        approvedScope: '只推送 main 分支',
+      });
+      assert.equal(approvedCursor.includes('--force'), true);
+      assert.equal(approvedCursor.includes('--trust'), true);
+      assert.equal(approvedCursor.includes('--auto-review'), false);
+      assert.equal(approvedCursor[approvedCursor.indexOf('--sandbox') + 1], 'disabled');
+      assert.equal(approvedCursor[approvedCursor.indexOf('--model') + 1], 'cursor-grok-4.6-high');
+      assert.match(approvedCursor.at(-1) ?? '', /只推送 main 分支/);
+      process.env.CURSOR_SANDBOX = 'enabled';
+      const tightCursor = cursor.buildArgs('修改 README', { executionPolicy: 'standard' });
+      assert.equal(tightCursor[tightCursor.indexOf('--sandbox') + 1], 'enabled');
+      const resumeCursor = cursor.buildResumeArgs('继续', 'chat-1', { executionPolicy: 'standard' });
+      assert.deepEqual(resumeCursor.slice(0, 2), ['--resume', 'chat-1']);
+      assert.equal(resumeCursor.includes('-p'), true);
+    } finally {
+      if (previousCursorCli === undefined) delete process.env.CURSOR_CLI;
+      else process.env.CURSOR_CLI = previousCursorCli;
+      if (previousCursorSandbox === undefined) delete process.env.CURSOR_SANDBOX;
+      else process.env.CURSOR_SANDBOX = previousCursorSandbox;
+      if (previousCursorModel === undefined) delete process.env.CURSOR_MODEL;
+      else process.env.CURSOR_MODEL = previousCursorModel;
+    }
   } finally {
     if (previousMcp === undefined) delete process.env.MCP_ENABLED;
     else process.env.MCP_ENABLED = previousMcp;
@@ -719,6 +820,103 @@ test('Codex 普通任务预授权问卷 MCP，但不预授权代填答案', () =
   } finally {
     if (previousMcp === undefined) delete process.env.MCP_ENABLED;
     else process.env.MCP_ENABLED = previousMcp;
+  }
+});
+
+test('Cursor 普通任务注入问卷 MCP overlay，并拒绝模型代填答案', () => {
+  const previousMcp = process.env.MCP_ENABLED;
+  const previousCursorCli = process.env.CURSOR_CLI;
+  delete process.env.MCP_ENABLED;
+  delete process.env.CURSOR_CLI;
+  try {
+    const workflowId = '14a8e2a5-12b8-4b9e-b37e-52bb6833d1d0';
+    const args = new CursorAdapter().buildArgs('澄清需求', {
+      executionPolicy: 'standard',
+      mcpContextEnv: pickAskMcpContextEnv({
+        AGENT_OS_WORKFLOW_ID: workflowId,
+        AGENT_OS_CHAT_ID: 'oc_chat',
+        AGENT_OS_TOPIC_ID: 'omt_topic',
+        AGENT_OS_OWNER_OPEN_ID: 'ou_owner',
+        AGENT_OS_BOT_ID: 'pm',
+        AGENT_OS_MESSAGE_ID: 'om_message',
+        SECRET_SHOULD_NOT_LEAK: 'nope',
+      }),
+    });
+    assert.equal(args.includes('--approve-mcps'), true);
+    const overlay = args[args.indexOf('--add-dir') + 1];
+    assert.ok(overlay);
+    assert.equal(overlay.startsWith(cursorRuntimeRoot()), true);
+    assert.equal(overlay.startsWith(AGENT_OS_ROOT), false);
+    const mcp = JSON.parse(readFileSync(join(overlay, '.cursor', 'mcp.json'), 'utf8')) as {
+      mcpServers?: { 'agent-os-ask'?: { env?: Record<string, string> } };
+    };
+    assert.equal(mcp.mcpServers?.['agent-os-ask']?.env?.AGENT_OS_WORKFLOW_ID, workflowId);
+    assert.equal(mcp.mcpServers?.['agent-os-ask']?.env?.AGENT_OS_CHAT_ID, 'oc_chat');
+    assert.equal(mcp.mcpServers?.['agent-os-ask']?.env?.AGENT_OS_MESSAGE_ID, 'om_message');
+    assert.equal(mcp.mcpServers?.['agent-os-ask']?.env?.AGENT_OS_MCP_DENY_RECORD_ANSWERS, '1');
+    assert.equal(mcp.mcpServers?.['agent-os-ask']?.env?.SECRET_SHOULD_NOT_LEAK, undefined);
+    const readonly = new CursorAdapter().buildArgs('分析日志', { executionPolicy: 'read-only' });
+    assert.equal(readonly.includes('--approve-mcps'), false);
+    assert.equal(readonly.includes('--add-dir'), false);
+  } finally {
+    if (previousMcp === undefined) delete process.env.MCP_ENABLED;
+    else process.env.MCP_ENABLED = previousMcp;
+    if (previousCursorCli === undefined) delete process.env.CURSOR_CLI;
+    else process.env.CURSOR_CLI = previousCursorCli;
+  }
+});
+
+test('Cursor MCP overlay 目录随 MESSAGE_ID 隔离，且不落在仓库内', () => {
+  const shared = {
+    AGENT_OS_WORKFLOW_ID: '14a8e2a5-12b8-4b9e-b37e-52bb6833d1d0',
+    AGENT_OS_CHAT_ID: 'oc_chat',
+    AGENT_OS_TOPIC_ID: 'omt_topic',
+    AGENT_OS_OWNER_OPEN_ID: 'ou_owner',
+    AGENT_OS_BOT_ID: 'pm',
+  };
+  const first = ensureCursorMcpOverlay({ ...shared, AGENT_OS_MESSAGE_ID: 'om_1' });
+  const second = ensureCursorMcpOverlay({ ...shared, AGENT_OS_MESSAGE_ID: 'om_2' });
+  // 新行为：MESSAGE_ID 不同，目录也不同（完全隔离）
+  assert.notEqual(first, second);
+  assert.equal(first.startsWith(AGENT_OS_ROOT), false);
+  assert.equal(first.startsWith(cursorRuntimeRoot()), true);
+  assert.equal(second.startsWith(AGENT_OS_ROOT), false);
+  assert.equal(second.startsWith(cursorRuntimeRoot()), true);
+  const mcp1 = JSON.parse(readFileSync(join(first, '.cursor', 'mcp.json'), 'utf8')) as {
+    mcpServers?: { 'agent-os-ask'?: { env?: Record<string, string> } };
+  };
+  const mcp2 = JSON.parse(readFileSync(join(second, '.cursor', 'mcp.json'), 'utf8')) as {
+    mcpServers?: { 'agent-os-ask'?: { env?: Record<string, string> } };
+  };
+  assert.equal(mcp1.mcpServers?.['agent-os-ask']?.env?.AGENT_OS_MESSAGE_ID, 'om_1');
+  assert.equal(mcp2.mcpServers?.['agent-os-ask']?.env?.AGENT_OS_MESSAGE_ID, 'om_2');
+});
+
+test('Cursor 仅输入分析把 spawn cwd 指到仓库外的隔离目录', () => {
+  const adapter = new CursorAdapter();
+  const jail = ensureCursorInputOnlyWorkspace();
+  assert.equal(adapter.resolveSpawnCwd?.('/Users/me/project', 'input-only'), jail);
+  assert.equal(adapter.resolveSpawnCwd?.('/Users/me/project', 'standard'), '/Users/me/project');
+  assert.equal(jail.startsWith(AGENT_OS_ROOT), false);
+  assert.equal(jail.startsWith(cursorRuntimeRoot()), true);
+});
+
+test('Cursor 发现项目自带 MCP 时警告 --approve-mcps 会一并放行', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-cursor-project-mcp-'));
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => { warnings.push(String(args[0])); };
+  try {
+    await mkdir(join(root, '.cursor'), { recursive: true });
+    await writeFile(join(root, '.cursor', 'mcp.json'), JSON.stringify({
+      mcpServers: { 'agent-os-ask': {}, github: {} },
+    }));
+    warnIfCursorProjectMcps(root);
+    assert.match(warnings.join('\n'), /github/);
+    assert.match(warnings.join('\n'), /approve-mcps/);
+  } finally {
+    console.warn = originalWarn;
+    await rm(root, { recursive: true, force: true });
   }
 });
 

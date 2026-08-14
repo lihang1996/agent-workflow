@@ -2,8 +2,16 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { ClaudeAdapter } from '../src/cli/claude-adapter.js';
 import { CodexAdapter } from '../src/cli/codex-adapter.js';
+import { CursorAdapter } from '../src/cli/cursor-adapter.js';
 import { resolveCliIdleTimeoutMs, resolveCliTimeoutMs, runCli } from '../src/cli/runner.js';
-import type { CliAdapter, CliEvent } from '../src/cli/types.js';
+import {
+  resolveCliMaxToolCount,
+  resolveCliToolLoopStreak,
+  ToolLoopWatch,
+} from '../src/cli/tool-budget.js';
+import { formatEngineChoices, formatEngineIds, isCliId, type CliAdapter, type CliEvent } from '../src/cli/types.js';
+import { isReviewExplicitlyApproved } from '../src/core/collab.js';
+import { hasExplicitStepResult } from '../src/core/step-result.js';
 
 class NodeScriptAdapter implements CliAdapter {
   readonly id = 'claude' as const;
@@ -151,4 +159,279 @@ test('Codex 流标记失败工具并读取 turn token 用量', () => {
     cacheReadTokens: 5,
     totalTokens: 28,
   });
+});
+
+test('引擎 id 与 /engine 文案包含 cursor', () => {
+  assert.equal(isCliId('cursor'), true);
+  assert.equal(isCliId('gemini'), false);
+  assert.equal(formatEngineIds(), 'claude|codex|cursor');
+  assert.equal(formatEngineChoices(), '/engine claude 或 /engine codex 或 /engine cursor');
+});
+
+test('Cursor 默认固定 grok 4.6，忽略 auto 和其它模型，且不启用 Smart Auto', () => {
+  const previousModel = process.env.CURSOR_MODEL;
+  const previousMcp = process.env.MCP_ENABLED;
+  process.env.MCP_ENABLED = 'false';
+  try {
+    delete process.env.CURSOR_MODEL;
+    const adapter = new CursorAdapter();
+    const unset = adapter.buildArgs('写代码', { executionPolicy: 'standard' });
+    assert.equal(unset[unset.indexOf('--model') + 1], 'cursor-grok-4.6-high');
+    assert.equal(unset.includes('--auto-review'), false);
+    assert.equal(unset.includes('--force'), true);
+    assert.equal(unset[unset.indexOf('--sandbox') + 1], 'disabled');
+    assert.match(unset.at(-1) ?? '', /不是 Claude dontAsk/);
+
+    process.env.CURSOR_MODEL = 'auto';
+    const ignored = adapter.buildArgs('写代码', { executionPolicy: 'standard' });
+    assert.equal(ignored[ignored.indexOf('--model') + 1], 'cursor-grok-4.6-high');
+
+    process.env.CURSOR_MODEL = 'sonnet-4';
+    const blocked = adapter.buildArgs('写代码', { executionPolicy: 'standard' });
+    assert.equal(blocked[blocked.indexOf('--model') + 1], 'cursor-grok-4.6-high');
+
+    // 新的严格验证：只允许精确的 cursor-grok-4.6-high
+    process.env.CURSOR_MODEL = 'cursor-grok-4.6-xhigh';
+    const alsoBlocked = adapter.buildArgs('写代码', { executionPolicy: 'standard' });
+    assert.equal(alsoBlocked[alsoBlocked.indexOf('--model') + 1], 'cursor-grok-4.6-high');
+  } finally {
+    if (previousModel === undefined) delete process.env.CURSOR_MODEL;
+    else process.env.CURSOR_MODEL = previousModel;
+    if (previousMcp === undefined) delete process.env.MCP_ENABLED;
+    else process.env.MCP_ENABLED = previousMcp;
+  }
+});
+
+test('Cursor 流解析会话、工具和最终结果', () => {
+  const adapter = new CursorAdapter();
+  const session = adapter.parseEvents(JSON.stringify({
+    type: 'system',
+    subtype: 'init',
+    session_id: 'cursor-session',
+    model: 'Composer',
+  }));
+  assert.equal(session[0]?.type, 'session');
+  assert.equal(session[0]?.type === 'session' && session[0].sessionId, 'cursor-session');
+
+  const assistant = adapter.parseEvents(JSON.stringify({
+    type: 'assistant',
+    session_id: 'cursor-session',
+    message: { role: 'assistant', content: [{ type: 'text', text: '正在读取' }] },
+  }));
+  assert.equal(assistant[0]?.type === 'assistant' && assistant[0].text, '正在读取');
+
+  const started = adapter.parseEvents(JSON.stringify({
+    type: 'tool_call',
+    subtype: 'started',
+    call_id: 'tool-1',
+    session_id: 'cursor-session',
+    tool_call: { readToolCall: { args: { path: '/tmp/a.ts' } } },
+  }));
+  assert.equal(started[0]?.type, 'tool_start');
+  assert.equal(started[0]?.type === 'tool_start' && started[0].toolName, 'Read');
+  assert.equal(started[0]?.type === 'tool_start' && started[0].detail, 'tmp/a.ts');
+
+  const ended = adapter.parseEvents(JSON.stringify({
+    type: 'tool_call',
+    subtype: 'completed',
+    call_id: 'tool-1',
+    session_id: 'cursor-session',
+    tool_call: { readToolCall: { args: { path: '/tmp/a.ts' }, result: { error: { message: 'missing' } } } },
+  }));
+  assert.equal(ended[0]?.type === 'tool_end' && ended[0].failed, true);
+
+  const missingIdA = adapter.parseEvents(JSON.stringify({
+    type: 'tool_call',
+    subtype: 'started',
+    tool_call: { grepToolCall: { args: { pattern: 'foo' } } },
+  }));
+  const missingIdB = adapter.parseEvents(JSON.stringify({
+    type: 'tool_call',
+    subtype: 'started',
+    tool_call: { grepToolCall: { args: { pattern: 'bar' } } },
+  }));
+  assert.equal(missingIdA[0]?.type === 'tool_start' && missingIdA[0].toolUseId, 'cursor-tool-1');
+  assert.equal(missingIdB[0]?.type === 'tool_start' && missingIdB[0].toolUseId, 'cursor-tool-2');
+
+  const resultOnly = new CursorAdapter().parseEvents(JSON.stringify({
+    type: 'result',
+    subtype: 'success',
+    is_error: false,
+    result: '已完成',
+    session_id: 'cursor-session',
+    duration_ms: 1200,
+  }));
+  assert.equal(resultOnly[0]?.type, 'result');
+  assert.equal(resultOnly[0]?.type === 'result' && resultOnly[0].answer, '已完成');
+  assert.deepEqual(resultOnly[0]?.type === 'result' ? resultOnly[0].stats : undefined, { durationMs: 1200 });
+});
+
+test('Cursor 终态用分段 assistant 文本，避免官方 result 无换行粘连破坏协议标记', () => {
+  const adapter = new CursorAdapter();
+  adapter.parseEvents(JSON.stringify({
+    type: 'assistant',
+    session_id: 'cursor-session',
+    message: { role: 'assistant', content: [{ type: 'text', text: 'I will read the file' }] },
+  }));
+  adapter.parseEvents(JSON.stringify({
+    type: 'assistant',
+    session_id: 'cursor-session',
+    message: { role: 'assistant', content: [{ type: 'text', text: '[APPROVED]\n[RESULT:done] 完成' }] },
+  }));
+  const result = adapter.parseEvents(JSON.stringify({
+    type: 'result',
+    subtype: 'success',
+    is_error: false,
+    result: 'I will read the file[APPROVED]\n[RESULT:done] 完成',
+    session_id: 'cursor-session',
+  }));
+  assert.equal(result[0]?.type, 'result');
+  const answer = result[0]?.type === 'result' ? result[0].answer : '';
+  assert.equal(answer, 'I will read the file\n\n[APPROVED]\n[RESULT:done] 完成');
+  assert.equal(hasExplicitStepResult(answer), true);
+  assert.equal(isReviewExplicitlyApproved(answer), true);
+  assert.equal(hasExplicitStepResult('I will read the file[RESULT:done] 完成'), false);
+  assert.equal(isReviewExplicitlyApproved('I will read the file[APPROVED]'), false);
+});
+
+test('CLI_MAX_TOOL_COUNT 默认 500，非法值回退', () => {
+  assert.equal(resolveCliMaxToolCount(12, '500'), 12);
+  assert.equal(resolveCliMaxToolCount(undefined, '500'), 500);
+  assert.equal(resolveCliMaxToolCount(undefined, 'not-a-number'), 500);
+  assert.equal(resolveCliToolLoopStreak(0), 0);
+  assert.equal(resolveCliToolLoopStreak(undefined, '20'), 20);
+});
+
+test('同一目标连续调用才视为死循环，换文件或缺少 detail 不算', () => {
+  const same = (id: string) => ({
+    type: 'tool_start' as const,
+    toolUseId: id,
+    toolName: 'Read',
+    label: '读取文件',
+    detail: 'src/a.ts',
+  });
+  const other = (id: string) => ({
+    type: 'tool_start' as const,
+    toolUseId: id,
+    toolName: 'Read',
+    label: '读取文件',
+    detail: 'src/b.ts',
+  });
+  const edit = (id: string) => ({
+    type: 'tool_start' as const,
+    toolUseId: id,
+    toolName: 'Edit',
+    label: '修改文件',
+    detail: 'src/a.ts',
+  });
+  const watch = new ToolLoopWatch(3);
+  assert.equal(watch.observe(same('1')).looped, false);
+  assert.equal(watch.observe(same('2')).looped, false);
+  assert.equal(watch.observe(same('3')).looped, true);
+
+  const mixed = new ToolLoopWatch(3);
+  assert.equal(mixed.observe(same('1')).looped, false);
+  assert.equal(mixed.observe(other('2')).looped, false);
+  assert.equal(mixed.observe(same('3')).looped, false);
+
+  const noDetail = new ToolLoopWatch(3);
+  for (let i = 0; i < 5; i++) {
+    assert.equal(
+      noDetail.observe({ type: 'tool_start', toolUseId: `${i}`, toolName: 'Read', label: '读取文件' }).looped,
+      false,
+    );
+  }
+
+  const warnWatch = new ToolLoopWatch(15);
+  for (let i = 1; i <= 9; i++) {
+    const observed = warnWatch.observe(same(`${i}`));
+    assert.equal(observed.warn, i === 8);
+    assert.equal(observed.looped, false);
+  }
+
+  const pingPong = new ToolLoopWatch({
+    consecutiveWarn: 99,
+    consecutiveCritical: 99,
+    repeatWarn: 99,
+    repeatCritical: 99,
+    pingPongWarn: 3,
+    pingPongCritical: 4,
+    historySize: 30,
+  });
+  assert.equal(pingPong.observe(same('p1')).looped, false);
+  assert.equal(pingPong.observe(other('p2')).looped, false);
+  const pingWarn = pingPong.observe(same('p3'));
+  assert.equal(pingWarn.warn, true);
+  assert.equal(pingWarn.detector, 'ping_pong');
+  const pingKill = pingPong.observe(other('p4'));
+  assert.equal(pingKill.looped, true);
+  assert.equal(pingKill.detector, 'ping_pong');
+
+  const readEdit = new ToolLoopWatch({
+    consecutiveWarn: 99,
+    consecutiveCritical: 99,
+    repeatWarn: 99,
+    repeatCritical: 99,
+    pingPongWarn: 3,
+    pingPongCritical: 4,
+    historySize: 30,
+  });
+  for (let i = 0; i < 8; i++) {
+    const observed = readEdit.observe(i % 2 === 0 ? same(`r${i}`) : edit(`e${i}`));
+    assert.equal(observed.looped, false, `Read/Edit 第 ${i + 1} 次不应算乒乓`);
+  }
+
+  const windowRepeat = new ToolLoopWatch({
+    consecutiveWarn: 99,
+    consecutiveCritical: 99,
+    repeatWarn: 3,
+    repeatCritical: 4,
+    pingPongWarn: 99,
+    pingPongCritical: 99,
+    historySize: 30,
+  });
+  assert.equal(windowRepeat.observe(same('w1')).looped, false);
+  assert.equal(windowRepeat.observe(other('w2')).looped, false);
+  assert.equal(windowRepeat.observe(same('w3')).warn, false);
+  assert.equal(windowRepeat.observe(edit('w4')).looped, false);
+  const windowWarn = windowRepeat.observe(same('w5'));
+  assert.equal(windowWarn.warn, true);
+  assert.equal(windowWarn.detector, 'generic_repeat');
+  assert.equal(windowRepeat.observe(edit('w6')).looped, false);
+  const windowKill = windowRepeat.observe(same('w7'));
+  assert.equal(windowKill.looped, true);
+  assert.equal(windowKill.detector, 'generic_repeat');
+});
+
+test('CLI 同一目标连续调用会按死循环终止', async () => {
+  const events = Array.from({ length: 4 }, (_, i) => (
+    `console.log(JSON.stringify({type:'tool_start',toolUseId:'t${i}',toolName:'Bash',label:'运行命令',detail:'pnpm test'}))`
+  )).join(';');
+  await assert.rejects(
+    () => runCli({
+      adapter: new NodeScriptAdapter(`${events};setInterval(()=>{},1000)`),
+      prompt: 'test',
+      cwd: process.cwd(),
+      timeoutMs: 2_000,
+      idleTimeoutMs: 0,
+      maxToolCount: 500,
+      toolLoopStreak: 3,
+    }),
+    /疑似工具死循环/,
+  );
+});
+
+test('CLI 交错不同目标不会被当成死循环', async () => {
+  const events = Array.from({ length: 6 }, (_, i) => (
+    `console.log(JSON.stringify({type:'tool_start',toolUseId:'t${i}',toolName:'Read',label:'读取文件',detail:'file-${i}.ts'}))`
+  )).join(';');
+  const result = await runCli({
+    adapter: new NodeScriptAdapter(`${events};console.log(JSON.stringify({type:'result',answer:'ok'}))`),
+    prompt: 'test',
+    cwd: process.cwd(),
+    idleTimeoutMs: 0,
+    maxToolCount: 500,
+    toolLoopStreak: 3,
+  });
+  assert.equal(result.answer, 'ok');
 });

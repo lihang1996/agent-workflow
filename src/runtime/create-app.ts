@@ -34,6 +34,7 @@ export interface App {
   reconcileApprovalExecutions: () => Promise<void>;
   markReady: () => void;
   pauseEventHandling: () => void;
+  disconnectBots: () => void;
   isReady: () => boolean;
 }
 
@@ -41,6 +42,7 @@ export interface App {
 export function createApp(deps: CreateAppDeps): App {
   const ctx = createAppContext(deps);
   let eventState: 'recovering' | 'ready' | 'stopping' = 'recovering';
+  let botsDisconnected = false;
 
   return {
     ctx,
@@ -84,6 +86,20 @@ export function createApp(deps: CreateAppDeps): App {
       if (eventState === 'recovering') eventState = 'ready';
     },
     pauseEventHandling: () => { eventState = 'stopping'; },
+    disconnectBots: () => {
+      if (botsDisconnected) return;
+      botsDisconnected = true;
+      let closed = 0;
+      for (const bot of ctx.botsById.values()) {
+        try {
+          bot.disconnect();
+          closed += 1;
+        } catch (error) {
+          console.error(`[飞书] 断开 bot=${bot.id} 失败:`, error instanceof Error ? error.message : String(error));
+        }
+      }
+      if (closed > 0) console.log(`[飞书] 已断开 ${closed} 个 Bot 长连接`);
+    },
     isReady: () => eventState === 'ready',
   };
 }

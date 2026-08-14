@@ -1,4 +1,5 @@
-export type CliId = "claude" | "codex";
+export const CLI_IDS = ['claude', 'codex', 'cursor'] as const;
+export type CliId = (typeof CLI_IDS)[number];
 export type CliExecutionPolicy = 'standard' | 'read-only' | 'input-only' | 'approved';
 
 /**
@@ -65,6 +66,11 @@ export interface CliAdapter {
   buildResumeArgs(prompt: string, sessionId: string, options?: CliBuildOptions): string[];
   /** 一行 stream-json 可能产出多个事件（如文本 + 工具调用）。 */
   parseEvents(line: string): CliEvent[];
+  /**
+   * 覆盖 CLI 子进程 cwd。Cursor 仅输入分析必须进空 jail，
+   * 不能停在用户仓库——`--workspace` 拦不住相对路径 Bash。
+   */
+  resolveSpawnCwd?(requestedCwd: string, policy: CliExecutionPolicy): string;
 }
 
 export interface CliRunResult {
@@ -75,5 +81,15 @@ export interface CliRunResult {
 
 /** 是否为受支持的 CLI 引擎 id。 */
 export function isCliId(value: string): value is CliId {
-  return value === "claude" || value === "codex";
+  return (CLI_IDS as readonly string[]).includes(value);
+}
+
+/** `/engine claude 或 /engine codex 或 /engine cursor` */
+export function formatEngineChoices(separator = ' 或 '): string {
+  return CLI_IDS.map((id) => `/engine ${id}`).join(separator);
+}
+
+/** `claude|codex|cursor` */
+export function formatEngineIds(separator = '|'): string {
+  return CLI_IDS.join(separator);
 }

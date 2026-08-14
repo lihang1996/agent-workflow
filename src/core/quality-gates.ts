@@ -28,6 +28,14 @@ export const GateCheckStatusSchema = z.enum(['pass', 'fail', 'blocked', 'unverif
 export type GateCheckStatus = z.infer<typeof GateCheckStatusSchema>;
 
 /**
+ * 命令数组的单个元素（argv 的一项）允许的最大字符数。
+ * Codex/Claude 常用 `/bin/zsh -lc "CHECK_START=... node -e '...'"` 格式，
+ * 内联脚本动辄 3000-5000 字符；2000 太紧导致整条流水线中断。
+ * 10000 足够覆盖绝大多数内联脚本，同时仍能防止失控输出。
+ */
+const MAX_COMMAND_PART_CHARS = 10_000;
+
+/**
  * LLM 输出兼容层：把 GATE_RESULT / change-plan 常见别名与错误形状归一化。
  * 目标是挡住低级格式问题（字符串当数组、INFO severity、accepted status 等），
  * 不放行真正缺失的关键字段或未识别的危险取值。
@@ -430,7 +438,22 @@ function normalizeCheckInput(input: unknown): unknown {
   const raw = { ...(input as Record<string, unknown>) };
   // 命令字符串无法可靠保留 shell quoting，不能作为可复现 argv 证据。
   if (Array.isArray(raw.command)) {
-    raw.command = raw.command.map((part) => String(part).trim()).slice(0, 100);
+    // P 修复：Codex/Claude 经常生成长内联脚本命令（/bin/zsh -lc "CHECK_START=... node -e '...'")
+    // 超过旧 2000 字符限制导致整条流水线中断。这里先截断到 MAX_COMMAND_PART_CHARS，
+    // 再由 schema 校验通过；截断的命令仍然保留了可复现性主体（命令名、关键参数）。
+    raw.command = raw.command
+      .map((part) => {
+        const s = String(part).trim();
+        if (s.length > MAX_COMMAND_PART_CHARS) {
+          console.warn(
+            `[门禁] check command 元素超过 ${MAX_COMMAND_PART_CHARS} 字符，已截断（原长 ${s.length}）。建议将长脚本写入临时文件。`,
+          );
+          return s.slice(0, MAX_COMMAND_PART_CHARS);
+        }
+        return s;
+      })
+      .filter((s) => s.length > 0)
+      .slice(0, 100);
   }
   if (typeof raw.exitCode === 'string' && /^-?\d+$/.test(raw.exitCode.trim())) {
     raw.exitCode = Number(raw.exitCode.trim());
@@ -584,10 +607,10 @@ export const GateFindingSchema = z.preprocess(
     status: GateFindingStatusSchema.default('open'),
     category: z.enum(GATE_FINDING_CATEGORIES).optional(),
     confidence: z.enum(['low', 'medium', 'high']).optional(),
-    impact: z.string().trim().min(1).max(2_000).optional(),
+    impact: z.string().trim().min(1).max(10_000).optional(),
     exploitability: z.enum(GATE_FINDING_EXPLOITABILITIES).optional(),
     summary: z.string().trim().min(1).max(4_000),
-    evidence: z.array(z.string().trim().min(1).max(2_000)).max(100).default([]),
+    evidence: z.array(z.string().trim().min(1).max(10_000)).max(100).default([]),
     waiver: z.preprocess((input) => {
       if (!input || typeof input !== 'object' || Array.isArray(input)) return input;
       const raw = { ...(input as Record<string, unknown>) };
@@ -638,7 +661,9 @@ export const GateCheckSchema = z.preprocess(
   normalizeCheckInput,
   z.object({
     id: z.string().trim().min(1).max(200),
-    command: z.array(z.string().trim().min(1).max(2_000)).min(1).max(100),
+    // P 修复：从 2000 提高到 MAX_COMMAND_PART_CHARS（10000）。
+    // Codex/Claude 生成的 /bin/zsh -lc "CHECK_START=... node -e '...'" 经常超过 2000。
+    command: z.array(z.string().trim().min(1).max(MAX_COMMAND_PART_CHARS)).min(1).max(100),
     status: GateCheckStatusSchema,
     required: z.boolean().default(true),
     /**
@@ -757,7 +782,9 @@ export function parseCanonicalSpecWaivers(content: string): CanonicalWaiverDecla
     const remainder = cleaned.slice(afterMarker);
     const braceOffset = remainder.search(/\{/);
     if (braceOffset < 0 || braceOffset > 120 || /[^\s`*'":-]/.test(remainder.slice(0, Math.max(0, braceOffset)))) {
-      throw new Error('canonical Spec 的 [RISK_WAIVER] 后必须紧跟完整 JSON 对象');
+      // Skill/提示词示例常被抄进正文且没有 JSON。无 JSON 的字面量不构成授权，忽略以免整轮作废。
+      from = afterMarker;
+      continue;
     }
     const json = extractBalancedJsonObject(cleaned, afterMarker + braceOffset);
     if (!json) throw new Error('canonical Spec 的 [RISK_WAIVER] JSON 未闭合');
@@ -782,6 +809,16 @@ export function parseCanonicalSpecWaivers(content: string): CanonicalWaiverDecla
     from = afterMarker + braceOffset + json.length;
   }
   return declarations;
+}
+
+/** 是否存在已解析的风险接受条款；解析失败时按「含条款」处理，避免从截断预览直接开始交付。 */
+export function canonicalSpecHasRiskWaivers(content: string): boolean {
+  try {
+    return parseCanonicalSpecWaivers(content).length > 0;
+  } catch {
+    const cleaned = content.replace(/```[\s\S]*?```/g, '').replace(/~~~[\s\S]*?~~~/g, '');
+    return cleaned.includes(CANONICAL_WAIVER_MARKER);
+  }
 }
 
 /**

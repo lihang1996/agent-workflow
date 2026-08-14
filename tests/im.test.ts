@@ -108,6 +108,16 @@ test('缺少稳定需求 ID 的历史待确认卡不显示任何确认入口', (
   assert.match(serialized, /不提供确认入口/);
 });
 
+test('仅提及 RISK_WAIVER 字面量、没有 JSON 条款时仍可直接开始技术交付', () => {
+  const card = buildSpecConfirmationCard({
+    ...spec('pending_confirmation'),
+    content: '### RQ-001 登录\n本轮不登记 [RISK_WAIVER]。',
+  });
+  const serialized = JSON.stringify(card);
+  assert.match(serialized, /confirm_spec_start/);
+  assert.doesNotMatch(serialized, /必须发布到飞书云文档完成全文评审/);
+});
+
 test('云文档标题会去掉换行并截断到飞书上限', () => {
   assert.equal(
     sanitizeDocumentTitle('产品 Spec · 目标\n第二行还有很多字'),

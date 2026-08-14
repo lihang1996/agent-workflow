@@ -114,9 +114,14 @@ const PRIOR_CONTEXT_KEYS: Record<PipelineStepId, readonly string[]> = {
 const PRIOR_CONTEXT_TOTAL_LIMIT = 36_000;
 
 const CANONICAL_WAIVER_SPEC_INSTRUCTION =
-  '只有用户已经明确接受的已知风险，才可在风险条目后单独写入一行 '
-  + '`[RISK_WAIVER] {"findingId":"FIND-...","owner":"...","reason":"...","scope":"...",'
-  + '"compensatingControl":"...","expiresAt":"带时区的 ISO 时间"}`；不得替用户决定、填占位值或为未来未知风险预授权。';
+  '没有用户已明确接受的风险时，Spec 正文不要出现 RISK_WAIVER 标记（包括说明、示例、非目标）。'
+  + '只有用户已经明确接受的已知风险，才可单独一行写入该标记并紧跟完整 JSON 对象，'
+  + '字段为 findingId、owner、reason、scope、compensatingControl、expiresAt（带时区的 ISO 时间）；'
+  + '不得把本说明、省略号占位或未闭合对象写进 Spec，不得替用户决定或为未来未知风险预授权。'
+  + '交卷前把 Spec 写入临时 markdown，运行 '
+  + skillPath('establish-delivery-contract').replace(/SKILL\.md$/, 'scripts/validate-spec-markdown.mjs')
+  + ' <该文件>；脚本失败则先修正再输出，不要把未校验正文交给控制器。'
+  + '若控制器因 Spec 结构拒绝，会在同一 CLI 会话纠偏一次（Claude/Codex/Cursor 相同），不要重新做项目发现。';
 
 function priorBlock(step: PipelineStep, priorOutputs: Record<string, string>): string {
   const entries = PRIOR_CONTEXT_KEYS[step.id]
@@ -142,6 +147,7 @@ function skillInstruction(step: PipelineStep): string {
   return [
     '强制 Skill：' + skillPath(skillName),
     '执行前必须完整读取该 SKILL.md，并按其中的渐进式路由读取所需 references/ 和运行 scripts/。',
+    '交卷前必须跑通本 Skill 的 validate-*.mjs。控制器若因 RESULT/GATE_RESULT/Spec 结构拒绝，会在同一 CLI 会话纠偏一次（Claude/Codex/Cursor 相同），不要重新做完整探索。',
     '缺少前置输入、命令未实际执行或证据不可定位时，不得报告 pass。',
   ].join('\n');
 }

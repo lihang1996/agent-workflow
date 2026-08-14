@@ -564,7 +564,13 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
       resultProtocol: step.id !== 'pm',
       acceptFailedResultIfValidated: step.id === 'architect',
       treatFailedResultAsDone: step.id === 'summary',
-      validateSuccess: workflow.qualityPolicy === 'gated' && gateIdForStep(step.id)
+      validateSuccess: step.id === 'pm'
+        ? async (answer) => {
+          if (await ctx.questionnaires.latestAwaitingForWorkflow(workflow.id)) return;
+          if (await ctx.questionnaires.recoverAwaitingFromProductOutput(answer, workflow.id)) return;
+          assertProductStepSpecOutput(answer);
+        }
+        : workflow.qualityPolicy === 'gated' && gateIdForStep(step.id)
         ? async (answer) => {
           await assertRuntimeSourceCurrent(ctx);
           preparedGateCompletion = await buildGateCompletion(
@@ -2133,6 +2139,7 @@ async function failWorkflow(
         'awaiting_spec_confirmation',
         'awaiting_doc_review',
         'awaiting_step_unblock',
+        'paused',
       ],
       { status: 'failed', error: normalizedError },
     );
@@ -2411,19 +2418,87 @@ export async function resumeBlockedWorkflowStep(
   return requireWorkflow(ctx, resumed.id);
 }
 
+/** 用户点停止后暂停流水线；不进入 failed，也不进入可自动恢复集合。 */
+export function workflowHasLiveCli(ctx: AppContext, workflowId: string): boolean {
+  // 以 activeRuns 是否仍持有该工作流为准：abort 之后进程组可能还在写盘，
+  // 不能只看 signal.aborted，否则 /workflow retry 会叠跑。
+  return [...ctx.activeRuns.values()].some((run) => run.workflowId === workflowId);
+}
+
+export function userStopResumeHint(workflowId: string): string {
+  return [
+    '流水线已暂停，不会自动继续。',
+    `需要从当前步骤恢复时，发送：/workflow retry ${workflowId}`,
+  ].join('\n');
+}
+
+export async function pauseWorkflowOnUserStop(
+  ctx: AppContext,
+  workflowId: string,
+): Promise<DeliveryWorkflow> {
+  const current = requireWorkflow(ctx, workflowId);
+  if (current.status === 'paused') return current;
+  if (current.status !== 'executing') {
+    throw new Error(`无法暂停：工作流当前状态为 ${current.status}，不是 executing`);
+  }
+  const paused = await ctx.workflows.updateIfStatus(workflowId, 'executing', {
+    status: 'paused',
+    error: '用户停止了当前步骤，流水线已暂停，不会自动继续。',
+  });
+  if (!paused) {
+    throw new Error(
+      `无法暂停：工作流当前状态为 ${ctx.workflows.get(workflowId)?.status ?? 'unknown'}，停止指令未能落地`,
+    );
+  }
+  return paused;
+}
+
+export async function resumePausedOrOrphanedWorkflow(
+  ctx: AppContext,
+  workflowId: string,
+): Promise<DeliveryWorkflow> {
+  const workflow = requireWorkflow(ctx, workflowId);
+  const orphanedExecuting = workflow.status === 'executing' && !workflowHasLiveCli(ctx, workflowId);
+  if (workflow.status !== 'paused' && !orphanedExecuting) {
+    throw new Error(`工作流当前状态为 ${workflow.status}，不在暂停中。`);
+  }
+  if (workflowHasLiveCli(ctx, workflowId)) {
+    throw new Error('当前步骤的 CLI 仍在退出，请稍后再发送 /workflow retry。');
+  }
+  const restored = await ctx.workflows.updateIfStatus(
+    workflowId,
+    workflow.status,
+    { status: 'ready', error: undefined },
+  );
+  if (!restored) {
+    throw new Error(`工作流当前状态为 ${ctx.workflows.get(workflowId)?.status ?? 'unknown'}，无法从暂停恢复。`);
+  }
+  return restored;
+}
+
 export async function abortBlockedWorkflow(
   ctx: AppContext,
   workflowId: string,
   reason = '用户终止流水线',
 ): Promise<DeliveryWorkflow> {
   const workflow = requireWorkflow(ctx, workflowId);
-  // P1 修复：支持任意非终态状态的终止，不只是 awaiting_step_unblock。
+  // 支持任意非终态状态的终止（含 paused），不只是 awaiting_step_unblock。
   const terminalStatuses = new Set(['completed', 'failed']);
   if (terminalStatuses.has(workflow.status)) {
     throw new Error(`工作流当前状态为 ${workflow.status}，无需终止。`);
   }
+  for (const run of ctx.activeRuns.values()) {
+    if (run.workflowId !== workflowId) continue;
+    run.cancelMode = 'stop';
+    run.interruptReason = reason;
+    if (!run.controller.signal.aborted) run.controller.abort();
+  }
   await failWorkflow(ctx, workflowId, reason);
-  return requireWorkflow(ctx, workflowId);
+  const after = requireWorkflow(ctx, workflowId);
+  if (after.status !== 'failed') {
+    throw new Error(`无法终止：工作流当前状态为 ${after.status}。`);
+  }
+  return after;
 }
 
 async function firstBindableWorkdir(candidates: string[]): Promise<string | undefined> {

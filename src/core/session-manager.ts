@@ -74,7 +74,7 @@ export class SessionManager {
     this.now = options.now ?? (() => new Date());
     this.createId = options.createId ?? randomUUID;
     this.store = options.store;
-    this.defaultCliId = options.defaultCliId ?? 'claude';
+    this.defaultCliId = options.defaultCliId ?? 'cursor';
   }
 
   /** 从持久化存储恢复会话管理器。 */
@@ -101,6 +101,11 @@ export class SessionManager {
   /** 按会话 UUID 查找。 */
   get(sessionId: string): Session | undefined {
     return [...this.sessions.values()].find((session) => session.id === sessionId);
+  }
+
+  /** 列出全部会话，供启动时对齐默认引擎。 */
+  list(): Session[] {
+    return [...this.sessions.values()];
   }
 
   /** 解析或创建「话题 + Bot」对应的会话。 */

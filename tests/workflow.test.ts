@@ -27,9 +27,12 @@ import {
   confirmSpecAndStartDelivery,
   completeProductStep,
   ensureCanonicalSpecSnapshotFile,
+  pauseWorkflowOnUserStop,
   reconcileWorkflowTopicCliIds,
   reconcileWorkflowSpecStates,
   rejectSpecConfirmation,
+  abortBlockedWorkflow,
+  resumePausedOrOrphanedWorkflow,
   runDeliverySquad,
   runTeamPipeline,
 } from '../src/runtime/pipeline-runner.js';
@@ -749,11 +752,18 @@ test('PM 未创建问卷时不能把内联澄清问题保存成待确认 Spec', 
     assert.equal(cards.length, 0);
     assert.equal(replies.length, 0);
 
-    await completeProductStep(ctx, workflow.id, 0, pm, '### RQ-001 登录\n- [ ] 可以成功登录');
+    await completeProductStep(
+      ctx,
+      workflow.id,
+      0,
+      pm,
+      '### RQ-001 登录\n- [ ] 可以成功登录\n本轮不登记 [RISK_WAIVER]，也没有已接受风险。',
+    );
     assert.equal(specs.findByWorkflowId(workflow.id)?.status, 'pending_confirmation');
     assert.equal(workflows.get(workflow.id)?.status, 'awaiting_spec_confirmation');
     assert.equal(cards.length, 1);
     assert.match(replies[0] ?? '', /产品 Spec 已生成/);
+    assert.match(JSON.stringify(cards[0]), /confirm_spec_start/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -824,6 +834,143 @@ test('工作流支持在云文档评审节点暂停', async () => {
     const waiting = await store.update(workflow.id, { status: 'awaiting_doc_review', nextStepIndex: 1 });
     assert.equal(waiting.status, 'awaiting_doc_review');
     assert.equal(store.listRecoverable().length, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('用户停止任务后流水线进入 paused，重启不会自动续跑，retry 才从当前步骤继续', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-workflow-paused-'));
+  try {
+    const workflows = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const stepIds = DEFAULT_PIPELINE_STEPS.map((step) => step.id);
+    const workflow = await workflows.create({
+      kind: 'team',
+      name: '团队交付流水线',
+      initiatorBotId: 'ceo',
+      goal: '全站焦点',
+      stepIds,
+      qualityPolicy: 'gated',
+      projectRoot: '/project/paused',
+      message: { messageId: 'om', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt', senderOpenId: 'ou' },
+    });
+    await workflows.update(workflow.id, {
+      status: 'executing',
+      nextStepIndex: 3,
+      priorOutputs: { pm: 'spec', architect: 'plan', dev: 'impl' },
+    });
+    const ctx = { workflows, activeRuns: new Map() } as import('../src/runtime/app-context.js').AppContext;
+    const paused = await pauseWorkflowOnUserStop(ctx, workflow.id);
+    assert.equal(paused.status, 'paused');
+    assert.equal(workflows.listRecoverable().length, 0);
+    assert.equal((await pauseWorkflowOnUserStop(ctx, workflow.id)).status, 'paused');
+
+    const second = await workflows.create({
+      kind: 'team',
+      name: '另一条',
+      initiatorBotId: 'ceo',
+      goal: '冲突',
+      stepIds,
+      qualityPolicy: 'gated',
+      projectRoot: '/project/paused',
+      message: { messageId: 'om-2', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt-2', senderOpenId: 'ou' },
+    });
+    await workflows.update(second.id, { status: 'awaiting_spec_confirmation', nextStepIndex: 1 });
+    await assert.rejects(
+      () => pauseWorkflowOnUserStop(ctx, second.id),
+      /不是 executing/,
+    );
+
+    // 自动终止 paused 工作流，新工作流可以直接激活
+    const activated = await workflows.activateTechnicalDelivery(second.id, 'awaiting_spec_confirmation');
+    assert.equal(activated?.status, 'ready');
+    assert.equal(workflows.get(workflow.id)?.status, 'failed');
+    assert.match(workflows.get(workflow.id)?.error ?? '', /已自动终止本工作流/);
+
+    // 为 resume 测试创建第三个独立项目的工作流
+    const third = await workflows.create({
+      kind: 'team',
+      name: '第三条',
+      initiatorBotId: 'ceo',
+      goal: '独立项目',
+      stepIds,
+      qualityPolicy: 'gated',
+      projectRoot: '/project/resume-test',
+      message: { messageId: 'om-3', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt-3', senderOpenId: 'ou' },
+    });
+    await workflows.update(third.id, {
+      status: 'executing',
+      nextStepIndex: 2,
+      priorOutputs: { pm: 'spec', architect: 'plan' },
+    });
+    await pauseWorkflowOnUserStop(ctx, third.id);
+
+    // 测试 resumePausedOrOrphanedWorkflow 在有 dying session 时的行为
+    const dying = new AbortController();
+    dying.abort();
+    ctx.activeRuns.set('dying-session', {
+      workflowId: third.id,
+      controller: dying,
+    } as import('../src/runtime/types.js').ActiveRun);
+    await assert.rejects(
+      () => resumePausedOrOrphanedWorkflow(ctx, third.id),
+      /仍在退出/,
+    );
+    ctx.activeRuns.delete('dying-session');
+
+    // 现在可以恢复 paused 工作流
+    const resumed = await resumePausedOrOrphanedWorkflow(ctx, third.id);
+    assert.equal(resumed.status, 'ready');
+    assert.equal(resumed.nextStepIndex, 2);
+    assert.equal(resumed.error, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('paused 工作流会被自动终止，为同项目新工作流让路', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-workflow-abort-lease-'));
+  try {
+    const workflows = await JsonWorkflowStore.open(join(root, 'workflows.json'));
+    const stepIds = DEFAULT_PIPELINE_STEPS.map((step) => step.id);
+    const occupied = await workflows.create({
+      kind: 'team',
+      name: '旧交付',
+      initiatorBotId: 'ceo',
+      goal: '焦点环',
+      stepIds,
+      qualityPolicy: 'gated',
+      projectRoot: '/project/shared',
+      message: { messageId: 'om-old', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt-old', senderOpenId: 'ou' },
+    });
+    await workflows.update(occupied.id, {
+      status: 'executing',
+      nextStepIndex: 3,
+      priorOutputs: { pm: 'spec', architect: 'plan', dev: 'impl' },
+    });
+    const ctx = {
+      workflows,
+      activeRuns: new Map(),
+      botsById: new Map(),
+    } as import('../src/runtime/app-context.js').AppContext;
+    await pauseWorkflowOnUserStop(ctx, occupied.id);
+
+    const waiting = await workflows.create({
+      kind: 'team',
+      name: '新交付',
+      initiatorBotId: 'ceo',
+      goal: 'P0',
+      stepIds,
+      qualityPolicy: 'gated',
+      projectRoot: '/project/shared',
+      message: { messageId: 'om-new', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt-new', senderOpenId: 'ou' },
+    });
+    await workflows.update(waiting.id, { status: 'awaiting_spec_confirmation', nextStepIndex: 1 });
+    // 自动终止 paused 工作流，新工作流可以直接激活
+    const activated = await workflows.activateTechnicalDelivery(waiting.id, 'awaiting_spec_confirmation');
+    assert.equal(activated?.status, 'ready');
+    assert.equal(workflows.get(occupied.id)?.status, 'failed');
+    assert.match(workflows.get(occupied.id)?.error ?? '', /已自动终止本工作流/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { z } from 'zod';
-import type { CliId } from '../cli/types.js';
+import { CLI_IDS, type CliId } from '../cli/types.js';
 
 export interface TopicSettings {
   chatId: string;
@@ -18,13 +18,14 @@ export interface TopicStore {
   clearWorkdir(chatId: string, threadId: string): Promise<void>;
   getCliId(chatId: string, threadId: string): CliId | undefined;
   setCliId(chatId: string, threadId: string, cliId: CliId): Promise<TopicSettings>;
+  list(): TopicSettings[];
 }
 
 const TopicSchema = z.object({
   chatId: z.string().min(1),
   threadId: z.string().min(1),
   workdir: z.string().min(1).optional(),
-  cliId: z.enum(['claude', 'codex']).optional(),
+  cliId: z.enum(CLI_IDS).optional(),
   updatedAt: z.iso.datetime(),
 }).refine((topic) => !!topic.workdir || !!topic.cliId, {
   message: '话题设置必须至少包含 workdir 或 cliId',
@@ -61,6 +62,11 @@ export class JsonTopicStore implements TopicStore {
   /** 读取话题统一执行引擎。 */
   getCliId(chatId: string, threadId: string): CliId | undefined {
     return this.topics.get(topicKey(chatId, threadId))?.cliId;
+  }
+
+  /** 列出全部话题设置，供启动时对齐默认引擎。 */
+  list(): TopicSettings[] {
+    return [...this.topics.values()];
   }
 
   /** 设置话题工作目录并落盘。 */

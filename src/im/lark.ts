@@ -134,6 +134,8 @@ export interface Bot {
     saveDir: string,
     fileName?: string,
   ) => Promise<string>;
+  /** 关闭飞书 WS 长连接，停止接收事件。 */
+  disconnect: () => void;
 }
 
 const CONTENT_TYPE_EXTENSIONS: Record<string, string> = {
@@ -654,6 +656,8 @@ export async function startBot(opts: BotOptions): Promise<Bot> {
       }));
     },
 
+    disconnect() {},
+
     /** 下载消息中的图片/文件到本地。 */
     async downloadResource(messageId, fileKey, type, saveDir, fileName) {
       const res = await withFeishuRetry('下载飞书消息资源', () => client.im.v1.messageResource.get({
@@ -744,6 +748,16 @@ export async function startBot(opts: BotOptions): Promise<Bot> {
 
   const wsClient = new Lark.WSClient({ appId, appSecret });
   wsClient.start({ eventDispatcher: dispatcher });
+  let disconnected = false;
+  bot.disconnect = () => {
+    if (disconnected) return;
+    disconnected = true;
+    try {
+      wsClient.close({ force: true });
+    } catch (error) {
+      console.error(`[飞书] 断开 bot=${bot.id} 失败:`, sanitizeForLog((error as Error).message, 1_000));
+    }
+  };
 
   return bot;
 }

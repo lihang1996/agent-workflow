@@ -58,6 +58,8 @@ description: "在代码准备交付、合并或发布时，基于最终项目快
 其中 `evidenceChain` 必须原样复制 `workflow_context.controllerEvidenceChain`，形状为
 `{"path":"绝对路径/evidence-chain.json","sha256":"64位真实哈希"}`；只写文件名或口头声称已读取无效。
 把结构化输出保存到控制器提供的 `evidenceRoot`，计算真实 SHA-256，并写入 `[GATE_RESULT].artifacts`。
+`checks[].command` 每个数组元素上限 10000 字符。长内联脚本（如 `node -e '...'` 或 `/bin/zsh -lc '...'`）
+必须先写入临时文件（如 `evidenceRoot/check-xxx.mjs`），再用 `node check-xxx.mjs` 作为 command，避免超限截断。
 `evidence-chain.json` 由控制器生成且只读，Reviewer 不得修改或重算其中登记值。
 
 最终快照未验证、有未解决 P0/P1、证据缺失/过期/hash 不匹配或只给文本结论时阻止交付。

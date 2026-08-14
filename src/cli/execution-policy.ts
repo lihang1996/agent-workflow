@@ -230,19 +230,19 @@ function localNetworkInstruction(expectation: CliCapabilityExpectation): string 
   if (expectation.expected === 'loopback') {
     return [
       `[本机网络能力：已请求；reason=${expectation.reason}]`,
-      '本次已向 Codex 请求工作区写入与本机回环网络（permission profile，含 allow_local_binding），用于当前项目的测试服务、浏览器和隔离测试库；不得探测无关本地服务。',
+      '本次已向当前 CLI 请求工作区写入与本机回环网络（含本机绑定），用于当前项目的测试服务、浏览器和隔离测试库；不得探测无关本地服务。',
       '“已请求”不等于运行时已授予；若实际执行仍返回受限、EPERM 或连接被拒绝，必须如实报告阻塞，不能伪造验收证据。',
     ].join('\n');
   }
   if (expectation.expected === 'sandbox-provided') {
     return [
       `[本机网络能力：由运行时提供；reason=${expectation.reason}]`,
-      '本次 Codex 权限与 Claude dontAsk 对齐：不启用旧 `--sandbox`，使用 `:danger-full-access` permission profile，可完成本机构建、测试服务、浏览器和隔离测试库；仍必须遵守本任务的审批范围和其它执行边界。',
+      '本次权限与 Claude dontAsk 对齐：可完成本机构建、测试服务、浏览器和隔离测试库；仍必须遵守本任务的审批范围和其它执行边界。',
     ].join('\n');
   }
   return [
     `[本机网络能力：未请求；reason=${expectation.reason}]`,
-    '本次没有向 Codex 请求本机回环网络；不得声称能够启动或连接本地服务。需要该能力时必须由调用方重新发起带明确网络请求的任务。',
+    '本次没有向当前 CLI 请求本机回环网络；不得声称能够启动或连接本地服务。需要该能力时必须由调用方重新发起带明确网络请求的任务。',
   ].join('\n');
 }
 

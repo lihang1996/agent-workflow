@@ -1,5 +1,5 @@
 import { getAdapter } from '../cli/registry.js';
-import { isCliId } from '../cli/types.js';
+import { formatEngineChoices, formatEngineIds, isCliId } from '../cli/types.js';
 import { parseCommand } from '../core/command-parser.js';
 import {
   buildHandoffPrompt,
@@ -49,7 +49,7 @@ import {
 } from './active-runs.js';
 import { startCliTask } from './cli-task.js';
 import { runCollabReview } from './collab-runner.js';
-import { rewindStepIdFromDriftMessage } from '../core/quality-gates.js';
+import { canonicalSpecHasRiskWaivers, rewindStepIdFromDriftMessage } from '../core/quality-gates.js';
 import {
   findMisroutedEnvironmentBlock,
   requiresTestResourceAuthorization,
@@ -65,9 +65,13 @@ import {
   confirmSpecForReview,
   confirmSpecAndStartDelivery,
   continueDeliveryWorkflow,
+  pauseWorkflowOnUserStop,
   rejectSpecConfirmation,
   resumeBlockedWorkflowStep,
+  resumePausedOrOrphanedWorkflow,
   resumeWorkflowAfterQuestionnaire,
+  userStopResumeHint,
+  workflowHasLiveCli,
 } from './pipeline-runner.js';
 import { approveSpecReview, publishSpecToDoc, requestSpecChangesFromCard } from './spec-review.js';
 import { executeApprovedAction, requestHighRiskApproval } from './approval-runner.js';
@@ -220,7 +224,7 @@ export async function handleMessage(
         [
           `本话题统一引擎：${getAdapter(effectiveCliId).displayName} (${effectiveCliId})`,
           topicCliId ? '所有角色及后续新建角色都会继承此设置。' : '尚未保存话题级设置；当前仅显示本角色引擎。',
-          '用法：/engine claude 或 /engine codex',
+          `用法：${formatEngineChoices()}`,
         ].join('\n'),
         hasThread,
       );
@@ -228,7 +232,7 @@ export async function handleMessage(
     }
     const next = command.arg.toLowerCase();
     if (!isCliId(next)) {
-      await bot.reply(msg.messageId, '只支持 /engine claude 或 /engine codex', hasThread);
+      await bot.reply(msg.messageId, `只支持 ${formatEngineChoices()}`, hasThread);
       return;
     }
     try {
@@ -447,6 +451,7 @@ export async function handleMessage(
         task: command.arg,
         round: 1,
         allowFixes: false,
+        executionPolicy: 'read-only',
       });
     } catch (error) {
       await bot.reply(msg.messageId, (error as Error).message, hasThread);
@@ -766,6 +771,37 @@ export async function handleMessage(
           });
           return;
         }
+        try {
+          const restored = await resumePausedOrOrphanedWorkflow(ctx, workflowId);
+          const stepName = restored.stepIds[restored.nextStepIndex] ?? '(结束)';
+          try {
+            await bot.reply(
+              msg.messageId,
+              `流水线已从暂停恢复，正在从步骤 ${stepName} 继续…`,
+              hasThread,
+            );
+          } catch (notifyError) {
+            console.error('[工作流] retry 暂停恢复通知失败，仍继续续跑:', (notifyError as Error).message);
+          }
+          void continueDeliveryWorkflow(ctx, workflowId).catch(async (error) => {
+            const message = (error as Error).message;
+            console.error(`[工作流] retry 续跑失败:`, message);
+            await bot.reply(msg.messageId, `续跑失败：${message}`, hasThread).catch(() => undefined);
+          });
+          return;
+        } catch (pausedError) {
+          if (workflow.status === 'executing' && workflowHasLiveCli(ctx, workflowId)) {
+            await bot.reply(
+              msg.messageId,
+              '当前步骤仍在执行，无需 retry。若要重来请先点卡片「停止任务」。',
+              hasThread,
+            );
+            return;
+          }
+          if (workflow.status !== 'awaiting_step_unblock') {
+            throw pausedError;
+          }
+        }
         if (await handOffBlockedWorkflowIfQualityFix(ctx, workflowId)) {
           await bot.reply(
             msg.messageId,
@@ -781,12 +817,32 @@ export async function handleMessage(
       }
       return;
     }
+    if (subcommand === 'abort' && workflowId) {
+      try {
+        const workflow = ctx.workflows.get(workflowId);
+        if (!workflow) throw new Error(`工作流不存在: ${workflowId}`);
+        assertCanControlOwnedResource(workflow.message.senderOpenId, operator, ctx.identities);
+        const aborted = await abortBlockedWorkflow(ctx, workflowId, '用户发送 /workflow abort 终止流水线');
+        await bot.reply(
+          msg.messageId,
+          [
+            `已终止工作流 ${aborted.id}，技术交付占用已释放。`,
+            '若另一条产品 Spec 仍待确认，可再次点「确认并直接开始技术交付」。',
+          ].join('\n'),
+          hasThread,
+        );
+      } catch (error) {
+        await bot.reply(msg.messageId, (error as Error).message, hasThread);
+      }
+      return;
+    }
     await bot.reply(
       msg.messageId,
       [
         '用法：',
-        '/workflow retry <工作流ID> — 失败工作流从当前步骤重试，或重新发送阻塞卡',
-        '工作流 ID 可在终端日志或 data/workflows.json 中查找。',
+        '/workflow retry <工作流ID> — 从失败、暂停或阻塞处继续当前步骤',
+        '/workflow abort <工作流ID> — 终止未完成流水线并释放项目占用',
+        '工作流 ID 可在终端日志、占用报错或 data/workflows.json 中查找。',
       ].join('\n'),
       hasThread,
     );
@@ -796,8 +852,17 @@ export async function handleMessage(
     const running = ctx.activeRuns.get(session.id);
     if (running) {
       running.cancelMode = 'close';
-      running.interruptReason = '本次任务已停止，当前会话已经关闭。';
+      running.interruptReason = running.workflowId
+        ? userStopResumeHint(running.workflowId)
+        : '本次任务已停止，当前会话已经关闭。';
       running.controller.abort();
+      if (running.workflowId) {
+        try {
+          await pauseWorkflowOnUserStop(ctx, running.workflowId);
+        } catch (error) {
+          console.error('[工作流] 停止后暂停流水线失败:', (error as Error).message);
+        }
+      }
     }
     if (session.status !== 'closed') await ctx.sessions.transition(session.id, 'closed');
     await bot.reply(
@@ -932,8 +997,9 @@ function buildHelpText(bot: Bot): string {
       '/handoff <角色> <任务> 只交给某一个角色',
       '/status 查看当前会话',
       '/workdir [路径] 查看/设置本话题项目目录（clear 清除）',
-      '/engine claude|codex 统一切换本话题所有角色的执行引擎',
+      `/engine ${formatEngineIds()} 统一切换本话题所有角色的执行引擎`,
       '/review <任务> 只读独立审查（修复请进入 /squad）',
+      '/workflow retry|abort <工作流ID> 续跑或终止流水线',
       '/reset /reopen /close /clean 会话管理',
       '执行中可点任务卡片「停止任务」（仅发起人）',
     ].join('\n');
@@ -944,12 +1010,13 @@ function buildHelpText(bot: Bot): string {
     '团队需求请先 @CEO助手；我适合承接本角色的具体任务。',
     '/status 查看当前会话',
     '/workdir [路径] 查看/设置本话题项目目录（clear 清除）',
-    '/engine claude|codex 统一切换本话题所有角色的执行引擎',
+    `/engine ${formatEngineIds()} 统一切换本话题所有角色的执行引擎`,
     '/handoff <角色> <任务> 交接给同话题其他角色',
     '/review <任务> 只读独立审查（修复请进入 /squad）',
     '/squad <目标> 架构→开发→评审→QA→运行时审计→终审',
     '/schedule … 创建/管理定时任务',
     '/approval <任务> 发起高风险操作审批',
+    '/workflow retry|abort <工作流ID> 续跑或终止流水线',
     '/reset /reopen /close /clean 会话管理',
     '执行中可点任务卡片「停止任务」（仅发起人）',
   ].join('\n');
@@ -1405,16 +1472,34 @@ export async function handleCardAction(
   freezeRunCard(run);
   run.terminalStatus = 'interrupted';
   run.cardSettledByCallback = true;
-  const detail = '本次任务已停止。你可以继续在当前话题里提问。';
+  const detail = run.workflowId
+    ? userStopResumeHint(run.workflowId)
+    : '本次任务已停止。你可以继续在当前话题里提问。';
   run.interruptReason = detail;
   const outcome = requestTaskAbort(ctx.activeRuns, sessionId, operator, ctx.identities);
   if (outcome !== 'stopped' && outcome !== 'already_stopping') {
     return { toast: { type: 'info' as const, content: '任务已经结束，无需再次停止。' } };
   }
+  let pausedOk = false;
+  if (run.workflowId) {
+    try {
+      await pauseWorkflowOnUserStop(ctx, run.workflowId);
+      pausedOk = true;
+    } catch (error) {
+      console.error('[工作流] 停止后暂停流水线失败:', (error as Error).message);
+    }
+  }
 
   return {
-    toast: { type: 'success' as const, content: '已发送停止指令。' },
-    card: { type: 'raw' as const, data: interruptedCard(run, detail) },
+    toast: {
+      type: pausedOk || !run.workflowId ? 'success' as const : 'warning' as const,
+      content: run.workflowId
+        ? (pausedOk
+          ? '已暂停当前步骤，不会自动继续。'
+          : '已停止 CLI，但流水线状态未能暂停，请查看日志或稍后 /workflow retry。')
+        : '已发送停止指令。',
+    },
+    card: { type: 'raw' as const, data: interruptedCard(run, detail, !!run.workflowId) },
   };
 }
 
@@ -1429,7 +1514,7 @@ function assertSpecApprovalAuthority(
   spec: import('../core/spec-store.js').ProductSpec,
   operator: UserIdentity,
 ): void {
-  if (spec.content.includes('[RISK_WAIVER]')) {
+  if (canonicalSpecHasRiskWaivers(spec.content)) {
     assertOwnedBy(spec.ownerOpenId, operator, ctx.identities);
     return;
   }

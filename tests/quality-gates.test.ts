@@ -22,6 +22,7 @@ import {
   gateResultInstruction,
   parseGateResult,
   parseCanonicalSpecWaivers,
+  canonicalSpecHasRiskWaivers,
   rewindStepIdFromDriftMessage,
   unresolvedOptionalCheckGapIds,
   validateGatePass,
@@ -211,6 +212,15 @@ test('waiver 只能绑定人工确认前 canonical Spec 中的同 ID 风险条�
     () => parseCanonicalSpecWaivers('### RQ-001\n[RISK_WAIVER] {"findingId":"FIND-1"}'),
     /格式错误/,
   );
+  assert.deepEqual(
+    parseCanonicalSpecWaivers('### RQ-001 登录\n本轮不登记 [RISK_WAIVER]。\n不得把示例抄进正文。'),
+    [],
+  );
+  assert.equal(
+    canonicalSpecHasRiskWaivers('### RQ-001 登录\n本轮不登记 [RISK_WAIVER]。'),
+    false,
+  );
+  assert.equal(canonicalSpecHasRiskWaivers(content), true);
 });
 
 test('findings 兼容 INFO severity 与 title/detail 别名', () => {

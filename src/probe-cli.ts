@@ -36,6 +36,13 @@ rl.on("line", (line) => {
       console.log(`${stamp()} 最终回答: ${ev.result}`);
       break;
 
+    case "tool_call":
+      if (ev.subtype === "started") {
+        const kind = Object.keys(ev.tool_call ?? {})[0] ?? "tool";
+        console.log(`${stamp()} 调用工具: ${kind} id=${ev.call_id}`);
+      }
+      break;
+
     // ── Codex ──
     case "thread.started":
       console.log(`${stamp()} 会话开始 thread_id=${ev.thread_id}`);

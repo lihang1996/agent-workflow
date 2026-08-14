@@ -67,6 +67,14 @@ test('契约和设计脚本拒绝缺失验收、并发风险处置及伪造空�
     });
     assert.equal(runScript('skills/establish-delivery-contract/scripts/validate-delivery-contract.mjs', [badContract]).status, 2);
 
+    // 对齐控制器行为：仅提及 [RISK_WAIVER] 字面量但没有 JSON 时，静默忽略（不报错）
+    const bareWaiver = join(root, 'bare-waiver.md');
+    await writeFile(bareWaiver, '### RQ-001 登录\n本轮不登记 [RISK_WAIVER]。\n');
+    assert.equal(runScript('skills/establish-delivery-contract/scripts/validate-spec-markdown.mjs', [bareWaiver]).status, 0);
+    const goodSpec = join(root, 'good-spec.md');
+    await writeFile(goodSpec, '### RQ-001 登录\n- [ ] 可以成功登录\n');
+    assert.equal(runScript('skills/establish-delivery-contract/scripts/validate-spec-markdown.mjs', [goodSpec]).status, 0);
+
     const goodPlan = join(root, 'plan.json');
     await writeJson(goodPlan, {
       contractHash: 'a'.repeat(64), projectFingerprint: 'b'.repeat(64), status: 'pass',

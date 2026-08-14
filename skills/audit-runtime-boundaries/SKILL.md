@@ -60,6 +60,8 @@ description: "在交付包含浏览器界面、HTTP API、公开输入、缓存�
 登记的 `buildHash`；有独立构建产物时使用 `workflow_context.hashPathCommandPrefix` 复核实际
 运行产物，并确认 QA 的 `buildArtifact.path` 仍产生同一 hash，不得启动或探测另一份未验证构建。
 把结构化输出保存到控制器提供的 `evidenceRoot`，计算真实 SHA-256，并写入 `[GATE_RESULT].artifacts`。
+`checks[].command` 每个数组元素上限 10000 字符。长内联脚本（如 `node -e '...'` 或 `/bin/zsh -lc '...'`）
+必须先写入临时文件（如 `evidenceRoot/check-xxx.mjs`），再用 `node check-xxx.mjs` 作为 command，避免超限截断。
 运行时新发现的风险不得由 Agent 自行 waived；只有人工确认前 canonical Spec 已登记的同 ID
 `[RISK_WAIVER]` 才可沿用，控制器会复核 Spec hash 与批准绑定。
 纯库经项目发现证明没有浏览器、HTTP 或部署运行时表面时，输出

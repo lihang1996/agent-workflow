@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { z } from 'zod';
+import { CLI_IDS } from '../cli/types.js';
 import type { Session } from './session-manager.js';
 
 export interface SessionStore {
@@ -14,7 +15,7 @@ const SessionSchema = z.object({
   botId: z.string().trim().min(1).max(100).default('dev'),
   threadId: z.string().trim().min(1).max(200),
   chatId: z.string().trim().min(1).max(200),
-  cliId: z.enum(['claude', 'codex']),
+  cliId: z.enum(CLI_IDS),
   cliSessionId: z.string().trim().min(1).max(500).optional(),
   status: z.enum(['creating', 'active', 'idle', 'closed']),
   createdAt: z.iso.datetime(),

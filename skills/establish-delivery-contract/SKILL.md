@@ -21,11 +21,13 @@ description: "在新项目、功能交付、迁移、恢复旧任务或存在多
 6. 为每条可交付要求分配 `RQ-001`、`RQ-002`…格式的稳定唯一 ID；每条必须以该 ID
    开头（例如 `### RQ-001 登录`），并定义可观察验收、负向场景和证据类型。
 7. 定义运行时、浏览器、数据库、构建、部署和安全基线；不适用项给出依据。
-8. 只有用户已经明确接受的已知风险，才可在 Spec 中登记严格的单行条款：
-   `[RISK_WAIVER] {"findingId":"FIND-...","owner":"...","reason":"...","scope":"...","compensatingControl":"...","expiresAt":"带时区的 ISO 时间"}`。
+8. 没有用户已明确接受的风险时，Spec 正文不要出现 RISK_WAIVER 标记（包括说明、示例、
+   非目标）。只有用户已经明确接受的已知风险，才可单独一行写入该标记并紧跟完整 JSON：
+   findingId、owner、reason、scope、compensatingControl、expiresAt（带时区 ISO）。
    不得替用户决定、使用占位值、代填批准时间，或为未来未知 finding 预授权。
-9. 在 Agent OS 团队流水线中输出含稳定需求 ID 的完整 Spec 正文，由控制器在人工确认后
-   保存 canonical 版本、内容 SHA-256 和项目绑定；独立使用本 Skill 时才生成
+9. 在 Agent OS 团队流水线中输出含稳定需求 ID 的完整 Spec 正文。交卷前把正文写入临时
+   markdown 并运行 `scripts/validate-spec-markdown.mjs`；失败则先修正。控制器在人工确认后
+   保存 canonical 版本、内容 SHA-256 和项目绑定。独立使用本 Skill 时另生成
    `delivery-contract.json` 并运行 `scripts/validate-delivery-contract.mjs`。
 
 ## 强制检查
@@ -35,6 +37,7 @@ description: "在新项目、功能交付、迁移、恢复旧任务或存在多
 - 从真实项目配置确定运行时和依赖版本。
 - 登记所有适用的 lint、typecheck、test、build、migration 和 E2E 命令。
 - 把未验证项明确标为 unverified，禁止写成已通过。
+- 流水线 Spec 必须先通过 `scripts/validate-spec-markdown.mjs` 再输出。
 - `waived` 只能引用人工确认前已存在于 canonical Spec 的同 ID `RISK_WAIVER`；后续 Agent
   生成的 owner、期限或“审批证据”都不构成人工授权。
 
@@ -67,5 +70,6 @@ description: "在新项目、功能交付、迁移、恢复旧任务或存在多
 - 真实失败：用存在多份冲突 Spec 的项目，期望因无 canonical 版本而 fail。
 - 通用案例：用不同目录结构的 API 服务，期望从实际配置生成契约并 pass。
 - 不触发：纯解释或只读代码审查不调用本 Skill。
-- 绕过案例：省略 P0 验收或把冲突写成 warning，校验脚本必须 fail。
+- 绕过案例：省略 P0 验收、把冲突写成 warning，或把 RISK_WAIVER 说明/示例抄进 Spec
+  且后面没有完整 JSON，校验脚本必须 fail。
 - 修复案例：确定 canonical、补齐验收和门禁后应 pass，输出可由架构节点读取。

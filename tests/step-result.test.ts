@@ -54,6 +54,9 @@ test('开发/架构 prompt 要求 RESULT 标记，PM Spec 不要求', () => {
   assert.doesNotMatch(dev, /workflow-id\/report\.json/);
   const pm = buildPipelineStepPrompt(DEFAULT_PIPELINE_STEPS[0], '目标', {});
   assert.doesNotMatch(pm, /\[RESULT:done\]/);
+  assert.match(pm, /validate-spec-markdown\.mjs/);
+  assert.match(pm, /不要出现 RISK_WAIVER 标记/);
+  assert.match(pm, /同一 CLI 会话纠偏一次/);
 });
 
 test('架构师 planned findings 必须 RESULT:done，不得因 FIND 标 failed', () => {
@@ -63,6 +66,7 @@ test('架构师 planned findings 必须 RESULT:done，不得因 FIND 标 failed'
     {},
   );
   assert.match(architect, /P0\/P1 登记为 planned 后必须输出 \[RESULT:done\]/);
+  assert.match(architect, /同一 CLI 会话纠偏一次/);
   assert.match(architect, /禁止把「已规划给开发修的 FIND-\*」写成 \[RESULT:failed\]/);
   assert.match(architect, /设计门禁 planned P0\/P1 必须随 \[RESULT:done\] 通过/);
   assert.doesNotMatch(architect, /发现需改代码的缺陷时用这个/);

@@ -1,6 +1,6 @@
 # Agent OS
 
-> 把飞书变成 AI 编程 CLI（Claude Code / Codex）的指挥台。
+> 把飞书变成 AI 编程 CLI（Claude Code / Codex / Cursor Agent）的指挥台。
 
 ## README 目标
 
@@ -10,7 +10,7 @@
 
 - 一个飞书话题对应一个任务和一组按角色隔离的 CLI 会话。
 - 支持多个 Bot 角色在同一话题中协作，并通过 `/handoff` 在进程内交接任务。
-- 支持 Claude Code 与 Codex 两种本地 CLI 引擎，可按话题切换。
+- 支持 Claude Code、Codex 与 Cursor Agent 三种本地 CLI 引擎，可按话题切换。
 - 任务执行过程通过飞书交互式卡片反馈状态、进度和最近活动。
 - 话题项目目录、会话状态和 CLI 会话 ID 持久化到本地 `data/`。
 
@@ -37,7 +37,7 @@ runtime/message-handler（命令与统一入口）
         ├── 会话 / 话题 / CLI 任务与流式卡片
         ├── 团队流水线 / 问卷 / Spec / 云文档评审
         ├── 定时任务 / 日志巡检 / 高风险审批
-        └── Claude/Codex adapter + CLI runner
+        └── Claude/Codex/Cursor adapter + CLI runner
 
 src/index.ts（启动、恢复、后台同步与信号收尾）
 ```
@@ -50,7 +50,7 @@ src/index.ts（启动、恢复、后台同步与信号收尾）
 | `src/runtime/` | 消息路由、CLI 任务、协作/流水线运行主线 |
 | `src/im/` | 飞书接入、消息解析、交互式任务卡片 |
 | `src/core/` | Bot 配置、会话、话题目录、命令和任务交接 |
-| `src/cli/` | Claude/Codex 适配器、事件解析和子进程运行器 |
+| `src/cli/` | Claude/Codex/Cursor 适配器、事件解析和子进程运行器 |
 | `src/mcp/` | 结构化提问 MCP（propose_questions 等） |
 | `src/probe-cli.ts` | 手工检查 CLI `stream-json` 输出的探针 |
 | `data/` | 运行时生成的会话、工作流、审批、定时任务、Spec 和下载文件（不提交） |
@@ -60,7 +60,7 @@ src/index.ts（启动、恢复、后台同步与信号收尾）
 - Node.js `>= 22`
 - pnpm
 - 可用的飞书应用凭证，并为每个应用开启事件长连接
-- 本机 PATH 中可执行的 `claude` CLI；使用 Codex 时还需要 `codex` CLI
+- 本机 PATH 中可执行的 `claude` CLI；使用 Codex 时还需要 `codex` CLI；使用 Cursor 时还需要 `agent` CLI（`curl https://cursor.com/install -fsS | bash`）
 
 ## 快速开始
 
@@ -69,7 +69,7 @@ src/index.ts（启动、恢复、后台同步与信号收尾）
 - Node.js `>= 22`
 - pnpm
 - 至少一个飞书 Bot 的 App ID 和 App Secret，并为应用开启事件长连接
-- 默认使用 Claude 时，确保 `claude` CLI 已在 PATH 中；使用 Codex 时额外确保 `codex` CLI 可用
+- 默认使用 Cursor 时，确保 `agent` CLI 已在 PATH 中，并配置 `CURSOR_API_KEY` 或已 `agent login`；使用 Claude / Codex 时额外确保对应 CLI 可用
 
 ### 2. 安装依赖
 
@@ -165,7 +165,7 @@ pnpm probe:cli  # 手工查看 CLI 的 JSON 流事件
 
 | 变量 | 说明 | 默认/回退 |
 | --- | --- | --- |
-| `DEFAULT_CLI` | 新会话默认引擎：`claude` 或 `codex` | `claude` |
+| `DEFAULT_CLI` | 新会话默认引擎：`claude`、`codex` 或 `cursor` | `cursor` |
 | `COLLAB_MAX_ROUNDS` | 流水线代码评审↔开发修复的最大协作轮次（1–10；非法值回退为 2） | `2` |
 | `PIPELINE_STEPS` | 固定交付链声明；只能使用完整规范顺序，不能裁剪或重排门禁 | `pm,architect,dev,review,qa,runtime_audit,final_review,summary` |
 | `AGENT_OS_SKILLS_DIR` | 七个交付 Skill 的绝对根目录；通常无需设置 | 仓库内 `skills/` |
@@ -173,11 +173,18 @@ pnpm probe:cli  # 手工查看 CLI 的 JSON 流事件
 | `MCP_STRICT` | Claude 是否加 `--strict-mcp-config` | `false` |
 | `CLAUDE_WORKDIR` | Claude 全局回退目录 | 当前工作目录 |
 | `CODEX_WORKDIR` | Codex 全局回退目录；未设置时继续回退到 `CLAUDE_WORKDIR`、当前工作目录 | 未设置时按上述顺序回退 |
+| `CURSOR_WORKDIR` | Cursor 全局回退目录；未设置时继续回退到 `CLAUDE_WORKDIR`、当前工作目录 | 未设置时按上述顺序回退 |
+| `CURSOR_API_KEY` | Cursor Agent 无头认证；也可用同一终端先 `agent login` | 未设置 |
+| `CURSOR_CLI` | Cursor 可执行文件名 | `agent` |
+| `CURSOR_MODEL` | 传给 `agent --model`。只接受精确的 `cursor-grok-4.6-high`；`auto` 或其它模型会被忽略 | `cursor-grok-4.6-high` |
+| `CURSOR_SANDBOX` | Cursor 普通/已审批任务：`--force --trust --sandbox disabled` 才能无头写文件和本机网络。`--force` 是 YOLO，没有 Claude PreToolUse。设 `enabled` 才收紧。不传 `--auto-review` | `disabled` |
 | `CODEX_SANDBOX` | Codex 普通任务权限：默认与 Claude dontAsk 对齐（`:danger-full-access` permission profile，不传 `--sandbox`）。设 `workspace-write` 或 `read-only` 才会收紧 | 未设置即全权限对齐 Claude |
 | `CODEX_LOCAL_NETWORK_ACCESS` | `false` 时禁止 Codex 本机网络/绑定（会从默认全权限降到无网络的 workspace profile） | `true`（未设置即允许） |
 | `CODEX_APPROVED_SANDBOX` | 已审批 Codex 任务权限；默认同样对齐 Claude skip-permissions。设 `workspace-write` 或 `read-only` 才会收紧 | 未设置即全权限对齐 Claude |
 | `AGENT_OS_TEST_RESOURCE_SENTINEL` | 明确授权 QA 对已通过隔离性预检的测试库执行 migration/TRUNCATE/DROP/seed；不能替代测试库命名与运行库不相等检查 | 未设置（不授权） |
-| `CLI_TIMEOUT_MS` | 单次 Claude/Codex **绝对**超时上限（毫秒）。持续有输出的长任务可跑到此上限；默认 6 小时，最大 12 小时 | `21600000`（6 小时） |
+| `CLI_MAX_TOOL_COUNT` | 单次 CLI 工具调用上限（读文件/改文件/跑命令都算 1 次） | `500` |
+| `CLI_TOOL_LOOP_STREAK` | 连续同目标多少次熔断；`0` 关闭。另检测窗口同参重复和同工具乒乓（警告 10 / 熔断 20） | `15` |
+| `CLI_TIMEOUT_MS` | 单次 CLI **绝对**超时上限（毫秒）。持续有输出的长任务可跑到此上限；默认 6 小时，最大 12 小时 | `21600000`（6 小时） |
 | `CLI_IDLE_TIMEOUT_MS` | 无 stream 输出多久视为卡住并终止（毫秒）；有工具/旁白输出会自动续命。`0` 关闭空闲检测 | `1200000`（20 分钟） |
 | `APPROVAL_TTL_MINUTES` | 高风险审批有效期（1–1440 分钟） | `30` |
 | `AGENT_OS_ALLOWED_ROOTS` | Agent 可访问的可信项目/日志根目录，多个路径用逗号分隔 | 当前项目和已配置工作目录 |
@@ -193,9 +200,9 @@ pnpm probe:cli  # 手工查看 CLI 的 JSON 流事件
 | `/help` | 查看命令帮助 |
 | `/status` | 查看当前会话、引擎和实际工作目录 |
 | `/workdir [路径]` | 查看或设置本话题项目目录；`/workdir clear` 清除 |
-| `/engine claude\|codex` | 统一切换本话题所有角色的引擎，并清理被切换角色的旧 CLI 上下文 |
+| `/engine claude\|codex\|cursor` | 统一切换本话题所有角色的引擎，并清理被切换角色的旧 CLI 上下文 |
 | `/handoff <角色> <任务>` | 将任务交给同话题的其他 Bot |
-| `/review <任务>` | 只读独立审查；不会在完整交付门禁外自动修改代码（需 reviewer Bot） |
+| `/review <任务>` | 只读独立审查（Cursor 走 `--mode ask`，不带 `--force`）；不会在完整交付门禁外自动改代码（需 reviewer Bot） |
 | `/pipeline <目标>` | **仅 CEO**：显式启动不可跳过的团队交付流水线。缺少角色、项目目录或门禁证据会阻断；CEO 收到**非命令**自然语言目标时也会自动走流水线 |
 | `/form <问卷ID>` | 把 MCP 生成的需求问卷渲染成可点选的飞书表单 |
 | `/spec list|show <ID>|publish <ID>` | 查看产品 Spec，或将已确认方案发布到飞书云文档 |
@@ -212,7 +219,7 @@ pnpm probe:cli  # 手工查看 CLI 的 JSON 流事件
 ```text
 @CEO助手 给 README 补一节快速开始说明
 /workdir /path/to/project
-/engine codex
+/engine cursor
 /handoff dev 根据当前仓库写一段 README 大纲
 @CEO助手 /pipeline 给 README 补一节快速开始说明
 /schedule logs 1h /absolute/path/server.log
@@ -240,7 +247,7 @@ CEO 统一入口 → MCP 结构化问题 → /form 点选澄清
 - 会话键由 `chatId + topicId + botId` 组成，因此同一话题中的不同角色拥有各自的上下文。
 - `topicId` 优先使用飞书 `threadId`，其次是 `rootId`，最后回退到消息 ID。
 - `/workdir` 绑定的是话题目录，同一话题下的 Bot 共享该目录。
-- `/engine` 绑定的是话题统一引擎；现有角色会批量对齐，尚未创建的 PM、架构、开发、评审和测试会在首次运行时继承，工作流升级前的旧话题会以发起角色当前引擎自动迁移。
+- `/engine` 绑定的是话题统一引擎；现有角色会批量对齐，尚未创建的 PM、架构、开发、评审和测试会在首次运行时继承。`DEFAULT_CLI` 变更时，启动会把空闲话题/会话一次性对齐到新默认；之后用 `/engine` 选定的引擎会保留。
 - 切换或清除话题目录、切换引擎、`/reset` 和 `/reopen` 都会清理对应 CLI 上下文，避免跨目录或跨引擎恢复错误会话。
 - 运行中任务不能重复执行、切换引擎或切换目录；可用 `/close` 取消任务。
 - `/pipeline` 固定步骤：PM → 架构 → 开发 → 评审协作 → 测试 → 运行时审计 → 最终审查 → CEO 汇总。`PIPELINE_STEPS` 只能声明完整顺序；未连接角色会阻断。
@@ -287,7 +294,7 @@ pnpm test
 ## 故障排查
 
 - **未找到任何 Bot 凭证**：检查 `.env` 中至少一个 Bot 的 App ID 和 Secret 是否非空。
-- **`claude` / `codex: command not found`**：确认 CLI 已安装，并且启动 `pnpm start` 的终端能通过 `which claude` / `which codex` 找到它。
+- **`claude` / `codex` / `agent: command not found`**：确认 CLI 已安装，并且启动 `pnpm start` 的终端能通过 `which claude` / `which codex` / `which agent` 找到它。Cursor 还需 `CURSOR_API_KEY` 或已 `agent login`。
 - **群聊没有响应**：确认已 @ 正确的 Bot、应用已加入群，并已开启飞书事件长连接。
 - **工作目录不存在**：`/workdir` 设置前确认路径是已存在的目录。
 - **恢复了旧上下文但目录已变更**：重新发送 `/workdir <路径>` 或 `/reset`，让系统建立新的 CLI 会话。

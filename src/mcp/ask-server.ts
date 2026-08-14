@@ -136,6 +136,13 @@ server.registerTool(
       return textResult({ ok: false, error: `问卷不存在: ${questionnaireId}` });
     }
     if (!canAccess(doc)) return textResult({ ok: false, error: '问卷不属于当前工作流。' });
+    const denyRecord = process.env.AGENT_OS_MCP_DENY_RECORD_ANSWERS?.trim().toLowerCase();
+    if (denyRecord === '1' || denyRecord === 'true' || denyRecord === 'yes' || denyRecord === 'on') {
+      return textResult({
+        ok: false,
+        error: 'record_answers 未对模型开放；请让用户在飞书发送 /form <id> 提交答案。',
+      });
+    }
     const { questionnaire: next, missingRequired: missing } = await store.recordAnswers(questionnaireId, answers);
 
     return textResult({

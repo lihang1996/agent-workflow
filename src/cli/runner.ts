@@ -1,7 +1,12 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { highRiskClasses } from '../core/risk.js';
-import { pickAskMcpContextEnv } from '../mcp/config.js';
+import { pickAskMcpContextEnv, warnIfCursorProjectMcps } from '../mcp/config.js';
+import {
+  resolveCliMaxToolCount,
+  resolveCliToolLoopStreak,
+  ToolLoopWatch,
+} from './tool-budget.js';
 import type {
   CliAdapter,
   CliCapabilityExpectation,
@@ -10,10 +15,14 @@ import type {
   CliRunResult,
 } from './types.js';
 
+export { resolveCliMaxToolCount, resolveCliToolLoopStreak } from './tool-budget.js';
+
 /**
  * 长工作流策略：
  * - CLI_TIMEOUT_MS：从启动起的绝对上限（默认 6 小时），防止失控进程永挂
  * - CLI_IDLE_TIMEOUT_MS：无 stream 事件多久视为卡住（默认 20 分钟）；有输出就续命
+ * - CLI_MAX_TOOL_COUNT：工具调用硬上限（默认 500）
+ * - CLI_TOOL_LOOP_STREAK：连续同目标熔断（默认 15）。另检测窗口同参重复和同工具乒乓（警告 10 / 熔断 20）
  * 几小时的持续编码靠「有活动续命」，不要只把墙钟超时硬拉长。
  */
 const DEFAULT_TIMEOUT_MS = 6 * 60 * 60 * 1000;
@@ -34,8 +43,10 @@ export interface RunCliOptions {
   timeoutMs?: number;
   /** 无事件空闲超时；优先于 CLI_IDLE_TIMEOUT_MS；设 0 关闭空闲检测 */
   idleTimeoutMs?: number;
-  /** P1 修复：工具调用硬上限；超过后终止 CLI 并报错。默认 100。 */
+  /** 工具调用硬上限；超过后终止 CLI。默认 500。 */
   maxToolCount?: number;
+  /** 同一目标连续调用多少次视为死循环；0 关闭。默认 15。 */
+  toolLoopStreak?: number;
   onEvent?: (event: CliEvent) => void;
   env?: NodeJS.ProcessEnv;
   executionPolicy?: CliExecutionPolicy;
@@ -158,6 +169,10 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
   const args = effectiveSessionId
     ? adapter.buildResumeArgs(prompt, effectiveSessionId, buildOptions)
     : adapter.buildArgs(prompt, buildOptions);
+  const spawnCwd = adapter.resolveSpawnCwd?.(cwd, executionPolicy) ?? cwd;
+  if (adapter.id === 'cursor' && args.includes('--approve-mcps')) {
+    warnIfCursorProjectMcps(cwd);
+  }
   const localNetworkExpectation = capabilityExpectations.find(
     (expectation) => expectation.capability === 'local-network',
   );
@@ -179,7 +194,7 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
   return new Promise((resolve, reject) => {
     // detached 让子进程成为新进程组组长，便于连带杀掉孙子进程。
     const child = spawn(adapter.command, args, {
-      cwd,
+      cwd: spawnCwd,
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: useProcessGroup,
       env: {
@@ -205,8 +220,9 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
     let timeoutReason: 'absolute' | 'idle' | undefined;
     let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
-    // P1 修复：工具调用计数与预算
-    const maxToolCount = options.maxToolCount ?? Number(process.env.CLI_MAX_TOOL_COUNT ?? 100);
+    const maxToolCount = resolveCliMaxToolCount(options.maxToolCount);
+    const toolLoopStreak = resolveCliToolLoopStreak(options.toolLoopStreak);
+    const loopWatch = new ToolLoopWatch(toolLoopStreak);
     let toolCount = 0;
 
     const forceKillLater = () => {
@@ -298,13 +314,24 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
           resultError = new Error(event.message);
           continue;
         }
-        // P1 修复：工具预算执行
         if (event.type === 'tool_start' || event.type === 'tool') {
           toolCount++;
+          const loop = loopWatch.observe(event);
+          if (loop.warn && loop.message) {
+            console.warn(`[CLI:${adapter.id}] [警告] ${loop.message}`);
+          }
+          if (loop.looped && loop.message) {
+            internalError = new Error(
+              `${adapter.displayName} 疑似工具死循环：${loop.message}。`
+              + 'Read/Edit 交错或换文件不算；确认不是循环时可设 CLI_TOOL_LOOP_STREAK=0。',
+            );
+            onAbort();
+            return;
+          }
           if (toolCount > maxToolCount) {
             internalError = new Error(
-              `${adapter.displayName} 工具调用次数（${toolCount}）超过上限（${maxToolCount}），已终止。` +
-              `请拆分任务或通过 CLI_MAX_TOOL_COUNT 环境变量调整上限。`,
+              `${adapter.displayName} 工具调用次数（${toolCount}）超过上限（${maxToolCount}），已终止。`
+              + `请拆分任务或通过 CLI_MAX_TOOL_COUNT 环境变量调整上限。`,
             );
             onAbort();
             return;

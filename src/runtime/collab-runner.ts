@@ -23,6 +23,7 @@ export async function runCollabReview(
     task: string;
     round: number;
     priorDevResult?: string;
+    /** 独立 /review 必须传 read-only；默认 standard 仅给流水线评审（需要写证据）。 */
     executionPolicy?: CliExecutionPolicy;
     approvedScope?: string;
     /** 独立审查为 false，避免在完整交付门禁外自动修改代码。 */

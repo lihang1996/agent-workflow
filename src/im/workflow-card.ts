@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { ApprovalRequest } from '../core/approval-store.js';
 import type { Questionnaire, Question } from '../core/questionnaire-store.js';
+import { canonicalSpecHasRiskWaivers } from '../core/quality-gates.js';
 import { extractRequirementIds } from '../core/requirement-ids.js';
 import type { ProductSpec } from '../core/spec-store.js';
 import { redactSecrets } from '../core/log-inspection.js';
@@ -277,7 +278,7 @@ export function buildQuestionnaireCard(questionnaire: Questionnaire): CardJson {
 
 export function buildSpecConfirmationCard(spec: ProductSpec): CardJson {
   const confirmed = spec.status === 'confirmed' || spec.status === 'published' || spec.status === 'in_review' || spec.status === 'approved';
-  const requiresFullDocumentReview = spec.content.includes('[RISK_WAIVER]');
+  const requiresFullDocumentReview = canonicalSpecHasRiskWaivers(spec.content);
   const hasStableRequirementIds = extractRequirementIds(spec.content).length > 0;
   const invalidPendingSpec = spec.status === 'pending_confirmation' && !hasStableRequirementIds;
   return {

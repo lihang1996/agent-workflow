@@ -8,6 +8,7 @@ export async function allowedFilesystemRoots(): Promise<string[]> {
     process.cwd(),
     process.env.CLAUDE_WORKDIR,
     process.env.CODEX_WORKDIR,
+    process.env.CURSOR_WORKDIR,
     ...(process.env.AGENT_OS_ALLOWED_ROOTS?.split(/[\n,]+/) ?? []),
     ...Object.entries(process.env)
       .filter(([key]) => /^BOT_[A-Z0-9_]+_WORKDIR$/.test(key))
@@ -68,8 +69,10 @@ export function resolveWorkdir(options: {
 }): string {
   if (options.topicWorkdir) return resolve(options.topicWorkdir);
   if (options.botWorkdir) return resolve(options.botWorkdir);
-  if (options.cliId === 'codex') {
-    return resolve(process.env.CODEX_WORKDIR ?? process.env.CLAUDE_WORKDIR ?? process.cwd());
-  }
-  return resolve(process.env.CLAUDE_WORKDIR ?? process.cwd());
+  const engineWorkdir = options.cliId === 'codex'
+    ? process.env.CODEX_WORKDIR
+    : options.cliId === 'cursor'
+      ? process.env.CURSOR_WORKDIR
+      : process.env.CLAUDE_WORKDIR;
+  return resolve(engineWorkdir ?? process.env.CLAUDE_WORKDIR ?? process.cwd());
 }

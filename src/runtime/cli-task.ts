@@ -1,7 +1,7 @@
 import { resolve } from 'node:path';
 import { createAdapter } from '../cli/registry.js';
 import { runCli } from '../cli/runner.js';
-import type { CliEvent, CliExecutionPolicy } from '../cli/types.js';
+import type { CliEvent, CliExecutionPolicy, CliRunResult } from '../cli/types.js';
 import {
   answerContinuation,
   answerNeedsContinuation,
@@ -15,6 +15,12 @@ import type { Session } from '../core/session-manager.js';
 import { TaskProgressTracker } from '../core/task-progress.js';
 import { sanitizeErrorForLog, sanitizeForLog } from '../core/log-inspection.js';
 import { hasExplicitStepResult, parseStepResult, type StepResult } from '../core/step-result.js';
+import {
+  buildProtocolFormatRepairPrompt,
+  resolveFormatRepairAttempts,
+  shouldRepairProtocolFormat,
+  isProtocolFormatError,
+} from '../core/protocol-format.js';
 import { displayAgentOutput } from '../core/agent-output.js';
 import { assertWorkdir } from '../core/workdir.js';
 import { TEST_RESOURCE_SENTINEL_ENV } from '../core/test-resource-policy.js';
@@ -306,11 +312,11 @@ export async function startCliTask(
     }
   };
 
-  void runCli({
+  const runCliOnce = (prompt: string, sessionId?: string) => runCli({
     adapter,
-    prompt: taskPrompt,
+    prompt,
     cwd,
-    sessionId: executionPolicy === 'input-only' ? undefined : session.cliSessionId,
+    sessionId: executionPolicy === 'input-only' ? undefined : sessionId,
     signal: controller.signal,
     onEvent: onCliEvent,
     executionPolicy,
@@ -327,58 +333,107 @@ export async function startCliTask(
       // 显式覆盖宿主环境，避免全局变量意外泄露到普通聊天或非 QA 步骤。
       [TEST_RESOURCE_SENTINEL_ENV]: testResourceSentinelAuthorized ? 'true' : '',
     },
-  })
-    .then(async (result) => {
-      if (
-        executionPolicy !== 'input-only'
-        && result.sessionId
-        && result.sessionId !== session.cliSessionId
-      ) {
+  });
+
+  const persistCliSession = async (result: CliRunResult) => {
+    if (
+      executionPolicy !== 'input-only'
+      && result.sessionId
+      && result.sessionId !== session.cliSessionId
+    ) {
+      try {
+        await ctx.sessions.setCliSessionId(session.id, result.sessionId);
+        session = ctx.sessions.get(session.id) ?? session;
+      } catch (error) {
+        console.error('[会话] 保存 CLI 上下文失败:', safeErrorMessage(error));
+      }
+    }
+    if (executionPolicy !== 'input-only' && result.stats?.contextWindowTokens) {
+      ctx.contextWindows.set(session.id, result.stats.contextWindowTokens);
+    }
+  };
+
+  const evaluateCliOutput = async (answer: string): Promise<StepResult> => {
+    // 仅流水线非 PM 步骤解析 RESULT 标记（resultProtocol=true 时）；
+    // PM 产出的是 Spec 正文，普通聊天/handoff/定时/巡检也不解析，
+    // 避免 Agent 在回答中举例 [RESULT:failed] 被误判为任务失败。
+    let stepResult = resultProtocol ? parseStepResult(answer) : { kind: 'done' as const };
+    if (resultProtocol && !hasExplicitStepResult(answer)) {
+      throw new Error('流水线步骤缺少显式 [RESULT:done|blocked|failed] 终态标记，不能按成功处理。');
+    }
+    if (stepResult.kind === 'failed' && treatFailedResultAsDone) {
+      console.warn(
+        `[CLI:${bot.id}] 输出了 [RESULT:failed]，本步按完成继续（评审回传或汇总落盘）`,
+      );
+      stepResult = { kind: 'done' };
+    }
+    if (stepResult.kind === 'done' && validateSuccess) {
+      await validateSuccess(answer);
+    } else if (
+      stepResult.kind === 'failed'
+      && acceptFailedResultIfValidated
+      && validateSuccess
+    ) {
+      try {
+        await validateSuccess(answer);
+        console.warn(
+          `[CLI:${bot.id}] 输出了 [RESULT:failed]，但本步门禁可通过，已按 [RESULT:done] 继续`,
+        );
+        stepResult = { kind: 'done' };
+      } catch (gateError) {
+        if (isProtocolFormatError(gateError)) throw gateError;
+        // P1 修复：保留原始 Error 类型和 cause，不要用空 catch 吞掉
+        // FingerprintDriftError / GateResult 校验错误等关键诊断信息。
+        console.error(`[CLI:${bot.id}] 门禁校验失败:`, safeErrorMessage(gateError));
+        // 将原始错误附加到 stepResult.reason，供 onFailure 回调使用。
+        stepResult = { kind: 'failed', reason: safeErrorMessage(gateError) };
+      }
+    }
+    return stepResult;
+  };
+
+  void runCliOnce(taskPrompt, session.cliSessionId)
+    .then(async (firstResult) => {
+      let result = firstResult;
+      await persistCliSession(result);
+      const maxRepairs = resolveFormatRepairAttempts();
+      let repairsUsed = 0;
+      let stepResult: StepResult = { kind: 'done' };
+      while (true) {
         try {
-          await ctx.sessions.setCliSessionId(session.id, result.sessionId);
+          stepResult = await evaluateCliOutput(result.answer);
+          break;
         } catch (error) {
-          console.error('[会话] 保存 CLI 上下文失败:', safeErrorMessage(error));
+          const resumeSessionId = result.sessionId ?? session.cliSessionId;
+          if (!shouldRepairProtocolFormat({
+            error,
+            repairsUsed,
+            maxRepairs,
+            resumeSessionId,
+            aborted: controller.signal.aborted,
+          })) {
+            throw error;
+          }
+          repairsUsed += 1;
+          console.warn(
+            `[CLI:${bot.id}/${adapter.id}] 交卷格式错误，同一会话纠偏 ${repairsUsed}/${maxRepairs}: ${safeErrorMessage(error)}`,
+          );
+          cardUpdater.push(buildTaskCard({
+            title: cardTitle,
+            status: 'running',
+            detail: `控制器发现交卷格式错误，正在同一会话纠偏（${repairsUsed}/${maxRepairs}），不重新探索`,
+            progress: activeRun.tracker.snapshot(),
+            abortSessionId: session.id,
+          }));
+          result = await runCliOnce(
+            buildProtocolFormatRepairPrompt(error),
+            resumeSessionId,
+          );
+          await persistCliSession(result);
         }
-      }
-      if (executionPolicy !== 'input-only' && result.stats?.contextWindowTokens) {
-        ctx.contextWindows.set(session.id, result.stats.contextWindowTokens);
-      }
-      // 仅流水线非 PM 步骤解析 RESULT 标记（resultProtocol=true 时）；
-      // PM 产出的是 Spec 正文，普通聊天/handoff/定时/巡检也不解析，
-      // 避免 Agent 在回答中举例 [RESULT:failed] 被误判为任务失败。
-      let stepResult = resultProtocol ? parseStepResult(result.answer) : { kind: 'done' as const };
-      if (resultProtocol && !hasExplicitStepResult(result.answer)) {
-        throw new Error('流水线步骤缺少显式 [RESULT:done|blocked|failed] 终态标记，不能按成功处理。');
       }
       const visibleAnswer = hideProtocolOutput ? displayAgentOutput(result.answer) : result.answer;
       // CLI exit 0 只代表进程完成；结构化门禁也通过后，卡片才允许显示绿色成功。
-      if (stepResult.kind === 'failed' && treatFailedResultAsDone) {
-        console.warn(
-          `[CLI:${bot.id}] 输出了 [RESULT:failed]，本步按完成继续（评审回传或汇总落盘）`,
-        );
-        stepResult = { kind: 'done' };
-      }
-      if (stepResult.kind === 'done' && validateSuccess) {
-        await validateSuccess(result.answer);
-      } else if (
-        stepResult.kind === 'failed'
-        && acceptFailedResultIfValidated
-        && validateSuccess
-      ) {
-        try {
-          await validateSuccess(result.answer);
-          console.warn(
-            `[CLI:${bot.id}] 输出了 [RESULT:failed]，但本步门禁可通过，已按 [RESULT:done] 继续`,
-          );
-          stepResult = { kind: 'done' };
-        } catch (gateError) {
-          // P1 修复：保留原始 Error 类型和 cause，不要用空 catch 吞掉
-          // FingerprintDriftError / GateResult 校验错误等关键诊断信息。
-          console.error(`[CLI:${bot.id}] 门禁校验失败:`, safeErrorMessage(gateError));
-          // 将原始错误附加到 stepResult.reason，供 onFailure 回调使用。
-          stepResult = { kind: 'failed', reason: safeErrorMessage(gateError) };
-        }
-      }
       if (activeRun.heartbeat) clearInterval(activeRun.heartbeat);
       if (!ctx.shuttingDown) {
         if (stepResult.kind !== 'failed' && onSuccess) {
@@ -473,9 +528,7 @@ export async function startCliTask(
         if (!ctx.shuttingDown && !activeRun.cardSettledByCallback) {
           await finishInterruptedRun(activeRun, detail);
         }
-        // P1 修复：用户主动取消不是质量缺陷，不要调 reportFailure 触发质量退回开发。
-        // workflow 留在 executing，重启时 resumeRecoverableWorkflows 会恢复为 ready。
-        // 用户可用 /workflow retry 或 /workflow abort 手动控制后续行为。
+        // 用户主动取消：卡片回调已把工作流标成 paused；不要 reportFailure，也不要留在 executing 以免重启自动续跑。
         return;
       }
       activeRun.terminalStatus = 'failed';

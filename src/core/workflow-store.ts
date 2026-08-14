@@ -23,6 +23,8 @@ export const WorkflowStatusSchema = z.enum([
   'awaiting_doc_review',
   /** 步骤显式 [RESULT:blocked]，等人纠正目录/前置条件后再重跑同一步 */
   'awaiting_step_unblock',
+  /** 用户点了停止任务；不自动续跑，需 /workflow retry 从当前步骤继续 */
+  'paused',
   'completed',
   'failed',
 ]);
@@ -204,6 +206,7 @@ export class JsonWorkflowStore {
 
   listRecoverable(): DeliveryWorkflow[] {
     // P1 修复：加入 awaiting_questions，使问卷答案已落库但工作流未恢复的状态可自愈。
+    // paused 不在此列：用户主动停止后必须手工 /workflow retry，重启不得自动续跑。
     return [...this.workflows.values()].filter((workflow) =>
       workflow.status === 'ready' || workflow.status === 'executing' || workflow.status === 'awaiting_questions');
   }
@@ -245,6 +248,7 @@ export class JsonWorkflowStore {
       const existing = [...this.workflows.values()].find((candidate) =>
         workflowLaunchKey(candidate) === launchKey);
       if (existing) return existing;
+      this.autoTerminatePausedConflicts(workflow);
       this.assertNoTechnicalDeliveryConflict(workflow);
       await this.replaceAndPersist(workflow.id, workflow);
       return workflow;
@@ -306,6 +310,7 @@ export class JsonWorkflowStore {
         status: 'ready',
         updatedAt: new Date().toISOString(),
       });
+      this.autoTerminatePausedConflicts(next);
       this.assertNoTechnicalDeliveryConflict(next);
       await beforePersist?.();
       await this.replaceAndPersist(id, next);
@@ -495,6 +500,32 @@ export class JsonWorkflowStore {
     return workflow;
   }
 
+  /**
+   * 自动终止同项目下已暂停的旧工作流，为新工作流让路。
+   * 只处理 paused 状态（用户主动停止的），不处理 awaiting_step_unblock 等业务阻塞。
+   */
+  private autoTerminatePausedConflicts(candidate: DeliveryWorkflow): void {
+    if (!isActiveTechnicalDelivery(candidate)) return;
+    const pausedConflicts = [...this.workflows.values()].filter((workflow) =>
+      workflow.id !== candidate.id
+      && workflow.projectRoot === candidate.projectRoot
+      && workflow.qualityPolicy === 'gated'
+      && workflow.status === 'paused');
+
+    for (const conflict of pausedConflicts) {
+      const terminated = DeliveryWorkflowSchema.parse({
+        ...conflict,
+        status: 'failed',
+        error: `项目 ${conflict.projectRoot} 有新的技术交付工作流 ${candidate.id} 启动，已自动终止本工作流。`,
+        updatedAt: new Date().toISOString(),
+      });
+      this.workflows.set(conflict.id, terminated);
+      console.log(
+        `[工作流] 自动终止 paused 工作流 ${conflict.id}（${conflict.name}），为新工作流 ${candidate.id} 释放项目租约`,
+      );
+    }
+  }
+
   private assertNoTechnicalDeliveryConflict(candidate: DeliveryWorkflow): void {
     if (!isActiveTechnicalDelivery(candidate)) return;
     const conflict = [...this.workflows.values()].find((workflow) =>
@@ -512,7 +543,9 @@ export class JsonWorkflowStore {
       workflow.id !== candidate.id
       && workflow.projectRoot === candidate.projectRoot
       && isActiveTechnicalDelivery(workflow)
-      && (workflow.status === 'executing' || workflow.status === 'awaiting_step_unblock'));
+      && (workflow.status === 'executing'
+        || workflow.status === 'awaiting_step_unblock'
+        || workflow.status === 'paused'));
     if (conflict) throw projectConflictError(candidate, conflict);
   }
 
@@ -584,7 +617,8 @@ function isActiveTechnicalDelivery(workflow: DeliveryWorkflow): boolean {
   if (workflow.qualityPolicy !== 'gated' || !workflow.projectRoot) return false;
   if (workflow.status !== 'ready'
     && workflow.status !== 'executing'
-    && workflow.status !== 'awaiting_step_unblock') return false;
+    && workflow.status !== 'awaiting_step_unblock'
+    && workflow.status !== 'paused') return false;
   const pmIndex = workflow.stepIds.indexOf('pm');
   return pmIndex < 0 || workflow.nextStepIndex > pmIndex;
 }
@@ -592,7 +626,8 @@ function isActiveTechnicalDelivery(workflow: DeliveryWorkflow): boolean {
 function projectConflictError(candidate: DeliveryWorkflow, conflict: DeliveryWorkflow): Error {
   return new Error(
     `项目 ${candidate.projectRoot} 已有技术交付工作流 ${conflict.id}（${conflict.status}）占用；`
-    + '为避免并发改代码、canonical Spec 切换和证据污染，请先完成或终止该工作流。',
+    + '为避免并发改代码、canonical Spec 切换和证据污染，请先完成该工作流，'
+    + `或发送 /workflow abort ${conflict.id} 终止它。`,
   );
 }
 

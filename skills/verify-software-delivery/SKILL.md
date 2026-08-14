@@ -80,6 +80,8 @@ applicabilityEvidence，禁止发现后静默省略。
 `executedChecks` 是 QA 检查的权威集合；`[GATE_RESULT].checks` 不得重复其中任何 ID，没有额外
 检查时必须写空数组，由控制器从报告水合。确需登记报告校验等额外命令时，必须使用新的唯一 ID。
 把结构化输出保存到控制器提供的 `evidenceRoot`，计算真实 SHA-256，并写入 `[GATE_RESULT].artifacts`。
+`executedChecks[].command` 每个数组元素上限 10000 字符。长内联脚本（如 `node -e '...'` 或 `/bin/zsh -lc '...'`）
+必须先写入临时文件（如 `evidenceRoot/check-xxx.mjs`），再用 `node check-xxx.mjs` 作为 command，避免超限截断。
 
 必需命令非零、资源校验失败、P0/P1 缺证据、必需环境不可用或测试被弱化时阻止后续阶段。
 仅因浏览器、端口、数据库、网络或授权环境不可用时，保留必需项的
