@@ -19,20 +19,36 @@ export type PipelineStepId =
 
 export interface PipelineStep {
   id: PipelineStepId;
-  /** 执行角色 botId；summary / review 有特殊编排 */
+  /** 缺独立 Bot 时使用的飞书角色；summary / review 有特殊编排 */
   botId: 'pm' | 'architect' | 'dev' | 'qa' | 'ceo' | 'reviewer';
+  /** 会话隔离用的逻辑角色；与 botId 相同时可省略 */
+  logicalRole?: string;
+  /** 若已配置独立飞书 Bot，优先使用；未配置不阻断流水线 */
+  preferredBotId?: 'runtime_auditor' | 'final_reviewer';
   title: string;
 }
 
 export const DEFAULT_PIPELINE_STEPS: PipelineStep[] = [
-  { id: 'pm', botId: 'pm', title: '需求澄清 / Spec' },
-  { id: 'architect', botId: 'architect', title: '技术方案' },
-  { id: 'dev', botId: 'dev', title: '开发实现' },
-  { id: 'review', botId: 'reviewer', title: '代码评审' },
-  { id: 'qa', botId: 'qa', title: '测试验收' },
-  { id: 'runtime_audit', botId: 'qa', title: '运行时边界审计' },
-  { id: 'final_review', botId: 'reviewer', title: '最终交付审查' },
-  { id: 'summary', botId: 'ceo', title: '交付汇总' },
+  { id: 'pm', botId: 'pm', logicalRole: 'pm', title: '需求澄清 / Spec' },
+  { id: 'architect', botId: 'architect', logicalRole: 'architect', title: '技术方案' },
+  { id: 'dev', botId: 'dev', logicalRole: 'dev', title: '开发实现' },
+  { id: 'review', botId: 'reviewer', logicalRole: 'reviewer', title: '代码评审' },
+  { id: 'qa', botId: 'qa', logicalRole: 'qa', title: '测试验收' },
+  {
+    id: 'runtime_audit',
+    botId: 'qa',
+    logicalRole: 'runtime_auditor',
+    preferredBotId: 'runtime_auditor',
+    title: '运行时边界审计',
+  },
+  {
+    id: 'final_review',
+    botId: 'reviewer',
+    logicalRole: 'final_reviewer',
+    preferredBotId: 'final_reviewer',
+    title: '最终交付审查',
+  },
+  { id: 'summary', botId: 'ceo', logicalRole: 'ceo', title: '交付汇总' },
 ];
 
 /** 开发内部交付小队固定包含完整的技术交付闭环，不允许通过配置裁剪。 */
@@ -62,7 +78,7 @@ export function parsePipelineSteps(value: string | undefined): PipelineStep[] {
   return DEFAULT_PIPELINE_STEPS;
 }
 
-/** 返回一组步骤实际运行所缺少的 Bot；评审步骤同时依赖 reviewer 与 dev。 */
+/** 返回一组步骤实际运行所缺少的 Bot；评审步骤同时依赖 reviewer 与 dev。独立审计/终审 Bot 可选。 */
 export function missingBotIdsForSteps(
   steps: readonly PipelineStep[],
   availableBotIds: ReadonlySet<string>,
@@ -73,6 +89,24 @@ export function missingBotIdsForSteps(
     if (step.id === 'review') required.add('dev');
   }
   return [...required].filter((botId) => !availableBotIds.has(botId));
+}
+
+/** 逻辑角色：用于 CLI 会话隔离；同 Bot 扮演的不同步骤不得共用上下文。 */
+export function logicalRoleForStep(step: PipelineStep): string {
+  if (step.logicalRole?.trim()) return step.logicalRole.trim();
+  if (step.id === 'runtime_audit') return 'runtime_auditor';
+  if (step.id === 'final_review') return 'final_reviewer';
+  if (step.id === 'summary') return 'ceo';
+  return step.botId;
+}
+
+/** 已配置独立 Bot 时用之，否则回退到步骤 botId。 */
+export function resolvePipelineActorId(
+  step: PipelineStep,
+  availableBotIds: ReadonlySet<string>,
+): string {
+  if (step.preferredBotId && availableBotIds.has(step.preferredBotId)) return step.preferredBotId;
+  return step.botId;
 }
 
 const PRIOR_CONTEXT_KEYS: Record<PipelineStepId, readonly string[]> = {
@@ -249,7 +283,8 @@ export function buildPipelineStepPrompt(
         '前置产出：',
         prior,
         '',
-        '请给出技术方案：模块边界、关键改动点、风险与取舍。不要直接大面积改代码。',
+        '请给出技术方案：模块边界、关键改动点、风险与取舍。',
+        '绝对禁止实现：不得创建、修改或删除目标仓库的产品代码、测试、配置或脚本；本步只产出 change-plan 与设计证据。',
         '本步只设计不实现。发现的 P0/P1 登记为 planned 后必须输出 [RESULT:done]，交给开发闭环；禁止因这些 FIND 输出 [RESULT:failed]。',
         ...gatedTail(step),
       ].join('\n');

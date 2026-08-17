@@ -8,6 +8,8 @@ import {
   DELIVERY_SQUAD_STEPS,
   buildPipelineStepPrompt,
   missingBotIdsForSteps,
+  resolvePipelineActorId,
+  logicalRoleForStep,
   resolveSkillsRoot,
   type PipelineStep,
 } from '../core/pipeline.js';
@@ -534,9 +536,12 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
       return;
     }
 
-    const actor = ctx.botsById.get(step.botId);
-    if (!actor) throw new Error(`角色 ${step.botId} 未连接`);
-    const actorSession = await ensureRunnableSession(ctx, actor, msg);
+    const actorId = resolvePipelineActorId(step, new Set(ctx.botsById.keys()));
+    const actor = ctx.botsById.get(actorId);
+    if (!actor) throw new Error(`角色 ${actorId} 未连接`);
+    const actorSession = await ensureRunnableSession(ctx, actor, msg, {
+      logicalRole: logicalRoleForStep(step),
+    });
     if (!actorSession) {
       // P1 修复：actor busy 时不要直接 throw 导致 failWorkflow，而是延迟重试。
       // 设为 ready 状态让调度器在下一个 tick 重试。

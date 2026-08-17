@@ -44,10 +44,16 @@ export function formatSessionStatus(
   const effective = workdirFor(ctx, session, bot, msg);
   const peers = ctx.sessions.listByTopic(msg.chatId, topicId);
   const peerLine = peers.length
-    ? peers.map((s) => `${s.botId}:${STATUS_LABELS[s.status]}`).join('，')
+    ? peers.map((s) => {
+      const role = s.logicalRole && s.logicalRole !== s.botId ? `${s.botId}::${s.logicalRole}` : s.botId;
+      return `${role}:${STATUS_LABELS[s.status]}`;
+    }).join('，')
     : '(无)';
+  const roleLabel = session.logicalRole && session.logicalRole !== session.botId
+    ? `${bot.name} (${bot.id}::${session.logicalRole})`
+    : `${bot.name} (${bot.id})`;
   return [
-    `角色：${bot.name} (${bot.id})`,
+    `角色：${roleLabel}`,
     `会话：${session.id}`,
     `状态：${STATUS_LABELS[session.status]}`,
     `执行引擎：${adapter.displayName} (${session.cliId})`,
@@ -74,6 +80,7 @@ export async function ensureRunnableSession(
   ctx: AppContext,
   bot: Bot,
   msg: IncomingMessage,
+  options?: { logicalRole?: string },
 ): Promise<Session | undefined> {
   const topicId = topicIdOf(msg);
   const preferredCliId = ctx.topics?.getCliId?.(msg.chatId, topicId);
@@ -84,6 +91,7 @@ export async function ensureRunnableSession(
     threadId: msg.threadId,
     rootId: msg.rootId,
     botId: bot.id,
+    logicalRole: options?.logicalRole?.trim() || bot.id,
   }, preferredCliId);
   if (session.status === 'closed') {
     return ctx.sessions.reopen(session.id);

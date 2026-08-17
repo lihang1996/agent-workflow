@@ -113,6 +113,35 @@ test('内部触发消息沿用原话题会话而不是触发消息 ID', async ()
   assert.equal(second?.id, first?.id);
 });
 
+test('同一 Bot 的不同逻辑角色使用独立 CLI 会话', async () => {
+  const sessions = new SessionManager({
+    createId: (() => {
+      let value = 0;
+      return () => `role-session-${++value}`;
+    })(),
+  });
+  const ctx = { sessions } as unknown as AppContext;
+  const qa = { id: 'qa' } as Bot;
+  const reviewer = { id: 'reviewer' } as Bot;
+  const msg = {
+    messageId: 'om-1', topicId: 'omt', chatId: 'oc', chatType: 'group', messageType: 'text',
+    text: '', rootId: '', threadId: 'omt', senderOpenId: 'ou', senderType: 'user', mentions: [], rawContent: '{}',
+  } satisfies IncomingMessage;
+
+  const qaSession = await ensureRunnableSession(ctx, qa, msg, { logicalRole: 'qa' });
+  const auditSession = await ensureRunnableSession(ctx, qa, msg, { logicalRole: 'runtime_auditor' });
+  const reviewSession = await ensureRunnableSession(ctx, reviewer, msg, { logicalRole: 'reviewer' });
+  const finalSession = await ensureRunnableSession(ctx, reviewer, msg, { logicalRole: 'final_reviewer' });
+
+  assert.equal(qaSession?.logicalRole, 'qa');
+  assert.equal(auditSession?.logicalRole, 'runtime_auditor');
+  assert.equal(reviewSession?.logicalRole, 'reviewer');
+  assert.equal(finalSession?.logicalRole, 'final_reviewer');
+  assert.notEqual(qaSession?.id, auditSession?.id);
+  assert.notEqual(reviewSession?.id, finalSession?.id);
+  assert.equal(sessions.listByTopic('oc', 'omt').length, 4);
+});
+
 test('话题统一引擎会让尚未创建的角色直接使用 Codex', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agent-os-topic-engine-new-role-'));
   try {
@@ -224,6 +253,28 @@ test('重复会话记录会在恢复前拒绝且保留原文件', async () => {
     await writeFile(path, original);
     await assert.rejects(() => new JsonSessionStore(path).load(), /重复 ID/);
     assert.equal(await readFile(path, 'utf8'), original);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('同一 Bot 不同逻辑角色可以同时落盘', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-os-session-logical-role-'));
+  const path = join(root, 'sessions.json');
+  try {
+    const store = new JsonSessionStore(path);
+    const qa = closedSession();
+    const audit = {
+      ...closedSession(),
+      id: 'session-audit',
+      botId: 'qa',
+      logicalRole: 'runtime_auditor',
+      cliSessionId: 'cli-audit',
+    };
+    await store.save([qa, audit]);
+    const loaded = await store.load();
+    assert.equal(loaded.length, 2);
+    assert.equal(loaded.find((session) => session.id === 'session-audit')?.logicalRole, 'runtime_auditor');
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -13,6 +13,7 @@ export interface SessionStore {
 const SessionSchema = z.object({
   id: z.string().trim().min(1).max(200),
   botId: z.string().trim().min(1).max(100).default('dev'),
+  logicalRole: z.string().trim().min(1).max(100).optional(),
   threadId: z.string().trim().min(1).max(200),
   chatId: z.string().trim().min(1).max(200),
   cliId: z.enum(CLI_IDS),
@@ -67,9 +68,16 @@ export class JsonSessionStore implements SessionStore {
       }
 
       if (ids.has(result.data.id)) throw new Error(`会话文件包含重复 ID: ${result.data.id}`);
-      const topicRole = JSON.stringify([result.data.chatId, result.data.threadId, result.data.botId]);
+      const topicRole = JSON.stringify([
+        result.data.chatId,
+        result.data.threadId,
+        result.data.botId,
+        result.data.logicalRole ?? result.data.botId,
+      ]);
       if (topicRoles.has(topicRole)) {
-        throw new Error(`会话文件包含重复话题角色: ${result.data.chatId}/${result.data.threadId}/${result.data.botId}`);
+        throw new Error(
+          `会话文件包含重复话题角色: ${result.data.chatId}/${result.data.threadId}/${result.data.botId}::${result.data.logicalRole ?? result.data.botId}`,
+        );
       }
       ids.add(result.data.id);
       topicRoles.add(topicRole);
@@ -111,9 +119,16 @@ function assertUniqueSessions(sessions: Session[]): void {
   const topicRoles = new Set<string>();
   for (const session of sessions) {
     if (ids.has(session.id)) throw new Error(`会话包含重复 ID: ${session.id}`);
-    const topicRole = JSON.stringify([session.chatId, session.threadId, session.botId]);
+    const topicRole = JSON.stringify([
+      session.chatId,
+      session.threadId,
+      session.botId,
+      session.logicalRole ?? session.botId,
+    ]);
     if (topicRoles.has(topicRole)) {
-      throw new Error(`会话包含重复话题角色: ${session.chatId}/${session.threadId}/${session.botId}`);
+      throw new Error(
+        `会话包含重复话题角色: ${session.chatId}/${session.threadId}/${session.botId}::${session.logicalRole ?? session.botId}`,
+      );
     }
     ids.add(session.id);
     topicRoles.add(topicRole);

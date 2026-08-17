@@ -1,6 +1,14 @@
 import { resolve } from 'node:path';
 
-export type BotRole = 'ceo' | 'pm' | 'architect' | 'dev' | 'qa' | 'reviewer';
+export type BotRole =
+  | 'ceo'
+  | 'pm'
+  | 'architect'
+  | 'dev'
+  | 'qa'
+  | 'reviewer'
+  | 'runtime_auditor'
+  | 'final_reviewer';
 
 export interface BotConfig {
   /** 稳定 ID，用于会话隔离，如 dev / qa */
@@ -27,6 +35,8 @@ const ROLE_SPECS: RoleSpec[] = [
   { id: 'dev', role: 'dev', envPrefix: 'BOT_DEV', defaultName: '开发工程师' },
   { id: 'qa', role: 'qa', envPrefix: 'BOT_QA', defaultName: '测试工程师' },
   { id: 'reviewer', role: 'reviewer', envPrefix: 'BOT_REVIEWER', defaultName: '代码评审' },
+  { id: 'runtime_auditor', role: 'runtime_auditor', envPrefix: 'BOT_RUNTIME_AUDITOR', defaultName: '运行时审计' },
+  { id: 'final_reviewer', role: 'final_reviewer', envPrefix: 'BOT_FINAL_REVIEWER', defaultName: '最终审查' },
 ];
 
 /** 读取非空环境变量。 */

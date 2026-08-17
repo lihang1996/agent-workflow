@@ -7,7 +7,10 @@ import {
   buildPipelineStepPrompt,
   DEFAULT_PIPELINE_STEPS,
   DELIVERY_SQUAD_STEPS,
+  missingBotIdsForSteps,
   parsePipelineSteps,
+  resolvePipelineActorId,
+  logicalRoleForStep,
   resolveSkillsRoot,
 } from '../src/core/pipeline.js';
 import { JsonQuestionnaireStore, extractQuestionnaireIdsFromText, questionnaireMatchesContext } from '../src/core/questionnaire-store.js';
@@ -1440,6 +1443,21 @@ test('内部交付小队固定完整角色且不会被流水线配置裁剪', as
       goal: '修复登录问题',
     }),
     /缺少已连接角色：architect、reviewer、qa/,
+  );
+  assert.deepEqual(
+    missingBotIdsForSteps(DEFAULT_PIPELINE_STEPS, new Set(['ceo', 'pm', 'architect', 'dev', 'reviewer', 'qa'])),
+    [],
+  );
+  const runtime = DEFAULT_PIPELINE_STEPS.find((step) => step.id === 'runtime_audit')!;
+  const finalReview = DEFAULT_PIPELINE_STEPS.find((step) => step.id === 'final_review')!;
+  assert.equal(logicalRoleForStep(runtime), 'runtime_auditor');
+  assert.equal(logicalRoleForStep(finalReview), 'final_reviewer');
+  assert.equal(resolvePipelineActorId(runtime, new Set(['qa'])), 'qa');
+  assert.equal(resolvePipelineActorId(runtime, new Set(['qa', 'runtime_auditor'])), 'runtime_auditor');
+  assert.equal(resolvePipelineActorId(finalReview, new Set(['reviewer'])), 'reviewer');
+  assert.equal(
+    resolvePipelineActorId(finalReview, new Set(['reviewer', 'final_reviewer'])),
+    'final_reviewer',
   );
 });
 

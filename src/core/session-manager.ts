@@ -7,6 +7,8 @@ export type SessionStatus = 'creating' | 'active' | 'idle' | 'closed';
 export interface Session {
   id: string;
   botId: string;
+  /** 同 Bot 扮演不同逻辑角色时隔离 CLI 上下文；缺省等于 botId。 */
+  logicalRole?: string;
   threadId: string;
   chatId: string;
   cliId: CliId;
@@ -23,6 +25,7 @@ export interface MessageAddress {
   threadId: string;
   rootId: string;
   botId: string;
+  logicalRole?: string;
 }
 
 export interface ResolvedSession {
@@ -57,9 +60,17 @@ function topicIdOf(message: MessageAddress): string {
   return message.topicId?.trim() || message.threadId || message.rootId || message.messageId;
 }
 
-/** 会话索引键：同一话题下按 bot 隔离。 */
-function sessionKey(chatId: string, threadId: string, botId: string): string {
-  return `${chatId}:${threadId}:${botId}`;
+/** 会话索引键：同一话题下按 bot + 逻辑角色隔离。 */
+export function logicalRoleOf(value: { botId: string; logicalRole?: string }): string {
+  return value.logicalRole?.trim() || value.botId;
+}
+
+function sessionKey(chatId: string, threadId: string, botId: string, logicalRole?: string): string {
+  return `${chatId}:${threadId}:${botId}::${logicalRole?.trim() || botId}`;
+}
+
+function sessionKeyOf(session: { chatId: string; threadId: string; botId: string; logicalRole?: string }): string {
+  return sessionKey(session.chatId, session.threadId, session.botId, session.logicalRole);
 }
 
 export class SessionManager {
@@ -83,10 +94,10 @@ export class SessionManager {
     const restored = await options.store?.load() ?? [];
     const restoredIds = new Set<string>();
     for (const session of restored) {
-      const key = sessionKey(session.chatId, session.threadId, session.botId);
+      const key = sessionKeyOf(session);
       if (restoredIds.has(session.id)) throw new Error(`会话文件包含重复 ID: ${session.id}`);
       if (manager.sessions.has(key)) {
-        throw new Error(`会话文件包含重复话题角色: ${session.chatId}/${session.threadId}/${session.botId}`);
+        throw new Error(`会话文件包含重复话题角色: ${session.chatId}/${session.threadId}/${session.botId}::${logicalRoleOf(session)}`);
       }
       restoredIds.add(session.id);
       manager.sessions.set(key, session);
@@ -112,7 +123,8 @@ export class SessionManager {
   async resolve(message: MessageAddress, preferredCliId?: CliId): Promise<ResolvedSession> {
     return this.enqueueMutation(async () => {
       const threadId = topicIdOf(message);
-      const key = sessionKey(message.chatId, threadId, message.botId);
+      const logicalRole = logicalRoleOf(message);
+      const key = sessionKey(message.chatId, threadId, message.botId, logicalRole);
       const existing = this.sessions.get(key);
       if (existing) {
         if (!preferredCliId || existing.cliId === preferredCliId || existing.status === 'active') {
@@ -138,6 +150,7 @@ export class SessionManager {
       const session: Session = {
         id: this.createId(),
         botId: message.botId,
+        logicalRole,
         threadId,
         chatId: message.chatId,
         cliId: preferredCliId ?? this.defaultCliId,
@@ -170,7 +183,7 @@ export class SessionManager {
         status: nextStatus,
         updatedAt: this.now().toISOString(),
       };
-      const key = sessionKey(updated.chatId, updated.threadId, updated.botId);
+      const key = sessionKeyOf(updated);
       this.sessions.set(key, updated);
       try {
         await this.persist();
@@ -194,7 +207,7 @@ export class SessionManager {
         cliSessionId: cliSessionId.trim(),
         updatedAt: this.now().toISOString(),
       };
-      const key = sessionKey(updated.chatId, updated.threadId, updated.botId);
+      const key = sessionKeyOf(updated);
       this.sessions.set(key, updated);
       try {
         await this.persist();
@@ -225,7 +238,7 @@ export class SessionManager {
         cliSessionId: undefined,
         updatedAt: this.now().toISOString(),
       };
-      const key = sessionKey(updated.chatId, updated.threadId, updated.botId);
+      const key = sessionKeyOf(updated);
       this.sessions.set(key, updated);
       try {
         await this.persist();
@@ -252,7 +265,11 @@ export class SessionManager {
         matched += 1;
         if (session.cliId === cliId) continue;
         if (session.status === 'active') {
-          deferredBotIds.push(session.botId);
+          deferredBotIds.push(
+            session.logicalRole && session.logicalRole !== session.botId
+              ? `${session.botId}::${session.logicalRole}`
+              : session.botId,
+          );
           continue;
         }
         if (session.cliSessionId) clearedContexts += 1;
@@ -306,7 +323,7 @@ export class SessionManager {
         status: current.status === 'creating' ? 'creating' : 'idle',
         updatedAt: this.now().toISOString(),
       };
-      const key = sessionKey(updated.chatId, updated.threadId, updated.botId);
+      const key = sessionKeyOf(updated);
       this.sessions.set(key, updated);
       try {
         await this.persist();
@@ -365,7 +382,7 @@ export class SessionManager {
         status: 'idle',
         updatedAt: this.now().toISOString(),
       };
-      const key = sessionKey(updated.chatId, updated.threadId, updated.botId);
+      const key = sessionKeyOf(updated);
       this.sessions.set(key, updated);
       try {
         await this.persist();
@@ -403,7 +420,11 @@ export class SessionManager {
   listByTopic(chatId: string, threadId: string): Session[] {
     return [...this.sessions.values()]
       .filter((session) => session.chatId === chatId && session.threadId === threadId)
-      .sort((a, b) => a.botId.localeCompare(b.botId));
+      .sort((a, b) => {
+        const roleCmp = a.botId.localeCompare(b.botId);
+        if (roleCmp !== 0) return roleCmp;
+        return logicalRoleOf(a).localeCompare(logicalRoleOf(b));
+      });
   }
 
   /** 写入底层 SessionStore。 */

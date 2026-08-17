@@ -74,7 +74,8 @@ test('架构师 planned findings 必须 RESULT:done，不得因 FIND 标 failed'
   assert.match(architect, /同一 CLI 会话纠偏一次/);
   assert.match(architect, /禁止把「已规划给开发修的 FIND-\*」写成 \[RESULT:failed\]/);
   assert.match(architect, /设计门禁 planned P0\/P1 必须随 \[RESULT:done\] 通过/);
-  assert.doesNotMatch(architect, /发现需改代码的缺陷时用这个/);
+  assert.match(architect, /绝对禁止实现/);
+  assert.doesNotMatch(architect, /不要直接大面积改代码/);
   assert.equal(shouldAcceptArchitectFailedAsDone('architect', 'failed', true), false);
   assert.equal(shouldAcceptArchitectFailedAsDone('architect', 'failed', false), false);
   assert.equal(shouldAcceptArchitectFailedAsDone('architect', 'done', true), false);
