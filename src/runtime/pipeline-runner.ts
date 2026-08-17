@@ -57,11 +57,13 @@ import {
   findMisroutedEnvironmentBlock,
   handoffStepIdFromQualityMessage,
   hasExplicitStepResult,
+  parseStepOutcome,
   parseStepResult,
   requiresTestResourceAuthorization,
   resolveQualityHandoffTarget,
-  shouldAcceptArchitectFailedAsDone,
+  resolveRejectedDecisionHandoff,
   shouldAutoCorrectDevEnvironmentBlock,
+  shouldPauseAsEvidenceBlock,
 } from '../core/step-result.js';
 import { assertWorkdir } from '../core/workdir.js';
 import { buildQuestionnaireCard, buildSpecConfirmationCard, buildStepBlockedCard } from '../im/workflow-card.js';
@@ -447,11 +449,17 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
         onComplete: async ({ approved, answer }) => {
           if (workflow.qualityPolicy === 'gated') await assertRuntimeSourceCurrent(ctx);
           if (!approved) {
-            await failWorkflow(
+            await handOffQualityFix(
               ctx,
               workflow.id,
-              '代码评审未通过，流水线已停止，不能继续 QA。',
-              { stepIndex, stepId: step.id },
+              {
+                fromStepId: step.id,
+                fromStepIndex: stepIndex,
+                targetStepId: 'dev',
+                reason: '变更审查未批准（含协作轮次用尽）',
+                answer,
+              },
+              false,
             );
             return;
           }
@@ -562,7 +570,6 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
       approvedScope: workflow.executionPolicy === 'approved' ? workflow.goal : undefined,
       // PM 步骤产出 Spec 正文，不解析 RESULT 标记
       resultProtocol: step.id !== 'pm',
-      acceptFailedResultIfValidated: step.id === 'architect',
       treatFailedResultAsDone: step.id === 'summary',
       validateSuccess: step.id === 'pm'
         ? async (answer) => {
@@ -591,39 +598,63 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
         if (step.id !== 'pm') {
           // P1 修复：使用 cli-task.ts 传入的已归一化 stepResult，避免重复解析导致不一致。
           const stepResult = normalizedResult ?? parseStepResult(answer);
+          const outcome = parseStepOutcome(answer);
+          const routingReason = stepResult.reason || outcome.reason || '';
+          if (shouldPauseAsEvidenceBlock(step.id, routingReason, answer)) {
+            await pauseWorkflowForStepBlock(
+              ctx,
+              workflow.id,
+              stepIndex,
+              step.id,
+              step.title,
+              answer,
+              routingReason || '本步证据或格式不可用',
+            );
+            return;
+          }
           if (stepResult.kind === 'failed') {
-            if (shouldAcceptArchitectFailedAsDone(step.id, stepResult.kind, !!preparedGateCompletion)) {
-              console.warn(
-                `[工作流] ${workflow.id} 架构师输出了 [RESULT:failed]，但设计门禁可通过，已按完成继续。`,
-              );
-            } else {
-              const handoff = resolveQualityHandoffTarget(step.id, stepResult.reason || '');
-              if (handoff) {
-                await handOffQualityFix(
-                  ctx,
-                  workflow.id,
-                  {
-                    fromStepId: step.id,
-                    fromStepIndex: stepIndex,
-                    targetStepId: handoff,
-                    reason: stepResult.reason || '质量步骤报告失败，需修复后重跑',
-                    answer,
-                  },
-                  false,
-                );
-                return;
-              }
-              await failWorkflow(
+            const handoff = resolveQualityHandoffTarget(step.id, routingReason, answer);
+            if (handoff) {
+              await handOffQualityFix(
                 ctx,
                 workflow.id,
-                stepResult.reason || '步骤报告失败',
-                { stepIndex, stepId: step.id },
+                {
+                  fromStepId: step.id,
+                  fromStepIndex: stepIndex,
+                  targetStepId: handoff,
+                  reason: routingReason || '质量步骤报告失败，需修复后重跑',
+                  answer,
+                },
+                false,
               );
               return;
             }
+            await failWorkflow(
+              ctx,
+              workflow.id,
+              routingReason || '步骤报告失败',
+              { stepIndex, stepId: step.id },
+            );
+            return;
+          }
+          const rejectedHandoff = resolveRejectedDecisionHandoff(step.id, outcome, answer);
+          if (rejectedHandoff) {
+            await handOffQualityFix(
+              ctx,
+              workflow.id,
+              {
+                fromStepId: step.id,
+                fromStepIndex: stepIndex,
+                targetStepId: rejectedHandoff,
+                reason: routingReason || '质量步骤拒绝批准，需修复后重跑',
+                answer,
+              },
+              false,
+            );
+            return;
           }
           if (stepResult.kind === 'blocked') {
-            const handoff = resolveQualityHandoffTarget(step.id, stepResult.reason || '');
+            const handoff = resolveQualityHandoffTarget(step.id, routingReason, answer);
             if (handoff) {
               await handOffQualityFix(
                 ctx,

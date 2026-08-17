@@ -39,11 +39,12 @@ function lastReviewDecision(answer: string, explicitMarkerOnly: boolean): Review
   let decision: ReviewDecision | undefined;
   for (const line of answer.normalize('NFKC').split(/\r?\n/)) {
     const conclusion = extractConclusion(line);
-    if (/^(?:未通过|不通过|拒绝|不可合并|仍需修改|需要修改|\[REJECTED\])(?:$|[\s。.!！,，(（])/i.test(conclusion)) {
+    if (/^(?:未通过|不通过|拒绝|不可合并|仍需修改|需要修改|\[REJECTED\]|\[DECISION:\s*rejected\])(?:$|[\s。.!！,，(（])/i.test(conclusion)) {
       decision = 'rejected';
       continue;
     }
-    if (/^\[APPROVED\](?:\s*[。.!！])?$/i.test(conclusion)) {
+    if (/^\[APPROVED\](?:\s*[。.!！])?$/i.test(conclusion)
+      || /^\[DECISION:\s*approved(?:-with-waiver)?\](?:\s*[。.!！])?$/i.test(conclusion)) {
       decision = 'approved';
       continue;
     }
@@ -74,8 +75,8 @@ export function buildInitialReviewPrompt(task: string, round: number): string {
     '请审查当前话题项目目录中的代码/改动，给出：',
     '1) 问题与风险（按严重程度）',
     '2) 修改建议',
-    '3) 若无明显问题，请在结论中明确写上 [APPROVED]',
-    '4) 完整交付流水线中必须另起一行 [RESULT:done|blocked|failed]：通过或未通过都用 [RESULT:done]；未通过时不要写 [APPROVED]，系统会回传开发。禁止把「发现需改代码」写成 [RESULT:failed]（那会停掉流水线）',
+    '3) 若无明显问题，请在结论中明确写上 [APPROVED] 或 [DECISION:approved]',
+    '4) 完整交付流水线中必须另起一行 [RESULT:done|blocked|failed]：通过或未通过都用 [RESULT:done]；未通过时不要写 [APPROVED]，可写 [DECISION:rejected] + [HANDOFF:dev]。禁止把「发现需改代码」写成 [RESULT:failed]（那会跳过回传）。审查做不完用 [RESULT:blocked] + [BLOCK_KIND:gate-evidence]。',
     '',
     `评审目标：${task}`,
   ].join('\n');
@@ -105,6 +106,6 @@ export function buildFollowUpReviewPrompt(task: string, round: number, devResult
     '开发已根据上一轮意见完成修改，说明如下：',
     compactAgentOutput(devResult),
     '',
-    '请复查是否已解决。若通过请写 [APPROVED] 并输出 [RESULT:done]；否则不要写 [APPROVED]，仍输出 [RESULT:done] 让系统继续回传开发。禁止用 [RESULT:failed] 停掉流水线。',
+    '请复查是否已解决。若通过请写 [APPROVED] 或 [DECISION:approved] 并输出 [RESULT:done]；否则不要写 [APPROVED]，仍输出 [RESULT:done] 让系统继续回传开发。禁止用 [RESULT:failed] 表示有 bug；审查做不完用 [RESULT:blocked] + [BLOCK_KIND:gate-evidence]。',
   ].join('\n');
 }

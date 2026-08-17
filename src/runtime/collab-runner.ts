@@ -12,7 +12,7 @@ import { startCliTask } from './cli-task.js';
 import { ensureRunnableSession, topicIdOf } from './sessions.js';
 import type { CliExecutionPolicy } from '../cli/types.js';
 import { sanitizeErrorForLog } from '../core/log-inspection.js';
-import { parseStepResult } from '../core/step-result.js';
+import { isGateEvidenceBlockReason, parseStepResult } from '../core/step-result.js';
 
 /** reviewer →（未通过则）dev → 复审，直到通过或达上限。 */
 export async function runCollabReview(
@@ -125,7 +125,6 @@ export async function runCollabReview(
       approvedScope,
       resultProtocol,
       hideProtocolOutput: true,
-      treatFailedResultAsDone: resultProtocol,
       validateSuccess: validateApproval
         ? async (answer) => {
           if (!approved(answer)) return;
@@ -139,10 +138,15 @@ export async function runCollabReview(
         await beforeTask?.();
         if (resultProtocol) {
           const result = parseStepResult(reviewAnswer);
-          if (result.kind === 'blocked') {
+          if (result.kind === 'blocked' || result.kind === 'failed') {
             await ctx.collabStore.clearRound(topicKey);
-            if (onBlocked) await onBlocked({ answer: reviewAnswer, reason: result.reason });
-            else await reportFailure(new Error(result.reason || '评审协作报告阻塞'));
+            const reason = result.reason || (result.kind === 'blocked' ? '评审协作报告阻塞' : '审查本身无法完成');
+            if (result.kind === 'blocked' || isGateEvidenceBlockReason(`${reason}\n${reviewAnswer}`)) {
+              if (onBlocked) await onBlocked({ answer: reviewAnswer, reason });
+              else await reportFailure(new Error(reason));
+              return;
+            }
+            await reportFailure(new Error(reason));
             return;
           }
         }

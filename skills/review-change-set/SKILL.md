@@ -63,9 +63,9 @@ description: "在功能、修复、重构或迁移完成实现后、进入 QA �
 必须先写入临时文件（如 `evidenceRoot/check-xxx.mjs`），再用 `node check-xxx.mjs` 作为 command，避免超限截断。
 
 基线不明、manifest 与真实变更无法调和、当前 fingerprint 与实现证据不一致、
-未覆盖完整变更集、校验脚本失败或仅输出文本批准时阻止进入 QA（`[RESULT:failed]`，审查本身无法完成）。
-开放 P0/P1 时不得输出 `[APPROVED]`，必须 `[RESULT:done]` 让协作回传开发；禁止把这些 FIND 写成
-`[RESULT:failed]`（那会跳过回传、停掉流水线）。
+未覆盖完整变更集、校验脚本失败或仅输出文本批准时阻止进入 QA（`[RESULT:blocked]` + `[BLOCK_KIND:gate-evidence]`，审查本身无法完成）。
+开放 P0/P1 时不得输出 `[APPROVED]`，必须 `[RESULT:done]`（可加 `[DECISION:rejected]` + `[HANDOFF:dev]`）让协作回传开发；禁止把这些 FIND 写成
+`[RESULT:failed]`（那会跳过回传）。存在有效契约 waiver 且无开放 P0/P1 时使用 `decision=approved-with-waiver`。
 
 ## 按需参考
 

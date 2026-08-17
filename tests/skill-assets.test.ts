@@ -399,6 +399,35 @@ test('变更审查脚本发现 untracked 范围差异并拒绝文本式批准', 
       decision: 'approved', status: 'pass',
     });
     assert.equal(runScript('skills/review-change-set/scripts/validate-review-report.mjs', [review]).status, 0);
+
+    await writeJson(review, {
+      implementationFingerprint: 'f'.repeat(64), reviewFingerprint: 'f'.repeat(64), baseline: 'HEAD',
+      reviewScope: scope,
+      requirementCoverage: [{ id: 'RQ-1', priority: 'P1', status: 'pass', evidence: ['src/tracked.ts:1'] }],
+      relatedContracts: [],
+      findings: [{
+        id: 'FIND-205',
+        severity: 'P3',
+        status: 'waived',
+        summary: 'accepted residual',
+        evidence: ['src/tracked.ts:1'],
+      }],
+      waivers: [{
+        findingId: 'FIND-205',
+        owner: 'owner',
+        reason: 'known residual',
+        scope: 'src/tracked.ts',
+        compensatingControl: 'monitor',
+        approvedAt: '2026-01-01T00:00:00.000Z',
+        approvalEvidence: 'canonical-spec:spec:v1:sha256:' + 'a'.repeat(64) + ':waiver:FIND-205',
+        expiresAt: '2099-01-01T00:00:00.000Z',
+      }],
+      removalPlans: [], notReviewed: [], residualRisks: [],
+      decision: 'approved', status: 'pass',
+    });
+    const missingWaiverDecision = runScript('skills/review-change-set/scripts/validate-review-report.mjs', [review]);
+    assert.equal(missingWaiverDecision.status, 2, missingWaiverDecision.stdout);
+    assert.match(missingWaiverDecision.stdout, /decision=approved-with-waiver/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -62,7 +62,8 @@ description: "在代码准备交付、合并或发布时，基于最终项目快
 必须先写入临时文件（如 `evidenceRoot/check-xxx.mjs`），再用 `node check-xxx.mjs` 作为 command，避免超限截断。
 `evidence-chain.json` 由控制器生成且只读，Reviewer 不得修改或重算其中登记值。
 
-最终快照未验证、有未解决 P0/P1、证据缺失/过期/hash 不匹配或只给文本结论时阻止交付。
+最终快照未验证、证据缺失/过期/hash 不匹配时输出 `[RESULT:blocked]` + `[BLOCK_KIND:gate-evidence]`，不要退回开发改产品代码。
+开放 P0/P1 时输出 `[RESULT:done]` + `[DECISION:rejected]` + `[HANDOFF:dev]`（或缺陷所属步）。只给文本结论不能交付。
 
 ## 按需参考
 

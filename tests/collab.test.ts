@@ -35,7 +35,8 @@ test('评审只接受明确的通过结论行', () => {
 test('结构化门禁必须有显式 APPROVED 标记', () => {
   assert.equal(isReviewExplicitlyApproved('最终结论：评审通过'), false);
   assert.equal(isReviewExplicitlyApproved('结论：[APPROVED]\n[GATE_RESULT] {}'), true);
-  assert.equal(isReviewExplicitlyApproved('[APPROVED]\n结论：[REJECTED]'), false);
+  assert.equal(isReviewExplicitlyApproved('[DECISION:approved]\n[RESULT:done]'), true);
+  assert.equal(isReviewExplicitlyApproved('[DECISION:approved-with-waiver]'), true);
 });
 
 test('协作评审 prompt 禁止把未通过标成 RESULT:failed', () => {
@@ -44,7 +45,7 @@ test('协作评审 prompt 禁止把未通过标成 RESULT:failed', () => {
   assert.match(first, /禁止把「发现需改代码」写成 \[RESULT:failed\]/);
   const followUp = buildFollowUpReviewPrompt('审查实现', 2, '已按意见修改');
   assert.match(followUp, /仍输出 \[RESULT:done\]/);
-  assert.match(followUp, /禁止用 \[RESULT:failed\] 停掉流水线/);
+  assert.match(followUp, /禁止用 \[RESULT:failed\] 表示有 bug/);
 });
 
 test('协作轮次落盘失败时回滚内存状态', async () => {

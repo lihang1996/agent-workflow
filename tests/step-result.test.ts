@@ -6,11 +6,16 @@ import {
   extractAbsolutePathCandidates,
   findMisroutedEnvironmentBlock,
   hasExplicitStepResult,
+  parseDecision,
+  parseHandoff,
+  parseStepOutcome,
   parseStepResult,
   resolveQualityHandoffTarget,
+  resolveRejectedDecisionHandoff,
   isEnvironmentBlockReason,
   shouldAcceptArchitectFailedAsDone,
   shouldAutoCorrectDevEnvironmentBlock,
+  shouldPauseAsEvidenceBlock,
   shouldTreatFailedResultAsDone,
 } from '../src/core/step-result.js';
 import { buildStepBlockedActionCard, buildStepBlockedCard } from '../src/im/workflow-card.js';
@@ -70,11 +75,11 @@ test('架构师 planned findings 必须 RESULT:done，不得因 FIND 标 failed'
   assert.match(architect, /禁止把「已规划给开发修的 FIND-\*」写成 \[RESULT:failed\]/);
   assert.match(architect, /设计门禁 planned P0\/P1 必须随 \[RESULT:done\] 通过/);
   assert.doesNotMatch(architect, /发现需改代码的缺陷时用这个/);
-  assert.equal(shouldAcceptArchitectFailedAsDone('architect', 'failed', true), true);
+  assert.equal(shouldAcceptArchitectFailedAsDone('architect', 'failed', true), false);
   assert.equal(shouldAcceptArchitectFailedAsDone('architect', 'failed', false), false);
   assert.equal(shouldAcceptArchitectFailedAsDone('architect', 'done', true), false);
   assert.equal(shouldAcceptArchitectFailedAsDone('dev', 'failed', true), false);
-  assert.equal(shouldTreatFailedResultAsDone('review'), true);
+  assert.equal(shouldTreatFailedResultAsDone('review'), false);
   assert.equal(shouldTreatFailedResultAsDone('summary'), true);
   assert.equal(shouldTreatFailedResultAsDone('architect'), false);
   assert.equal(shouldTreatFailedResultAsDone('qa'), false);
@@ -181,6 +186,41 @@ test('开发纯环境阻塞只允许一次性契约纠偏，目录、资源与�
   );
   assert.match(prompt, /### dev_environment_autocorrect\n一次性纠偏/);
   assert.match(prompt, /不得复用上一轮 blocked manifest/);
+});
+
+test('parseStepOutcome 识别 DECISION、HANDOFF 与 BLOCK_KIND', () => {
+  const rejected = parseStepOutcome([
+    '开放 P1',
+    '[RESULT:done] 审查完成但未批准',
+    '[DECISION:rejected]',
+    '[HANDOFF:dev]',
+  ].join('\n'));
+  assert.equal(rejected.kind, 'done');
+  assert.equal(rejected.decision, 'rejected');
+  assert.equal(rejected.handoff, 'dev');
+  assert.equal(resolveRejectedDecisionHandoff('qa', rejected, '开放 P1'), 'dev');
+
+  const tagged = parseStepOutcome('[RESULT:blocked]\n[BLOCK_KIND:environment]\n沙箱策略禁止了该操作');
+  assert.equal(tagged.kind, 'blocked');
+  assert.equal(tagged.blockKind, 'environment');
+  assert.equal(classifyStepBlockReason('[BLOCK_KIND:environment]\n沙箱策略禁止了该操作'), 'environment');
+  assert.equal(resolveQualityHandoffTarget('qa', '沙箱策略禁止了该操作', '[BLOCK_KIND:environment]'), undefined);
+
+  assert.equal(parseDecision('[APPROVED]\n[RESULT:done]'), 'approved');
+  assert.equal(parseDecision('[DECISION:approved-with-waiver]'), 'approved-with-waiver');
+  assert.equal(parseHandoff('[HANDOFF:architect]'), 'architect');
+  assert.equal(parseDecision('[APPROVED]\n[DECISION:rejected]'), 'rejected');
+});
+
+test('终审证据失败不得移交开发', () => {
+  const reason = '最终审查 evidenceChain hash 不匹配';
+  assert.equal(classifyStepBlockReason(reason), 'gate-evidence');
+  assert.equal(shouldPauseAsEvidenceBlock('final_review', reason, '[RESULT:failed] hash 不匹配'), true);
+  assert.equal(resolveQualityHandoffTarget('final_review', reason, '[RESULT:failed] hash 不匹配'), undefined);
+  assert.equal(
+    resolveQualityHandoffTarget('final_review', '开放 P0 需修产品代码', '[HANDOFF:dev]\n[DECISION:rejected]'),
+    'dev',
+  );
 });
 
 test('运行时/QA 的代码缺陷应移交开发，目录问题不移交', () => {

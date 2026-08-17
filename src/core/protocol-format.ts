@@ -65,7 +65,7 @@ export function buildProtocolFormatRepairPrompt(error: unknown): string {
     '',
     '要求：',
     '1. 不要重新读取整个仓库，不要重做项目发现或全量审查。',
-    '2. 只修正 Spec 结构、行首 [RESULT:done|blocked|failed]、[GATE_RESULT] JSON、主 artifact 路径与真实 sha256。',
+    '2. 只修正 Spec 结构、行首 [RESULT:done|blocked|failed]、可选的 [DECISION]/[HANDOFF]/[BLOCK_KIND]、[GATE_RESULT] JSON、主 artifact 路径与真实 sha256。',
     '3. 没有用户已明确接受的风险时，Spec 正文不要出现 RISK_WAIVER 标记。',
     '4. 先运行本步骤 Skill 的 validate-*.mjs（产品经理用 validate-spec-markdown.mjs），通过后再输出完整终态。',
     '5. 产品结论、开放 P0/P1、是否 [APPROVED] 保持上一轮判断，除非格式修正必然改到这些字段。',

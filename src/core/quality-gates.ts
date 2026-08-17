@@ -1092,7 +1092,7 @@ async function recoverGateResultFromEvidence(
   const reportStatus = typeof report.status === 'string' ? report.status.trim().toLowerCase() : '';
   const decision = typeof report.decision === 'string' ? report.decision.trim().toLowerCase() : '';
   let status: string = reportStatus || 'pass';
-  if (decision === 'approved' && (!reportStatus || reportStatus === 'pass')) status = 'pass';
+  if ((decision === 'approved' || decision === 'approved-with-waiver') && (!reportStatus || reportStatus === 'pass')) status = 'pass';
   if (decision === 'rejected' || decision === 'blocked') status = reportStatus || 'fail';
 
   const findings = Array.isArray(report.findings) ? report.findings : [];
@@ -1705,7 +1705,7 @@ export async function verifyGateArtifacts(
       }
       const hasWaivers = result.findings.some((finding) => finding.status === 'waived')
         || (Array.isArray(report.waivers) && report.waivers.length > 0);
-      const expectedDecision = result.gateId === 'final-review' && hasWaivers
+      const expectedDecision = hasWaivers
         ? 'approved-with-waiver'
         : 'approved';
       if (report.status !== 'pass' || report.decision !== expectedDecision) {

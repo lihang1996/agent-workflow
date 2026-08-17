@@ -92,9 +92,12 @@ if (openBlocking.length > 0) errors.push(`unclosed P0/P1 findings: ${openBlockin
 const planned = (report.findings ?? []).filter((finding) => finding?.status === "planned");
 if (planned.length > 0) errors.push(`review findings cannot remain planned: ${planned.map((item) => item.id).join(",")}`);
 
-const approved = report.decision === "approved" || report.status === "pass";
-if (approved && (report.decision !== "approved" || report.status !== "pass")) {
-  errors.push("approved report must use decision=approved and status=pass");
+const hasWaivers = (report.findings ?? []).some((finding) => finding?.status === "waived")
+  || (Array.isArray(report.waivers) && report.waivers.length > 0);
+const expectedDecision = hasWaivers ? "approved-with-waiver" : "approved";
+const approved = report.decision === "approved" || report.decision === "approved-with-waiver" || report.status === "pass";
+if (approved && (report.decision !== expectedDecision || report.status !== "pass")) {
+  errors.push(`approved report must use decision=${expectedDecision} and status=pass`);
 }
 if (approved && report.implementationFingerprint !== report.reviewFingerprint) {
   errors.push("review fingerprint differs from implementation fingerprint");

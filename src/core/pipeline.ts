@@ -308,7 +308,7 @@ export function buildPipelineStepPrompt(
         '前置产出：',
         prior,
         '',
-        '请独立核对需求追踪、变更范围、QA 与运行时证据。发现证据断链或开放 P0/P1 必须 [RESULT:failed] 交回开发，系统会继续修而不是永久停掉流水线。',
+        '请独立核对需求追踪、变更范围、QA 与运行时证据。开放 P0/P1 输出 [RESULT:done] + [DECISION:rejected] + [HANDOFF:dev]。证据断链、hash 不匹配或缺 gate 必须 [RESULT:blocked] + [BLOCK_KIND:gate-evidence]，禁止 [RESULT:failed] 交回开发改产品代码。',
         ...gatedTail(step),
       ].join('\n');
     case 'summary':
@@ -333,7 +333,7 @@ export function buildPipelineStepPrompt(
         prior,
         '',
         '请独立检查完整变更范围和关联契约；不能只依据开发总结。',
-        '开放 P0/P1 时给出可执行修复意见并拒绝批准：输出 [RESULT:done] 且不要写 [APPROVED]，让协作回传开发。禁止因这些 FIND 输出 [RESULT:failed]。',
+        '开放 P0/P1 时给出可执行修复意见并拒绝批准：输出 [RESULT:done] 且不要写 [APPROVED]，可另写 [DECISION:rejected] + [HANDOFF:dev]，让协作回传开发。禁止因这些 FIND 输出 [RESULT:failed]。审查做不完用 [RESULT:blocked] + [BLOCK_KIND:gate-evidence]。',
         ...gatedTail(step),
       ].join('\n');
     default:
