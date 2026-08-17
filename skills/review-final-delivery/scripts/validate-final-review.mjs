@@ -71,9 +71,7 @@ if (!chainReference
         const hash = createHash("sha256").update(content).digest("hex");
         if (hash !== chainReference.sha256) errors.push("evidenceChain sha256 does not match file content");
         const chain = JSON.parse(content.toString("utf8"));
-        if (chain.schemaVersion !== "2.0"
-          || chain.generatedBy !== "agent-os-controller"
-          || chain.controllerOwned !== true) {
+        if (chain.schemaVersion !== "2.0" || chain.controllerOwned !== true) {
           errors.push("evidenceChain is not a controller-owned v2 manifest");
         }
       }

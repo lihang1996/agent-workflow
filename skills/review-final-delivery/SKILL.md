@@ -5,6 +5,9 @@ description: "在代码准备交付、合并或发布时，基于最终项目快
 
 # 审查最终交付
 
+本 Skill 的 `scripts/` 属于编排框架，不是目标仓库代码。请运行
+`workflow_context.skillsRoot/review-final-delivery/scripts/...`；没有该字段时使用本文件所在目录。
+
 ## 必需输入
 
 - 读取 canonical 契约、最终和基准 fingerprint、方案、实现、验证与运行时证据。

@@ -5,6 +5,9 @@ description: "在已批准交付契约和风险方案下实现功能、修复、
 
 # 实现可追踪变更
 
+本 Skill 的 `scripts/` 属于编排框架，不是目标仓库代码。请运行
+`workflow_context.skillsRoot/implement-traceable-change/scripts/...`；没有该字段时使用本文件所在目录。
+
 ## 必需输入
 
 - 读取已批准 canonical Spec 及其内容 SHA-256、变更方案和匹配的项目快照；

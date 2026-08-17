@@ -5,6 +5,9 @@ description: "在交付包含浏览器界面、HTTP API、公开输入、缓存�
 
 # 审计运行时边界
 
+本 Skill 的 `scripts/` 属于编排框架，不是目标仓库代码。请运行
+`workflow_context.skillsRoot/audit-runtime-boundaries/scripts/...`；没有该字段时使用本文件所在目录。
+
 ## 必需输入
 
 - 读取契约、实现和验证报告。

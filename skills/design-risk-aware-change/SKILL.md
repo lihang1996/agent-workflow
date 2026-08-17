@@ -5,6 +5,9 @@ description: "在代码、数据、接口、权限、缓存、依赖、部署或
 
 # 设计风险感知变更
 
+本 Skill 的 `scripts/` 属于编排框架，不是目标仓库代码。请运行
+`workflow_context.skillsRoot/design-risk-aware-change/scripts/...`；没有该字段时使用本文件所在目录。
+
 ## 必需输入
 
 - 读取控制器提供的 canonical Spec 正文与 `canonical_spec` 元数据（ID、版本、

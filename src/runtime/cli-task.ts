@@ -23,7 +23,7 @@ import {
 } from '../core/protocol-format.js';
 import { displayAgentOutput } from '../core/agent-output.js';
 import { assertWorkdir } from '../core/workdir.js';
-import { TEST_RESOURCE_SENTINEL_ENV } from '../core/test-resource-policy.js';
+import { EXPECTED_SENTINEL_ENV_NAME, TEST_RESOURCE_SENTINEL_ENV } from '../core/test-resource-policy.js';
 import type { AppContext } from './app-context.js';
 import type { ActiveRun } from './types.js';
 import {
@@ -332,6 +332,7 @@ export async function startCliTask(
       ...(workflowId ? { AGENT_OS_WORKFLOW_ID: workflowId } : {}),
       // 显式覆盖宿主环境，避免全局变量意外泄露到普通聊天或非 QA 步骤。
       [TEST_RESOURCE_SENTINEL_ENV]: testResourceSentinelAuthorized ? 'true' : '',
+      [EXPECTED_SENTINEL_ENV_NAME]: TEST_RESOURCE_SENTINEL_ENV,
     },
   });
 

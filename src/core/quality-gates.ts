@@ -9,6 +9,11 @@ import { hashPathArtifact } from './project-snapshot.js';
 export const QualityPolicySchema = z.enum(['legacy', 'gated']);
 export type QualityPolicy = z.infer<typeof QualityPolicySchema>;
 
+/** 认 schema + 控制器所有权，不绑定具体编排器品牌字符串。 */
+export function isControllerOwnedV2EvidenceChain(chain: Record<string, unknown>): boolean {
+  return chain.schemaVersion === '2.0' && chain.controllerOwned === true;
+}
+
 export const GateIdSchema = z.enum([
   'design',
   'implementation',
@@ -2324,9 +2329,7 @@ async function verifyFinalEvidenceChainReference(
     throw new Error('最终审查 evidenceChain hash 与控制器证据链不一致');
   }
   const chain = parseJsonArtifact(content, canonicalPath);
-  if (chain.schemaVersion !== '2.0'
-    || chain.generatedBy !== 'agent-os-controller'
-    || chain.controllerOwned !== true) {
+  if (!isControllerOwnedV2EvidenceChain(chain)) {
     throw new Error('最终审查引用的 evidenceChain 不是控制器拥有的 v2 证据链');
   }
 }
@@ -2691,7 +2694,7 @@ export function buildEvidenceChainManifest(
   })));
   return {
     schemaVersion: '2.0',
-    generatedBy: 'agent-os-controller',
+    generatedBy: process.env.AGENT_OS_EVIDENCE_GENERATOR?.trim() || 'agent-os-controller',
     controllerOwned: true,
     workflowId,
     generatedAt,
@@ -2772,24 +2775,24 @@ export function gateResultInstruction(stepId: PipelineStepId): string {
   const primary = PRIMARY_EVIDENCE_ARTIFACT[gateId];
   const exampleCheck = gateId === 'verification'
     ? {
-      id: 'test',
-      command: ['pnpm', 'test'],
+      id: '<actual-check-id>',
+      command: ['<do-not-copy>', '<actual-project-command>'],
       status: 'pass',
       required: true,
       exitCode: 0,
-      cwd: '/absolute/project',
-      startedAt: '2026-08-11T01:00:00.000Z',
-      finishedAt: '2026-08-11T01:00:01.000Z',
+      cwd: '<absolute-project-root>',
+      startedAt: '<iso-8601-from-this-attempt>',
+      finishedAt: '<iso-8601-from-this-attempt>',
     }
     : {
       id: 'validate-artifact',
-      command: ['node', 'validator.mjs', primary.fileName],
+      command: ['node', '<skillsRoot>/<skill>/scripts/validator.mjs', primary.fileName],
       status: 'pass',
       required: true,
       exitCode: 0,
-      cwd: '/absolute/project',
-      startedAt: '2026-08-11T01:00:00.000Z',
-      finishedAt: '2026-08-11T01:00:01.000Z',
+      cwd: '<absolute-project-root>',
+      startedAt: '<iso-8601-from-this-attempt>',
+      finishedAt: '<iso-8601-from-this-attempt>',
     };
   const artifactCheckField = gateId === 'design' ? 'checks'
     : gateId === 'implementation' ? 'targetedCheckResults'
@@ -2803,8 +2806,8 @@ export function gateResultInstruction(stepId: PipelineStepId): string {
     checks: artifactCheckField ? [] : [exampleCheck],
     evidence: ['绝对路径:行号、命令输出或运行时 artifact'],
     artifacts: [{
-      path: `/absolute/project/.agent-os/evidence/workflow-id/${primary.fileName}`,
-      sha256: '0'.repeat(64),
+      path: `<evidenceRoot>/${primary.fileName}`,
+      sha256: '<sha256-of-that-file>',
       kind: primary.kind,
     }],
     findings: [],
@@ -2815,6 +2818,7 @@ export function gateResultInstruction(stepId: PipelineStepId): string {
     '只能修改本步骤拥有的主 artifact；不得修改其他 gate 主 artifact，canonical-spec.md 与 evidence-chain.json 由控制器生成且只读。',
     'canonical Spec 的完整正文必须从 workflow_context.canonicalSpec.path 读取，并核对其 sha256；不要只依赖提示词中可能被截断的 pm 摘要。',
     '完成正文后必须单独输出：[GATE_RESULT] 后紧跟 JSON（推荐单行；允许多行，但 JSON 结束后不要再追加工具调用、DSML、markdown 或其它杂质）。示例：[GATE_RESULT] ' + example,
+    '示例里的命令、cwd、时间戳、路径和 sha256 都是占位符，禁止原样复制；必须换成本轮真实执行结果。',
     'JSON 不得省略字段；系统会按括号匹配提取 JSON，并可用证据目录内真实文件重算 sha256。',
     'artifacts[].sha256 必须是文件内容的真实 SHA-256：恰好 64 位小写十六进制（/[a-f0-9]{64}/），禁止编造、截断或加长；用 node -e "crypto.createHash(\'sha256\').update(fs.readFileSync(path)).digest(\'hex\')" 计算。',
     'artifact 中的项目 fingerprint 必须来自 workflow_context.projectFingerprintBeforeStep，或实际运行 workflow_context.fingerprintCommand 后读取其 fingerprint；禁止用 Git commit hash、自行拼接或凭空生成。修改项目文件后必须重新运行该命令。',

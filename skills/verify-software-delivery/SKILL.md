@@ -5,6 +5,9 @@ description: "在代码或配置准备交付时，发现并运行适用的静态
 
 # 验证软件交付
 
+本 Skill 的 `scripts/` 属于编排框架，不是目标仓库代码。请运行
+`workflow_context.skillsRoot/verify-software-delivery/scripts/...`；没有该字段时使用本文件所在目录。
+
 ## 必需输入
 
 - 读取交付契约、变更方案、实现 manifest 和相同的项目 fingerprint。
@@ -20,9 +23,8 @@ description: "在代码或配置准备交付时，发现并运行适用的静态
 3. 在 migration、truncate、drop 或 seed 前运行
    `scripts/preflight-test-resources.mjs <resource-policy.json>`。
    `resource-policy.json.sentinelEnv` 必须原样使用
-   `workflow_context.testResourceSafety.sentinelEnv`（当前固定为
-   `AGENT_OS_TEST_RESOURCE_SENTINEL`），不得临时发明其它 sentinel 变量名；上下文中
-   `sentinelAuthorized=false` 时先阻塞，不执行破坏性命令。
+   `workflow_context.testResourceSafety.sentinelEnv`，不得临时发明其它 sentinel
+   变量名；上下文中 `sentinelAuthorized=false` 时先阻塞，不执行破坏性命令。
 4. 使用 `scripts/run-quality-gates.mjs <gate-config.json>` 执行命令。
 5. 捕获每条命令的原始 argv、required/status、cwd、起止时间、退出码、耗时和脱敏日志；
    禁止把自然语言命令摘要登记为已执行命令。

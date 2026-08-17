@@ -10,9 +10,7 @@ if (!path) {
 }
 const chain = JSON.parse(await readFile(path, "utf8"));
 const errors = [];
-if (chain.schemaVersion !== "2.0"
-  || chain.generatedBy !== "agent-os-controller"
-  || chain.controllerOwned !== true) {
+if (chain.schemaVersion !== "2.0" || chain.controllerOwned !== true) {
   errors.push("evidence chain is not a controller-owned v2 manifest");
 }
 if (!chain.workflowId || !chain.generatedAt) errors.push("evidence chain lacks workflow provenance");

@@ -8,6 +8,7 @@ import {
   DELIVERY_SQUAD_STEPS,
   buildPipelineStepPrompt,
   missingBotIdsForSteps,
+  resolveSkillsRoot,
   type PipelineStep,
 } from '../core/pipeline.js';
 import {
@@ -1432,6 +1433,7 @@ async function priorOutputsForPrompt(
       workflowId: workflow.id,
       projectRoot: workflow.projectRoot,
       evidenceRoot: evidenceRootFor(workflow),
+      skillsRoot: resolveSkillsRoot(),
       qualityProtocolVersion: '2.0',
       gateAttemptStartedAt: workflow.updatedAt,
       canonicalRequirementIds: canonical

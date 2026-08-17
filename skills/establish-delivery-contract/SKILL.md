@@ -5,6 +5,9 @@ description: "在新项目、功能交付、迁移、恢复旧任务或存在多
 
 # 建立交付契约
 
+本 Skill 的 `scripts/` 属于编排框架，不是目标仓库代码。请运行
+`workflow_context.skillsRoot/establish-delivery-contract/scripts/...`；没有该字段时使用本文件所在目录。
+
 ## 必需输入
 
 - 获取目标项目绝对路径、用户目标、可读取的规格和项目级指令。

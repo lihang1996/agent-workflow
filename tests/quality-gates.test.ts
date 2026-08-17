@@ -20,6 +20,7 @@ import {
   consolidateLatestGateFindings,
   createGateRun,
   gateResultInstruction,
+  isControllerOwnedV2EvidenceChain,
   parseGateResult,
   parseCanonicalSpecWaivers,
   canonicalSpecHasRiskWaivers,
@@ -382,7 +383,7 @@ test('waiverId + 顶层 waivers[] 会补全 waived，且与审查 artifact 比�
     const chainPath = join(evidenceRoot, 'evidence-chain.json');
     const chainContent = JSON.stringify({
       schemaVersion: '2.0',
-      generatedBy: 'agent-os-controller',
+      generatedBy: 'host-orchestrator',
       controllerOwned: true,
     });
     await writeFile(chainPath, chainContent);
@@ -579,6 +580,25 @@ test('门禁提示示例与主 artifact 的 checks 所有权保持一致', () =>
     assert.equal(example.checks.length, 1, `${stepId} 示例必须保留真实门禁命令`);
     assert.match(instruction, /GATE_RESULT\.checks 必须保留真实/);
   }
+});
+
+test('门禁示例使用占位符，证据链只认 schema 与控制器所有权', () => {
+  for (const stepId of ['architect', 'dev', 'qa', 'review', 'runtime_audit', 'final_review'] as const) {
+    const instruction = gateResultInstruction(stepId);
+    assert.match(instruction, /占位符/);
+    assert.doesNotMatch(instruction, /2026-08-11/);
+    assert.doesNotMatch(instruction, /"pnpm","test"/);
+  }
+  assert.equal(isControllerOwnedV2EvidenceChain({
+    schemaVersion: '2.0',
+    generatedBy: 'host-orchestrator',
+    controllerOwned: true,
+  }), true);
+  assert.equal(isControllerOwnedV2EvidenceChain({
+    schemaVersion: '2.0',
+    generatedBy: 'agent-os-controller',
+    controllerOwned: false,
+  }), false);
 });
 
 test('答案完全缺少 GATE_RESULT 时可从证据目录主 artifact 恢复', async () => {

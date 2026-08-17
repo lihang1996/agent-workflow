@@ -38,6 +38,7 @@ test('七个 Skill 具有精简元数据、可发现界面和五类回归说明'
     assert.match(markdown, new RegExp('name: ' + name));
     assert.match(markdown, /description: /);
     assert.match(markdown, /## 回归验证/);
+    assert.match(markdown, /workflow_context\.skillsRoot/);
     for (const marker of ['真实失败', '通用案例', '不触发', '绕过案例', '修复案例']) {
       assert.match(markdown, new RegExp(marker));
     }
@@ -133,11 +134,30 @@ test('实现和 QA 脚本阻止越界改动、质量配置绕过与危险测试�
       {
         SKILL_TEST_DATABASE_URL: 'postgres://user:secret@localhost/project_test',
         SKILL_RUNTIME_DATABASE_URL: 'postgres://user:secret@localhost/project_dev',
+        AGENT_OS_EXPECTED_SENTINEL_ENV: 'AGENT_OS_TEST_RESOURCE_SENTINEL',
         AGENT_INVENTED_SENTINEL: 'true',
       },
     );
     assert.equal(inventedSentinel.status, 3);
     assert.match(inventedSentinel.stdout, /sentinelEnv must be AGENT_OS_TEST_RESOURCE_SENTINEL/);
+
+    await writeJson(resource, {
+      destructive: true,
+      connectionEnv: 'SKILL_TEST_DATABASE_URL',
+      runtimeConnectionEnvs: ['SKILL_RUNTIME_DATABASE_URL'],
+      sentinelEnv: 'HOST_ORCH_TEST_SENTINEL',
+    });
+    const hostOrchestratorSentinel = runScript(
+      'skills/verify-software-delivery/scripts/preflight-test-resources.mjs',
+      [resource],
+      {
+        SKILL_TEST_DATABASE_URL: 'postgres://user:secret@localhost/project_test',
+        SKILL_RUNTIME_DATABASE_URL: 'postgres://user:secret@localhost/project_dev',
+        AGENT_OS_EXPECTED_SENTINEL_ENV: 'HOST_ORCH_TEST_SENTINEL',
+        HOST_ORCH_TEST_SENTINEL: 'true',
+      },
+    );
+    assert.equal(hostOrchestratorSentinel.status, 0, hostOrchestratorSentinel.stdout);
 
     await writeJson(resource, {
       destructive: true,
@@ -151,6 +171,7 @@ test('实现和 QA 脚本阻止越界改动、质量配置绕过与危险测试�
       {
         SKILL_TEST_DATABASE_URL: 'postgres://user:secret@localhost/project_test',
         SKILL_RUNTIME_DATABASE_URL: 'postgres://user:secret@localhost/project_dev',
+        AGENT_OS_EXPECTED_SENTINEL_ENV: 'AGENT_OS_TEST_RESOURCE_SENTINEL',
         AGENT_OS_TEST_RESOURCE_SENTINEL: 'true',
       },
     );
@@ -584,7 +605,7 @@ test('运行时与终审脚本拒绝状态缺口、旧快照和文本式批准',
     }, 'runtime-report');
     const requiredGateIds = ['design', 'implementation', 'change-review', 'verification', 'runtime-audit'];
     await writeJson(chain, {
-      schemaVersion: '2.0', generatedBy: 'agent-os-controller', controllerOwned: true,
+      schemaVersion: '2.0', generatedBy: 'host-orchestrator', controllerOwned: true,
       workflowId: 'workflow-1', generatedAt: new Date().toISOString(),
       requiredGateIds,
       gateRuns: requiredGateIds.map((gateId) => ({

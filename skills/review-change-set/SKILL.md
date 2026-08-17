@@ -5,6 +5,9 @@ description: "在功能、修复、重构或迁移完成实现后、进入 QA �
 
 # 审查实现变更集
 
+本 Skill 的 `scripts/` 属于编排框架，不是目标仓库代码。请运行
+`workflow_context.skillsRoot/review-change-set/scripts/...`；没有该字段时使用本文件所在目录。
+
 ## 必需输入
 
 - 读取 canonical 契约、批准方案、最新 implementation manifest 和项目指令。

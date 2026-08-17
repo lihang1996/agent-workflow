@@ -8,6 +8,7 @@ import {
   DEFAULT_PIPELINE_STEPS,
   DELIVERY_SQUAD_STEPS,
   parsePipelineSteps,
+  resolveSkillsRoot,
 } from '../src/core/pipeline.js';
 import { JsonQuestionnaireStore, extractQuestionnaireIdsFromText, questionnaireMatchesContext } from '../src/core/questionnaire-store.js';
 import { JsonApprovalStore } from '../src/core/approval-store.js';
@@ -698,6 +699,19 @@ test('普通白名单不能代替负责人批准含风险接受条款的 Spec', 
     if (previousAllowed === undefined) delete process.env.AGENT_OS_ALLOWED_OPEN_IDS;
     else process.env.AGENT_OS_ALLOWED_OPEN_IDS = previousAllowed;
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('Skill 根目录可配置且默认指向仓库 skills/', () => {
+  const previous = process.env.AGENT_OS_SKILLS_DIR;
+  try {
+    delete process.env.AGENT_OS_SKILLS_DIR;
+    assert.match(resolveSkillsRoot().replace(/\\/g, '/'), /\/skills\/?$/);
+    process.env.AGENT_OS_SKILLS_DIR = '/tmp/custom-skills';
+    assert.equal(resolveSkillsRoot(), '/tmp/custom-skills');
+  } finally {
+    if (previous === undefined) delete process.env.AGENT_OS_SKILLS_DIR;
+    else process.env.AGENT_OS_SKILLS_DIR = previous;
   }
 });
 

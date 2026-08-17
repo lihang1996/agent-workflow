@@ -171,12 +171,15 @@ function evidenceOwnershipInstruction(step: PipelineStep): string {
   ].join('\n');
 }
 
-function skillPath(skillName: string): string {
+export function resolveSkillsRoot(): string {
   const configuredRoot = process.env.AGENT_OS_SKILLS_DIR?.trim();
-  const root = configuredRoot
+  return configuredRoot
     ? resolve(configuredRoot)
     : fileURLToPath(new URL('../../skills/', import.meta.url));
-  return resolve(root, skillName, 'SKILL.md');
+}
+
+function skillPath(skillName: string): string {
+  return resolve(resolveSkillsRoot(), skillName, 'SKILL.md');
 }
 
 function gatedTail(step: PipelineStep): string[] {
