@@ -1,48 +1,6 @@
 {
-  "_comment": "此文件仍被读取以获取 Bot 凭证和 workspace，但不再支持 defaultCli 字段。各角色引擎统一由 .env 的 DEFAULT_CLI 与话题 /engine 决定。",
-  "bots": [
-    {
-      "id": "ceo",
-      "appIdEnv": "BOT_CEO_APP_ID",
-      "appSecretEnv": "BOT_CEO_APP_SECRET",
-      "workspace": "example-project",
-      "systemPrompt": "你是 CEO 助手，负责任务分派与总体协调。"
-    },
-    {
-      "id": "developer",
-      "appIdEnv": "BOT_DEV_APP_ID",
-      "appSecretEnv": "BOT_DEV_APP_SECRET",
-      "workspace": "example-project",
-      "systemPrompt": "你是开发工程师，负责理解需求并完成实现。",
-      "reviewBy": "reviewer"
-    },
-    {
-      "id": "qa",
-      "appIdEnv": "BOT_QA_APP_ID",
-      "appSecretEnv": "BOT_QA_APP_SECRET",
-      "workspace": "example-project",
-      "systemPrompt": "你是测试工程师，负责冒烟、验收与风险说明。"
-    },
-    {
-      "id": "pm",
-      "appIdEnv": "BOT_PM_APP_ID",
-      "appSecretEnv": "BOT_PM_APP_SECRET",
-      "workspace": "example-project",
-      "systemPrompt": "你是产品经理，负责澄清需求并输出可执行 Spec。"
-    },
-    {
-      "id": "architect",
-      "appIdEnv": "BOT_ARCH_APP_ID",
-      "appSecretEnv": "BOT_ARCH_APP_SECRET",
-      "workspace": "example-project",
-      "systemPrompt": "你是架构师，负责技术方案与风险设计。"
-    },
-    {
-      "id": "reviewer",
-      "appIdEnv": "BOT_REVIEWER_APP_ID",
-      "appSecretEnv": "BOT_REVIEWER_APP_SECRET",
-      "workspace": "example-project",
-      "systemPrompt": "你是代码评审，负责检查实现、发现风险并给出修改建议。"
-    }
-  ]
+  "_read_by_runtime": false,
+  "_comment": "此文件不被 TypeScript、pnpm start 或任何运行时读取。不要把 id/workspace/systemPrompt/reviewBy/defaultCli 当成有效配置。",
+  "_source_of_truth": "Bot 凭证、显示名和工作目录只来自 .env 的 BOT_*（src/core/bot-config.ts）。角色约束来自 buildPipelineStepPrompt 与 skills/。对照表见 README。",
+  "_optional_independent_bots": "运行时审计与最终审查可另配 BOT_RUNTIME_AUDITOR_* / BOT_FINAL_REVIEWER_*；未配置时回退 QA/Reviewer，流水线不阻断，但 CLI 会话按逻辑角色隔离。pm_accept 是另开的产品 UAT 需求，当前代码不实现、不插入流水线。"
 }

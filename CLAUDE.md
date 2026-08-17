@@ -11,6 +11,7 @@ pnpm dev（tsx watch）/ pnpm start / pnpm build / pnpm test
 
 - ESM only，Node 22+，pnpm
 - 凭证只放 .env（已 gitignore），绝不硬编码、绝不提交
+- `config/bots.json` 不被 TypeScript/运行时读取；Bot 只认 `.env` 的 `BOT_*`。不要把其中的 `developer` / `systemPrompt` / `reviewBy` 当配置源。独立 `BOT_RUNTIME_AUDITOR_*` / `BOT_FINAL_REVIEWER_*` 可选，缺了不阻断流水线。`pm_accept` 是另开需求，不要插入 `PIPELINE_STEPS`。
 
 ## 错题本
 

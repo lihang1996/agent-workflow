@@ -139,16 +139,18 @@ pnpm probe:cli  # 手工查看 CLI 的 JSON 流事件
 
 按角色配置以下环境变量（缺少凭证的角色会被跳过）：
 
-| 角色 | 环境变量前缀 | 默认显示名 |
-| --- | --- | --- |
-| CEO | `BOT_CEO` | CEO助手 |
-| PM | `BOT_PM` | 产品经理 |
-| 架构师 | `BOT_ARCH` | 架构师 |
-| 开发 | `BOT_DEV` | 开发工程师 |
-| QA | `BOT_QA` | 测试工程师 |
-| 评审 | `BOT_REVIEWER` | 代码评审 |
+| 角色 | 环境变量前缀 | 默认显示名 | 是否必需 |
+| --- | --- | --- | --- |
+| CEO | `BOT_CEO` | CEO助手 | 团队流水线必需 |
+| PM | `BOT_PM` | 产品经理 | 团队流水线必需 |
+| 架构师 | `BOT_ARCH` | 架构师 | 必需 |
+| 开发 | `BOT_DEV` | 开发工程师 | 必需 |
+| QA | `BOT_QA` | 测试工程师 | 必需 |
+| 评审 | `BOT_REVIEWER` | 代码评审 | 必需 |
+| 运行时审计 | `BOT_RUNTIME_AUDITOR` | 运行时审计 | 可选；未配置回退 QA |
+| 最终审查 | `BOT_FINAL_REVIEWER` | 最终审查 | 可选；未配置回退评审 |
 
-每个前缀至少需要 `<PREFIX>_APP_ID` 和 `<PREFIX>_APP_SECRET`，还可设置 `<PREFIX>_NAME`、`<PREFIX>_WORKDIR`。开发 Bot 兼容旧变量 `BOT_A_APP_ID` / `BOT_A_APP_SECRET`。
+每个前缀至少需要 `<PREFIX>_APP_ID` 和 `<PREFIX>_APP_SECRET`，还可设置 `<PREFIX>_NAME`、`<PREFIX>_WORKDIR`。开发 Bot 兼容旧变量 `BOT_A_APP_ID` / `BOT_A_APP_SECRET`。`config/bots.json` 不被运行时读取，其中的 `id` / `systemPrompt` / `workspace` / `reviewBy` 都无效。
 
 ### 用户身份与权限
 
@@ -242,15 +244,30 @@ CEO 统一入口 → MCP 结构化问题 → /form 点选澄清
 - 普通 Spec 的确认卡可选择直接开始技术交付，或发布到飞书云文档继续产品评审；两条路径都会先固化同一份 canonical Spec，再执行架构、开发、代码评审、QA、运行时审计和最终审查。含 `[RISK_WAIVER]` 的 Spec 不显示直接开始入口，必须发布完整云文档并由当前 `OWNER_*` 身份（未配置时为需求发起人）批准，避免在被截断的卡片预览中接受未读风险。也可用 `/squad` 单独启动内部交付小队。
 - 飞书应用需具备 Docx 创建/读取/编辑、Drive 文件评论读取/写入权限。建议在事件订阅中添加 `drive.notice.comment_add_v1`；即使事件暂未配置，服务也会定时补偿拉取评审评论。
 
+## 角色 / 步骤 / 门禁 / Skill
+
+真实约束来自 `buildPipelineStepPrompt` 与 `skills/`，不是 `config/bots.json`。未配置独立审计/终审 Bot 时流水线不阻断，但 CLI 会话按逻辑角色切开。`pm_accept` 是另开的产品 UAT 需求，当前不实现、不插入固定链。
+
+| 步骤 | 逻辑角色 | 默认飞书 Bot | 可选独立 Bot | Gate | 主 artifact | Skill | 未审批时写权限 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `pm` | `pm` | `BOT_PM` | — | 无（Spec 校验） | canonical Spec | `establish-delivery-contract` | `standard` |
+| `architect` | `architect` | `BOT_ARCH` | — | `design` | `change-plan.json` | `design-risk-aware-change` | `evidence-write` |
+| `dev` | `dev` | `BOT_DEV` | — | `implementation` | `implementation-manifest.json` | `implement-traceable-change` | `standard` |
+| `review` | `reviewer` | `BOT_REVIEWER` | — | `change-review` | `change-review.json` | `review-change-set` | `evidence-write`（回传开发仍 `standard`） |
+| `qa` | `qa` | `BOT_QA` | — | `verification` | `verification-report.json` | `verify-software-delivery` | `evidence-write` |
+| `runtime_audit` | `runtime_auditor` | `BOT_QA` | `BOT_RUNTIME_AUDITOR` | `runtime-audit` | `runtime-audit.json` | `audit-runtime-boundaries` | `evidence-write` |
+| `final_review` | `final_reviewer` | `BOT_REVIEWER` | `BOT_FINAL_REVIEWER` | `final-review` | `final-review.json` | `review-final-delivery` | `evidence-write` |
+| `summary` | `ceo` | `BOT_CEO` | — | 无 | 汇总文本 | `coordinate-delivery-summary` | `evidence-write` |
+
 ## 会话与协作模型
 
-- 会话键由 `chatId + topicId + botId` 组成，因此同一话题中的不同角色拥有各自的上下文。
+- 会话键由 `chatId + topicId + botId[::logicalRole]` 组成；同一飞书 Bot 扮演 QA 与运行时审计、评审与终审时，CLI 上下文仍然隔离。
 - `topicId` 优先使用飞书 `threadId`，其次是 `rootId`，最后回退到消息 ID。
 - `/workdir` 绑定的是话题目录，同一话题下的 Bot 共享该目录。
 - `/engine` 绑定的是话题统一引擎；现有角色会批量对齐，尚未创建的 PM、架构、开发、评审和测试会在首次运行时继承。`DEFAULT_CLI` 变更时，启动会把空闲话题/会话一次性对齐到新默认；之后用 `/engine` 选定的引擎会保留。
 - 切换或清除话题目录、切换引擎、`/reset` 和 `/reopen` 都会清理对应 CLI 上下文，避免跨目录或跨引擎恢复错误会话。
 - 运行中任务不能重复执行、切换引擎或切换目录；可用 `/close` 取消任务。
-- `/pipeline` 固定步骤：PM → 架构 → 开发 → 评审协作 → 测试 → 运行时审计 → 最终审查 → CEO 汇总。`PIPELINE_STEPS` 只能声明完整顺序；未连接角色会阻断。业务验收发生在人确认 Spec；本流水线在实现后不做第二次 PM UAT。若需要，后续可加只读步骤 `pm_accept`。
+- `/pipeline` 固定步骤：PM → 架构 → 开发 → 评审协作 → 测试 → 运行时审计 → 最终审查 → CEO 汇总。`PIPELINE_STEPS` 只能声明完整顺序；未连接的必需角色会阻断，可选的独立审计/终审 Bot 缺失不阻断。业务验收发生在人确认 Spec；实现后不做第二次 PM UAT。`pm_accept` 若要做，应另开产品需求，不要塞进当前固定链。
 - 同一项目根目录同一时间只允许一条已进入技术阶段的门禁工作流；确认 Spec、切换 canonical 与取得项目租约在同一临界区完成，避免不同飞书话题并发改代码或互相覆盖证据。
 - 新交付工作流必须绑定真实项目目录。PM Spec 中每项需求须以稳定 ID 开头（例如 `### RQ-001 登录`）；所有设计、实现、评审、QA、运行时和终审 artifact 必须精确覆盖同一组 ID。
 - 流水线写权限按步骤划分，不是整步 `read-only`：PM/开发用 `standard`（可改产品代码）；架构、评审、QA、运行时审计、终审、汇总用 `evidence-write`（只写 `.agent-os/evidence/<workflowId>/`）。工作流 `executionPolicy` 仍只表示高风险审批（`standard|approved`）；整单已审批时各步都走 `approved`。评审协作里开发回传必须继续用 `standard/approved`，不能继承质检的 evidence-write。Claude 对 evidence-write 只预授权 `Write/Edit(.agent-os/evidence/**)` 与当前证据目录；Codex 用 `workspace-write` 而不是 `:danger-full-access`。Cursor 无头 `--force` 做不到路径级写权限，需要本机网络时还会关掉 sandbox，生产质检优先 Claude。独立 `/review` 仍是 `read-only`。

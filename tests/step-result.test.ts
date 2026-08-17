@@ -40,13 +40,16 @@ test('流水线可区分兼容性默认 done 与真实显式终态', () => {
   assert.equal(hasExplicitStepResult('完成\n[RESULT:done]'), true);
 });
 
-test('extractAbsolutePathCandidates 能抽出目标路径', () => {
+test('extractAbsolutePathCandidates 能抽出 Unix、容器挂载和 Windows 路径', () => {
   const paths = extractAbsolutePathCandidates(
-    '请在 /Users/leon/Desktop/leon-blog 生成代码，不要改 /Users/leon/Desktop/dom/aiDemo/agent-os',
+    '请在 /Users/leon/Desktop/leon-blog 生成代码，不要改 /Users/leon/Desktop/dom/aiDemo/agent-os；也可看 /mnt/data/app 或 C:\\Users\\leon\\work 与 D:/src/proj',
   );
   assert.deepEqual(paths, [
     '/Users/leon/Desktop/leon-blog',
     '/Users/leon/Desktop/dom/aiDemo/agent-os',
+    '/mnt/data/app',
+    'C:\\Users\\leon\\work',
+    'D:/src/proj',
   ]);
 });
 

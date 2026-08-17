@@ -353,21 +353,28 @@ export function shouldTreatFailedResultAsDone(stepId: string): boolean {
   return stepId === 'summary';
 }
 
+const ABSOLUTE_PATH_CANDIDATE_PATTERNS = [
+  /(?:^|[\s`'"(=])(\/(?:Users|home|opt|var|tmp|Volumes|mnt|root)\/[^\s`'":\n；，。、]+)/g,
+  /(?:^|[\s`'"(=])([A-Za-z]:[\\/][^\s`'":\n；，。、]+)/g,
+];
+
 /**
- * 从文本中提取疑似绝对路径（仅用于阻塞卡展示候选目录，仍需用户显式确认）。
- * 只收集常见 Unix 绝对路径形态，不做存在性校验。
+ * 从文本中提取疑似绝对路径。
+ * 仅用于阻塞卡 UI 展示候选目录，仍需用户显式 `/workdir` 确认。
+ * 不作路径授权，也不证明目录可绑定。
  */
 export function extractAbsolutePathCandidates(text: string): string[] {
-  const matches = text.matchAll(/(?:^|[\s`'"(=])(\/(?:Users|home|opt|var|tmp|Volumes)\/[^\s`'":\n]+)/g);
   const seen = new Set<string>();
   const paths: string[] = [];
-  for (const match of matches) {
-    let path = match[1]?.replace(/[.,;]+$/, '') ?? '';
-    // 去掉尾部中文或说明性后缀前的路径截断：保留到最后一个有意义的路径段
-    path = path.replace(/\/+$/, '');
-    if (!path || seen.has(path)) continue;
-    seen.add(path);
-    paths.push(path);
+  for (const pattern of ABSOLUTE_PATH_CANDIDATE_PATTERNS) {
+    pattern.lastIndex = 0;
+    for (const match of text.matchAll(pattern)) {
+      let path = match[1]?.replace(/[.,;]+$/, '') ?? '';
+      path = path.replace(/[\\/]+$/, '');
+      if (!path || seen.has(path)) continue;
+      seen.add(path);
+      paths.push(path);
+    }
   }
   return paths;
 }
