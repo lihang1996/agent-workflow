@@ -11,6 +11,13 @@ const STANDARD_POLICY = [
   '如果任务确实需要这些操作，立即停止并明确提示用户通过 /approval 重新发起，不能自行绕过。',
 ].join('\n');
 
+const EVIDENCE_WRITE_POLICY = [
+  '[Agent OS 执行边界：证据写入]',
+  '本步禁止修改产品代码、测试、质量阈值或上游 artifact。',
+  '只允许写入 evidenceRoot 下本步主 artifact 与校验产生的临时文件。',
+  'Cursor 无头做不到路径级写权限，必须遵守本边界；生产质检隔离优先 Claude。',
+].join('\n');
+
 const READ_ONLY_POLICY = [
   '[Agent OS 执行边界：只读任务]',
   '本任务只能分析已有输入与文件，不能修改文件、运行会改变状态的命令，也不能调用有副作用的外部工具。',
@@ -34,6 +41,7 @@ export function instructionsForExecutionPolicy(
 ): string {
   let boundary: string;
   if (policy === 'standard') boundary = STANDARD_POLICY;
+  else if (policy === 'evidence-write') boundary = EVIDENCE_WRITE_POLICY;
   else if (policy === 'read-only') boundary = READ_ONLY_POLICY;
   else if (policy === 'input-only') boundary = INPUT_ONLY_POLICY;
   else {
@@ -64,6 +72,7 @@ export function promptForExecutionPolicy(
  */
 export function codexSandboxFor(policy: CliExecutionPolicy): CodexSandbox {
   if (policy === 'read-only' || policy === 'input-only') return 'read-only';
+  if (policy === 'evidence-write') return 'workspace-write';
   if (policy === 'approved') {
     const configured = process.env.CODEX_APPROVED_SANDBOX?.trim();
     if (!configured) return 'danger-full-access';
@@ -174,6 +183,9 @@ function resolveNetworkIntent(
   if (policy === 'read-only' || policy === 'input-only') {
     return { expected: 'none', reason: 'policy-forbids-network' };
   }
+  if (policy === 'evidence-write' && sandbox === 'workspace-write' && requested) {
+    return { expected: 'loopback', reason: 'loopback-config-applied' };
+  }
   if (sandbox === 'read-only') return { expected: 'none', reason: 'sandbox-read-only' };
 
   const configured = configuredValue?.trim().toLowerCase();
@@ -249,4 +261,19 @@ function localNetworkInstruction(expectation: CliCapabilityExpectation): string 
 
 function isCodexSandbox(value: string): value is CodexSandbox {
   return value === 'read-only' || value === 'workspace-write' || value === 'danger-full-access';
+}
+
+const PRODUCT_WRITE_STEP_IDS = new Set(['pm', 'dev']);
+
+/**
+ * 流水线步骤的 CLI 写权限。工作流 `executionPolicy` 仍只表示高风险审批（standard|approved）；
+ * 质检步骤在未获整单审批时改为 evidence-write，不能整步改成 read-only。
+ */
+export function cliPolicyForPipelineStep(
+  stepId: string,
+  workflowPolicy: 'standard' | 'approved' = 'standard',
+): CliExecutionPolicy {
+  if (workflowPolicy === 'approved') return 'approved';
+  if (PRODUCT_WRITE_STEP_IDS.has(stepId)) return 'standard';
+  return 'evidence-write';
 }

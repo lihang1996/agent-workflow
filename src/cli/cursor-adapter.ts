@@ -104,8 +104,9 @@ function cursorModelFlags(): string[] {
   return ['--model', DEFAULT_CURSOR_MODEL];
 }
 
-function cursorSandbox(policy: CliExecutionPolicy): 'enabled' | 'disabled' {
+function cursorSandbox(policy: CliExecutionPolicy, requestedNetwork = false): 'enabled' | 'disabled' {
   if (policy === 'read-only' || policy === 'input-only') return 'enabled';
+  if (policy === 'evidence-write' && !requestedNetwork) return 'enabled';
   const configured = process.env.CURSOR_SANDBOX?.trim().toLowerCase();
   if (configured === 'enabled' || configured === 'disabled') return configured;
   if (configured && !warnedSandbox) {
@@ -182,6 +183,14 @@ function cursorPolicySuffix(policy: CliExecutionPolicy): string {
       '本次为 --mode ask，只读分析；不得修改文件、运行有副作用的命令，也不得调用 MCP。',
     ].join('\n');
   }
+  if (policy === 'evidence-write') {
+    return [
+      '[Cursor 权限说明]',
+      '本次为证据写入。Cursor 无头 --force 做不到路径级写权限，不能在 OS 层禁止改 src/。',
+      '只允许写 evidenceRoot 下本步 artifact；禁止改产品代码、测试或质量阈值。',
+      '生产质检隔离优先 Claude。需要本机网络探测时可能关闭 sandbox，写隔离仍只靠本说明。',
+    ].join('\n');
+  }
   return [
     '[Cursor 权限说明]',
     '无头运行使用 --force，Cursor CLI 不会拦截高风险 Bash/MCP；这不是 Claude dontAsk，也没有 PreToolUse 闸门。',
@@ -192,7 +201,7 @@ function cursorPolicySuffix(policy: CliExecutionPolicy): string {
 
 function outputArgs(prompt: string, options: CliBuildOptions = {}): string[] {
   const policy = options.executionPolicy ?? 'standard';
-  const sandbox = cursorSandbox(policy);
+  const sandbox = cursorSandbox(policy, options.localNetworkAccess === true);
   const expectation = networkExpectation(policy, sandbox, options.localNetworkAccess === true);
   options.onCapabilityExpectation?.(expectation);
   const task = promptForExecutionPolicy(prompt, policy, options.approvedScope, expectation);

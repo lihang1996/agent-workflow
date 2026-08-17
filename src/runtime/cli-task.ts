@@ -47,6 +47,8 @@ export async function startCliTask(
     testResourceSentinelAuthorized?: boolean;
     executionPolicy?: CliExecutionPolicy;
     approvedScope?: string;
+    /** 质检步骤传给 Claude 路径级 allow；Cursor 无法按路径禁写。 */
+    evidenceRoot?: string;
     /** 是否解析 [RESULT:done|blocked|failed] 标记；仅流水线非 PM 步骤启用 */
     resultProtocol?: boolean;
     /** 是否在卡片/续发文本中隐藏 RESULT、GATE_RESULT、DSML 等机器协议。 */
@@ -81,6 +83,7 @@ export async function startCliTask(
     testResourceSentinelAuthorized = false,
     executionPolicy = 'standard',
     approvedScope,
+    evidenceRoot,
     resultProtocol = false,
     hideProtocolOutput = resultProtocol,
     validateSuccess,
@@ -321,6 +324,7 @@ export async function startCliTask(
     onEvent: onCliEvent,
     executionPolicy,
     approvedScope: executionPolicy === 'approved' ? (approvedScope ?? options.prompt) : undefined,
+    evidenceRoot,
     // 普通聊天继续无网络；只有有持久化恢复与资源安全协议的交付流水线可访问回环地址。
     localNetworkAccess: !!workflowId,
     env: {

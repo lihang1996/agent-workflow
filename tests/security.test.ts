@@ -31,6 +31,7 @@ import { CodexAdapter } from '../src/cli/codex-adapter.js';
 import { CursorAdapter } from '../src/cli/cursor-adapter.js';
 import { buildLocalNetworkCapabilityEnv } from '../src/cli/runner.js';
 import type { CliCapabilityExpectation } from '../src/cli/types.js';
+import { claudeAllowedToolsFor } from '../src/cli/permission-hook.js';
 import {
   AGENT_OS_ROOT,
   cursorRuntimeRoot,
@@ -784,6 +785,83 @@ test('CLI 按普通、只读和已审批任务使用不同权限边界', () => {
     else process.env.CODEX_APPROVED_SANDBOX = previousApprovedSandbox;
     if (previousLocalNetwork === undefined) delete process.env.CODEX_LOCAL_NETWORK_ACCESS;
     else process.env.CODEX_LOCAL_NETWORK_ACCESS = previousLocalNetwork;
+  }
+});
+
+test('质检 evidence-write：Claude 只放行证据目录，Codex 非全权限，Cursor 声明做不到路径隔离', () => {
+  const previousMcp = process.env.MCP_ENABLED;
+  const previousSandbox = process.env.CODEX_SANDBOX;
+  const previousCursorCli = process.env.CURSOR_CLI;
+  const previousCursorSandbox = process.env.CURSOR_SANDBOX;
+  const previousCursorModel = process.env.CURSOR_MODEL;
+  process.env.MCP_ENABLED = 'false';
+  delete process.env.CODEX_SANDBOX;
+  delete process.env.CURSOR_CLI;
+  delete process.env.CURSOR_SANDBOX;
+  delete process.env.CURSOR_MODEL;
+  try {
+    const evidenceRoot = '/tmp/agent-os-project/.agent-os/evidence/wf-1';
+    const allow = claudeAllowedToolsFor('evidence-write', evidenceRoot);
+    assert.equal(allow.includes('Write'), false);
+    assert.equal(allow.includes('Edit'), false);
+    assert.equal(allow.some((rule) => rule.includes('src/')), false);
+    assert.ok(allow.includes('Write(.agent-os/evidence/**)'));
+    assert.ok(allow.includes(`Write(${evidenceRoot}/**)`));
+    assert.ok(allow.includes(`Edit(${evidenceRoot}/**)`));
+
+    const claude = new ClaudeAdapter().buildArgs('写审查报告', {
+      executionPolicy: 'evidence-write',
+      evidenceRoot,
+    });
+    assert.equal(claude.includes('--dangerously-skip-permissions'), false);
+    assert.equal(claude[claude.indexOf('--permission-mode') + 1], 'dontAsk');
+    const settingsPath = claude[claude.indexOf('--settings') + 1];
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf8')) as {
+      permissions?: { allow?: string[] };
+    };
+    assert.equal(settings.permissions?.allow?.includes('Write'), false);
+    assert.equal(settings.permissions?.allow?.includes('Edit'), false);
+    assert.ok(settings.permissions?.allow?.includes('Write(.agent-os/evidence/**)'));
+    assert.ok(settings.permissions?.allow?.includes(`Write(${evidenceRoot}/**)`));
+    assert.match(claude[claude.indexOf('--append-system-prompt') + 1], /证据写入/);
+
+    const codex = new CodexAdapter().buildArgs('写审查报告', {
+      executionPolicy: 'evidence-write',
+      localNetworkAccess: true,
+    });
+    assert.equal(codex.includes('default_permissions=":danger-full-access"'), false);
+    assert.equal(codex.includes('--sandbox'), false);
+    assert.deepEqual(codex.slice(0, 2), ['--ask-for-approval', 'untrusted']);
+    assert.equal(codex.some((arg) => arg.includes('default_permissions="agent-os-workspace"')), true);
+    assert.match(codex.at(-1) ?? '', /证据写入/);
+
+    const cursor = new CursorAdapter().buildArgs('写审查报告', {
+      executionPolicy: 'evidence-write',
+    });
+    assert.equal(cursor.includes('--force'), true);
+    assert.equal(cursor.includes('--mode'), false);
+    assert.equal(cursor[cursor.indexOf('--sandbox') + 1], 'enabled');
+    assert.match(cursor.at(-1) ?? '', /做不到路径级写权限/);
+    assert.match(cursor.at(-1) ?? '', /生产质检隔离优先 Claude/);
+
+    const networkedCursor = new CursorAdapter().buildArgs('探测本机服务', {
+      executionPolicy: 'evidence-write',
+      localNetworkAccess: true,
+    });
+    assert.equal(networkedCursor.includes('--force'), true);
+    assert.equal(networkedCursor[networkedCursor.indexOf('--sandbox') + 1], 'disabled');
+    assert.match(networkedCursor.at(-1) ?? '', /写隔离仍只靠本说明/);
+  } finally {
+    if (previousMcp === undefined) delete process.env.MCP_ENABLED;
+    else process.env.MCP_ENABLED = previousMcp;
+    if (previousSandbox === undefined) delete process.env.CODEX_SANDBOX;
+    else process.env.CODEX_SANDBOX = previousSandbox;
+    if (previousCursorCli === undefined) delete process.env.CURSOR_CLI;
+    else process.env.CURSOR_CLI = previousCursorCli;
+    if (previousCursorSandbox === undefined) delete process.env.CURSOR_SANDBOX;
+    else process.env.CURSOR_SANDBOX = previousCursorSandbox;
+    if (previousCursorModel === undefined) delete process.env.CURSOR_MODEL;
+    else process.env.CURSOR_MODEL = previousCursorModel;
   }
 });
 

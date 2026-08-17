@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
@@ -5,6 +6,7 @@ import {
   BUNDLED_ASK_MCP_PERMISSION_RULES,
   tsxLoaderPath,
 } from '../mcp/config.js';
+import type { CliExecutionPolicy } from './types.js';
 
 let cachedClaudeSettingsPath: string | undefined;
 let cachedClaudeSettingsBody: string | undefined;
@@ -53,11 +55,57 @@ const STANDARD_ALLOWED_TOOLS = [
   'Bash(git stash *)',
 ];
 
+const EVIDENCE_WRITE_BASE_TOOLS = [
+  'Read',
+  'Glob',
+  'Grep',
+  ...BUNDLED_ASK_MCP_PERMISSION_RULES,
+  'Bash(pnpm *)',
+  'Bash(npm *)',
+  'Bash(npx *)',
+  'Bash(node *)',
+  'Bash(tsc *)',
+  'Bash(ls *)',
+  'Bash(pwd)',
+  'Bash(which *)',
+  'Bash(cat *)',
+  'Bash(head *)',
+  'Bash(tail *)',
+  'Bash(git status *)',
+  'Bash(git diff *)',
+  'Bash(git log *)',
+];
+
+export function claudeAllowedToolsFor(
+  policy: CliExecutionPolicy,
+  evidenceRoot?: string,
+): string[] {
+  if (policy !== 'evidence-write') return STANDARD_ALLOWED_TOOLS;
+  const roots = new Set<string>(['.agent-os/evidence/**']);
+  if (evidenceRoot?.trim()) {
+    const normalized = evidenceRoot.replaceAll('\\', '/').replace(/\/+$/, '');
+    roots.add(`${normalized}/**`);
+  }
+  return [
+    ...EVIDENCE_WRITE_BASE_TOOLS,
+    ...[...roots].flatMap((root) => [`Write(${root})`, `Edit(${root})`]),
+  ];
+}
+
+function claudeSettingsFileName(policy: CliExecutionPolicy, evidenceRoot?: string): string {
+  if (policy !== 'evidence-write') return 'runtime-claude-settings-standard.json';
+  const digest = createHash('sha256').update(evidenceRoot?.trim() ?? '').digest('hex').slice(0, 16);
+  return `runtime-claude-settings-evidence-write-${digest}.json`;
+}
+
 /** 为 Claude Code 注入 Agent OS 自有 PreToolUse 审批闸门。 */
-export function ensureClaudePermissionSettingsFile(): string {
+export function ensureClaudePermissionSettingsFile(
+  policy: CliExecutionPolicy = 'standard',
+  evidenceRoot?: string,
+): string {
   const dir = join(AGENT_OS_ROOT, 'data', 'approval');
   mkdirSync(dir, { recursive: true });
-  const path = join(dir, 'runtime-claude-settings.json');
+  const path = join(dir, claudeSettingsFileName(policy, evidenceRoot));
   const command = [
     shellQuote(process.execPath),
     '--import',
@@ -66,7 +114,7 @@ export function ensureClaudePermissionSettingsFile(): string {
   ].join(' ');
   const settings = {
     permissions: {
-      allow: STANDARD_ALLOWED_TOOLS,
+      allow: claudeAllowedToolsFor(policy, evidenceRoot),
     },
     hooks: {
       PreToolUse: [{

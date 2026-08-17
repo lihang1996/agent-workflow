@@ -76,6 +76,7 @@ import { runCollabReview } from './collab-runner.js';
 import { startCliTask } from './cli-task.js';
 import { ensureRunnableSession, topicIdOf, truncate } from './sessions.js';
 import { finishApprovalExecution } from './approval-status.js';
+import { cliPolicyForPipelineStep } from '../cli/execution-policy.js';
 
 interface ApprovedWorkflowLaunch {
   executionPolicy?: DeliveryWorkflow['executionPolicy'];
@@ -391,7 +392,9 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
         msg,
         task: buildPipelineStepPrompt(step, workflow.goal, promptOutputs),
         round: 1,
-        executionPolicy: workflow.executionPolicy,
+        executionPolicy: cliPolicyForPipelineStep(step.id, workflow.executionPolicy),
+        fixExecutionPolicy: workflow.executionPolicy === 'approved' ? 'approved' : 'standard',
+        evidenceRoot: optionalEvidenceRoot(workflow),
         approvedScope: workflow.executionPolicy === 'approved' ? workflow.goal : undefined,
         resultProtocol: workflow.qualityPolicy === 'gated',
         stateKey: `workflow:${workflow.id}`,
@@ -572,7 +575,8 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
         isTestResourceSentinelAuthorized()
         || workflow.priorOutputs.test_resource_authorized === 'true'
       ),
-      executionPolicy: workflow.executionPolicy,
+      executionPolicy: cliPolicyForPipelineStep(step.id, workflow.executionPolicy),
+      evidenceRoot: optionalEvidenceRoot(workflow),
       approvedScope: workflow.executionPolicy === 'approved' ? workflow.goal : undefined,
       // PM 步骤产出 Spec 正文，不解析 RESULT 标记
       resultProtocol: step.id !== 'pm',
@@ -1489,6 +1493,11 @@ function stepStartFingerprintFromPrompt(outputs: Record<string, string>): string
 function evidenceRootFor(workflow: DeliveryWorkflow): string {
   if (!workflow.projectRoot) throw new Error('门禁工作流缺少项目根目录');
   return resolve(workflow.projectRoot, '.agent-os', 'evidence', workflow.id);
+}
+
+/** PM 尚未绑定目录时不要 throw；质检步骤有 projectRoot 才会注入 Claude 路径级写入。 */
+function optionalEvidenceRoot(workflow: DeliveryWorkflow): string | undefined {
+  return workflow.projectRoot ? evidenceRootFor(workflow) : undefined;
 }
 
 async function writeControllerEvidenceChain(ctx: AppContext, workflow: DeliveryWorkflow): Promise<string> {

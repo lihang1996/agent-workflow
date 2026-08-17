@@ -51,6 +51,7 @@ export interface RunCliOptions {
   env?: NodeJS.ProcessEnv;
   executionPolicy?: CliExecutionPolicy;
   approvedScope?: string;
+  evidenceRoot?: string;
   localNetworkAccess?: boolean;
 }
 
@@ -146,6 +147,7 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
     env,
     executionPolicy = 'standard',
     approvedScope,
+    evidenceRoot,
     localNetworkAccess = false,
   } = options;
   const timeoutMs = resolveCliTimeoutMs(options.timeoutMs);
@@ -156,6 +158,7 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
   const buildOptions = {
     executionPolicy,
     approvedScope,
+    evidenceRoot,
     localNetworkAccess,
     mcpContextEnv: pickAskMcpContextEnv(env),
     onCapabilityExpectation(expectation: CliCapabilityExpectation) {

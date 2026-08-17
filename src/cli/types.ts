@@ -1,6 +1,6 @@
 export const CLI_IDS = ['claude', 'codex', 'cursor'] as const;
 export type CliId = (typeof CLI_IDS)[number];
-export type CliExecutionPolicy = 'standard' | 'read-only' | 'input-only' | 'approved';
+export type CliExecutionPolicy = 'standard' | 'read-only' | 'input-only' | 'approved' | 'evidence-write';
 
 /**
  * 适配器在构建命令行时给出的能力预期。
@@ -17,6 +17,8 @@ export interface CliCapabilityExpectation {
 export interface CliBuildOptions {
   executionPolicy?: CliExecutionPolicy;
   approvedScope?: string;
+  /** 质检步骤只允许写入该证据目录；Claude 用路径级 allow，Cursor 做不到。 */
+  evidenceRoot?: string;
   /** 仅持久化交付流水线请求本机回环网络，用于项目服务、浏览器和测试库。 */
   localNetworkAccess?: boolean;
   /** 接收本次参数构建实际采用的能力预期，供 runner 记录日志并传递给子进程。 */

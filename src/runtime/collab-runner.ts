@@ -23,8 +23,15 @@ export async function runCollabReview(
     task: string;
     round: number;
     priorDevResult?: string;
-    /** 独立 /review 必须传 read-only；默认 standard 仅给流水线评审（需要写证据）。 */
+    /** 独立 /review 必须传 read-only；流水线评审用 evidence-write。 */
     executionPolicy?: CliExecutionPolicy;
+    /**
+     * 评审未通过后的开发回传策略。缺省时：evidence-write 回退 standard，避免质检权限落到开发。
+     * 流水线应显式传入 workflow 的 standard/approved。
+     */
+    fixExecutionPolicy?: CliExecutionPolicy;
+    /** 仅评审 CLI 使用；开发回传不走路径级写入限制。 */
+    evidenceRoot?: string;
     approvedScope?: string;
     /** 独立审查为 false，避免在完整交付门禁外自动修改代码。 */
     allowFixes?: boolean;
@@ -57,6 +64,8 @@ export async function runCollabReview(
     round,
     priorDevResult,
     executionPolicy = 'standard',
+    fixExecutionPolicy,
+    evidenceRoot,
     approvedScope,
     allowFixes = true,
     resultProtocol = false,
@@ -71,6 +80,8 @@ export async function runCollabReview(
     onBlocked,
     onFailure,
   } = options;
+  const resolvedFixPolicy = fixExecutionPolicy
+    ?? (executionPolicy === 'evidence-write' ? 'standard' : executionPolicy);
   const hasThread = !!msg.threadId || !!msg.rootId;
   const reviewer = ctx.botsById.get('reviewer');
   const dev = ctx.botsById.get('dev');
@@ -122,6 +133,7 @@ export async function runCollabReview(
       prompt: reviewPrompt,
       workflowId,
       executionPolicy,
+      evidenceRoot,
       approvedScope,
       resultProtocol,
       hideProtocolOutput: true,
@@ -210,7 +222,7 @@ export async function runCollabReview(
             session: devSession,
             prompt: buildFixFromReviewPrompt(reviewer, reviewAnswer, round, resolvedFixInstruction),
             workflowId,
-            executionPolicy,
+            executionPolicy: resolvedFixPolicy,
             approvedScope,
             resultProtocol,
             hideProtocolOutput: true,
@@ -261,6 +273,8 @@ export async function runCollabReview(
                   round: nextRound,
                   priorDevResult: devAnswer,
                   executionPolicy,
+                  fixExecutionPolicy: resolvedFixPolicy,
+                  evidenceRoot,
                   approvedScope,
                   allowFixes,
                   resultProtocol,

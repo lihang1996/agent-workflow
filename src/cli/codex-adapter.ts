@@ -317,5 +317,5 @@ function mcpFlagsFor(policy: CliExecutionPolicy, contextEnv?: Record<string, str
 function codexApprovalPolicyFor(policy: CliExecutionPolicy): 'untrusted' | 'never' {
   // 普通任务遇到 Codex 判定为不可信的命令时必须失败并回到飞书审批门；
   // 已审批任务由持久化审批记录限定范围，其它只读策略依赖沙箱直接拒绝写入。
-  return policy === 'standard' ? 'untrusted' : 'never';
+  return policy === 'standard' || policy === 'evidence-write' ? 'untrusted' : 'never';
 }
