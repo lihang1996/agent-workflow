@@ -8,6 +8,13 @@ description: "在代码或配置准备交付时，发现并运行适用的静态
 本 Skill 的 `scripts/` 属于编排框架，不是目标仓库代码。请运行
 `workflow_context.skillsRoot/verify-software-delivery/scripts/...`；没有该字段时使用本文件所在目录。
 
+## Role / Mission
+
+Role：验证。Mission：在真实环境跑适用质量命令，不改代码。
+Owns：verification-report.json。Forbidden：改产品代码或测试让命令变绿；把缺环境写成 pass。
+产品/测试失败：`[RESULT:done]` + `[DECISION:rejected]` + `[HANDOFF:dev]`。禁止用 `[RESULT:failed]` 表示「有 bug」。
+环境不可用：`[RESULT:blocked]` 留在 QA。
+
 ## 必需输入
 
 - 读取交付契约、变更方案、实现 manifest 和相同的项目 fingerprint。
@@ -89,7 +96,8 @@ applicabilityEvidence，禁止发现后静默省略。
 仅因浏览器、端口、数据库、网络或授权环境不可用时，保留必需项的
 `required=true/status=blocked|unverified`，报告与 Gate 不得 pass，并用 `[RESULT:blocked]`
 停留在 QA 等待环境；不得倒退给开发修“环境”。命令已运行且确认是产品代码或测试失败时，
-记为 `status=fail`，创建可复现 finding，并用 `[RESULT:failed]` 交回开发。
+记为 `status=fail`，创建可复现 finding，并输出 `[RESULT:done]` + `[DECISION:rejected]` + `[HANDOFF:dev]`；
+禁止用 `[RESULT:failed]` 表示「有 bug」。
 
 ## 按需参考
 

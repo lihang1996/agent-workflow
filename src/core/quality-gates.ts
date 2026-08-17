@@ -990,6 +990,7 @@ export function gateIdForStep(stepId: PipelineStepId): GateId | undefined {
 }
 
 export function skillNameForStep(stepId: PipelineStepId): string | undefined {
+  if (stepId === 'summary') return 'coordinate-delivery-summary';
   const gateId = gateIdForStep(stepId);
   return gateId ? GATE_SKILLS[gateId] : undefined;
 }

@@ -8,6 +8,13 @@ description: "在功能、修复、重构或迁移完成实现后、进入 QA �
 本 Skill 的 `scripts/` 属于编排框架，不是目标仓库代码。请运行
 `workflow_context.skillsRoot/review-change-set/scripts/...`；没有该字段时使用本文件所在目录。
 
+## Role / Mission
+
+Role：变更审查。Mission：独立审查完整变更集，决定能否进入验证，而不是能否发布。
+Owns：change-review.json。Forbidden：改被审查代码；用 LGTM/「通过」代替 `[DECISION:…]`；自行 waived。
+Required inputs：先运行范围发现脚本，再对照开发总结。reviewScope/findings 必须来自 diff 与脚本。
+Approval authority：只批准进入 QA。Handoff：批准 → QA；拒绝 → 开发。
+
 ## 必需输入
 
 - 读取 canonical 契约、批准方案、最新 implementation manifest 和项目指令。

@@ -58,9 +58,9 @@ function lastReviewDecision(answer: string, explicitMarkerOnly: boolean): Review
   return decision;
 }
 
-/** 普通独立评审支持明确自然语言，以最后一个决定为准。 */
+/** 普通独立评审也只接受显式 [APPROVED] / [DECISION:approved]，不再把 LGTM 或「通过」当批准。 */
 export function isReviewApproved(answer: string): boolean {
-  return lastReviewDecision(answer, false) === 'approved';
+  return lastReviewDecision(answer, true) === 'approved';
 }
 
 /** 结构化门禁只接受独立 [APPROVED] 标记，后续拒绝结论会覆盖旧标记。 */
@@ -75,7 +75,7 @@ export function buildInitialReviewPrompt(task: string, round: number): string {
     '请审查当前话题项目目录中的代码/改动，给出：',
     '1) 问题与风险（按严重程度）',
     '2) 修改建议',
-    '3) 若无明显问题，请在结论中明确写上 [APPROVED] 或 [DECISION:approved]',
+    '3) 这不是流水线门禁。若无明显问题，必须另起一行写 [APPROVED] 或 [DECISION:approved]；LGTM、「通过」、「可以合并」不算批准。',
     '4) 完整交付流水线中必须另起一行 [RESULT:done|blocked|failed]：通过或未通过都用 [RESULT:done]；未通过时不要写 [APPROVED]，可写 [DECISION:rejected] + [HANDOFF:dev]。禁止把「发现需改代码」写成 [RESULT:failed]（那会跳过回传）。审查做不完用 [RESULT:blocked] + [BLOCK_KIND:gate-evidence]。',
     '',
     `评审目标：${task}`,

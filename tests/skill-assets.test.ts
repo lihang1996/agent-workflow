@@ -15,6 +15,7 @@ const skillNames = [
   'verify-software-delivery',
   'audit-runtime-boundaries',
   'review-final-delivery',
+  'coordinate-delivery-summary',
 ];
 
 function runScript(relativePath: string, args: string[], env?: NodeJS.ProcessEnv) {
@@ -29,7 +30,7 @@ async function writeJson(path: string, value: unknown): Promise<void> {
   await writeFile(path, JSON.stringify(value));
 }
 
-test('七个 Skill 具有精简元数据、可发现界面和五类回归说明', async () => {
+test('交付 Skill 具有精简元数据、可发现界面和五类回归说明', async () => {
   for (const name of skillNames) {
     const root = join(repoRoot, 'skills', name);
     const markdown = await readFile(join(root, 'SKILL.md'), 'utf8');
@@ -39,6 +40,8 @@ test('七个 Skill 具有精简元数据、可发现界面和五类回归说明'
     assert.match(markdown, /description: /);
     assert.match(markdown, /## 回归验证/);
     assert.match(markdown, /workflow_context\.skillsRoot/);
+    assert.match(markdown, /Owns：/);
+    assert.match(markdown, /Forbidden：/);
     for (const marker of ['真实失败', '通用案例', '不触发', '绕过案例', '修复案例']) {
       assert.match(markdown, new RegExp(marker));
     }
@@ -47,6 +50,7 @@ test('七个 Skill 具有精简元数据、可发现界面和五类回归说明'
     assert.match(openaiYaml, /display_name:/);
     assert.match(openaiYaml, /short_description:/);
     assert.match(openaiYaml, /default_prompt:/);
+    assert.match(openaiYaml, /allow_implicit_invocation: false/);
   }
 });
 

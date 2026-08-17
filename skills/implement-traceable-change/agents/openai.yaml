@@ -3,4 +3,4 @@ interface:
   short_description: "按照需求契约与风险方案实现变更并生成完整的文件测试追踪证据"
   default_prompt: "使用 $implement-traceable-change 按已批准方案实现并记录需求追踪。"
 policy:
-  allow_implicit_invocation: true
+  allow_implicit_invocation: false

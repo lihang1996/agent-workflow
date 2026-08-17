@@ -1,0 +1,6 @@
+interface:
+  display_name: "Coordinate Delivery Summary"
+  short_description: "在门禁结束后汇总事实与残余风险，不批准也不改代码"
+  default_prompt: "使用 $coordinate-delivery-summary 汇总本次交付事实、验证与残余风险。"
+policy:
+  allow_implicit_invocation: false

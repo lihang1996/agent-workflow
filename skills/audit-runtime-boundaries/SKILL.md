@@ -1,6 +1,6 @@
 ---
 name: audit-runtime-boundaries
-description: "在交付包含浏览器界面、HTTP API、公开输入、缓存、部署响应或性能目标时，验证真实运行时的可访问性、响应式、状态码、安全头、缓存和兼容边界；不用于没有运行时表面的纯库或无法启动产物的静态分析。"
+description: "在交付包含运行时表面时，按 workflow_context.runtimeSurfaceKinds 验证适用的可访问性、契约、缓存与兼容边界；不用于没有运行时表面的纯库，也不默认假设浏览器或 CDN。"
 ---
 
 # 审计运行时边界
@@ -8,10 +8,17 @@ description: "在交付包含浏览器界面、HTTP API、公开输入、缓存�
 本 Skill 的 `scripts/` 属于编排框架，不是目标仓库代码。请运行
 `workflow_context.skillsRoot/audit-runtime-boundaries/scripts/...`；没有该字段时使用本文件所在目录。
 
+## Role / Mission
+
+Role：运行时边界审计。Mission：在 QA 已验证的同一构建上，只探测适用运行时边界。
+Owns：runtime-audit.json。Forbidden：重做 QA 普通 E2E 或完整 build；改代码。
+表面类型来自 `workflow_context.runtimeSurfaceKinds`（`http|ui|cli|job|none`）；缺省则本步发现，不要默认键盘/Safari/CDN。
+
 ## 必需输入
 
 - 读取契约、实现和验证报告。
-- 获取可运行的隔离环境、页面/API 清单、目标浏览器、视口和性能预算。
+- 获取可运行的隔离环境，以及 `workflow_context.runtimeSurfaceKinds` 声明的表面清单。
+- 仅当表面类型包含 `ui` 时才验证键盘/焦点/视口；包含 `http` 时才探测状态与安全头。不要假设浏览器。
 - 无法启动 P0 运行环境时返回 unverified/blocked。
 - 实际运行 `workflow_context.fingerprintCommand`，将 JSON 输出中的 `fingerprint` 写入
   `projectFingerprint`；它必须与 QA 验证时的快照一致。
@@ -23,8 +30,8 @@ description: "在交付包含浏览器界面、HTTP API、公开输入、缓存�
    `scripts/discover-runtime-surfaces.mjs <delivery-contract.json>` 辅助发现。
 2. 建立“表面 × 状态 × 环境”矩阵，包含正常、空、加载、错误、404 和权限失败。
 3. 对 HTTP 表面运行 `scripts/probe-http-contract.mjs <http-probes.json>`。
-4. 验证导航、表单反馈、重复提交、对话框焦点、横向溢出和布局稳定性。
-5. 按契约运行目标浏览器和视口；缺失目标标为 unverified。
+4. 仅当 `runtimeSurfaceKinds` 包含 `ui` 时，验证导航、表单反馈、重复提交、对话框焦点、横向溢出和布局稳定性。
+5. 仅当契约或上下文指定目标浏览器/视口时才运行；缺失目标标为 unverified，不得默认 Safari/CDN。
 6. 检查安全头、共享缓存、资源大小、图片尺寸、性能预算和错误可观察性。
 7. 保存截图、响应头、trace 或网络证据。
 8. 生成 `runtime-audit.json` 并运行 `scripts/validate-runtime-matrix.mjs`；所有探测和校验

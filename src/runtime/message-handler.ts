@@ -11,6 +11,7 @@ import { collabTopicKey } from '../core/collab.js';
 import { requestTaskAbort } from '../core/task-abort.js';
 import { assertWorkdir } from '../core/workdir.js';
 import { isDeliveryMutationTask } from '../core/delivery-policy.js';
+import { qualityRoleRejectsImplementationHandoff } from '../core/role-constitution.js';
 import { DEFAULT_PIPELINE_STEPS } from '../core/pipeline.js';
 import {
   formatScheduleInterval,
@@ -356,7 +357,7 @@ export async function handleMessage(
       return;
     }
 
-    if (isDeliveryMutationTask(parsed.task)) {
+    if (isDeliveryMutationTask(parsed.task) || qualityRoleRejectsImplementationHandoff(target.id, parsed.task)) {
       await bot.reply(
         msg.messageId,
         '交接命令不能绕过交付门禁执行项目修改。请由 CEO 发起流水线，或由开发工程师使用 /squad <目标>。',
@@ -370,7 +371,7 @@ export async function handleMessage(
         await requestHighRiskApproval(ctx, {
           bot: target,
           msg,
-          prompt: buildHandoffPrompt(bot, parsed.task),
+          prompt: buildHandoffPrompt(bot, parsed.task, target),
           action: 'task',
           reason: highRiskReason(parsed.task),
         });
@@ -405,7 +406,7 @@ export async function handleMessage(
         bot: target,
         msg,
         session: targetSession,
-        prompt: buildHandoffPrompt(bot, parsed.task),
+        prompt: buildHandoffPrompt(bot, parsed.task, target),
       });
     } catch (error) {
       await bot.reply(msg.messageId, (error as Error).message, hasThread);
@@ -418,7 +419,8 @@ export async function handleMessage(
         msg.messageId,
         [
           '用法：/review <任务>',
-          '流程：reviewer 做只读独立审查；不会在完整交付门禁外自动修改代码',
+          '这不是流水线门禁：reviewer 做只读独立审查，不会自动改代码。',
+          '通过只认独立一行 [APPROVED] 或 [DECISION:approved]；LGTM、「通过」、「可以合并」不算。',
           '示例：/review 审查 README.md 是否完整准确',
         ].join('\n'),
         hasThread,
@@ -998,7 +1000,7 @@ function buildHelpText(bot: Bot): string {
       '/status 查看当前会话',
       '/workdir [路径] 查看/设置本话题项目目录（clear 清除）',
       `/engine ${formatEngineIds()} 统一切换本话题所有角色的执行引擎`,
-      '/review <任务> 只读独立审查（修复请进入 /squad）',
+      '/review <任务> 只读独立审查（只认 [APPROVED]/[DECISION:approved]，修复请进入 /squad）',
       '/workflow retry|abort <工作流ID> 续跑或终止流水线',
       '/reset /reopen /close /clean 会话管理',
       '执行中可点任务卡片「停止任务」（仅发起人）',
@@ -1012,7 +1014,7 @@ function buildHelpText(bot: Bot): string {
     '/workdir [路径] 查看/设置本话题项目目录（clear 清除）',
     `/engine ${formatEngineIds()} 统一切换本话题所有角色的执行引擎`,
     '/handoff <角色> <任务> 交接给同话题其他角色',
-    '/review <任务> 只读独立审查（修复请进入 /squad）',
+    '/review <任务> 只读独立审查（只认 [APPROVED]/[DECISION:approved]，修复请进入 /squad）',
     '/squad <目标> 架构→开发→评审→QA→运行时审计→终审',
     '/schedule … 创建/管理定时任务',
     '/approval <任务> 发起高风险操作审批',

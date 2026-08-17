@@ -1,4 +1,5 @@
 import type { Bot } from '../im/lark.js';
+import { forbiddenHandoffHint } from './role-constitution.js';
 
 const ROLE_ALIASES: Record<string, string[]> = {
   ceo: ['ceo', 'ceo助手', '总助', '老板'],
@@ -7,6 +8,8 @@ const ROLE_ALIASES: Record<string, string[]> = {
   dev: ['dev', 'developer', '开发', '开发工程师'],
   qa: ['qa', 'test', '测试', '测试工程师'],
   reviewer: ['reviewer', 'review', '评审', '代码评审'],
+  runtime_auditor: ['runtime_auditor', 'runtime', '运行时', '运行时审计'],
+  final_reviewer: ['final_reviewer', '终审', '最终审查'],
 };
 
 /** 解析 `/handoff <角色> <任务>` 参数。 */
@@ -45,9 +48,10 @@ export function listHandoffTargets(bots: Iterable<Bot>): string {
 }
 
 /** 构造交给目标 Bot 的任务 prompt。 */
-export function buildHandoffPrompt(from: Bot, task: string): string {
+export function buildHandoffPrompt(from: Bot, task: string, target?: Bot): string {
   return [
     `【任务交接】来自 ${from.name}（${from.id}）`,
+    target ? forbiddenHandoffHint(target.id) : '请只做本角色允许的工作。',
     '请在当前话题的项目工作目录中完成以下任务，完成后给出简洁结论：',
     task,
   ].join('\n');

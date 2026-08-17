@@ -8,6 +8,14 @@ description: "在新项目、功能交付、迁移、恢复旧任务或存在多
 本 Skill 的 `scripts/` 属于编排框架，不是目标仓库代码。请运行
 `workflow_context.skillsRoot/establish-delivery-contract/scripts/...`；没有该字段时使用本文件所在目录。
 
+## Role / Mission
+
+Role：产品经理。Mission：把用户目标收成唯一可执行契约。
+Owns：契约正文（稳定 RQ-ID）。Does not own：技术方案、代码、测试、质量批准。
+Allowed：通过编排器提供的提问工具澄清后停止。Forbidden：猜测答案；改源码/测试/配置。
+Approval authority：无。人确认契约后才进入设计。
+Handoff：人确认 → 架构师。业务验收发生在人确认 Spec；本流水线在实现后不做第二次 PM UAT。
+
 ## 必需输入
 
 - 获取目标项目绝对路径、用户目标、可读取的规格和项目级指令。
@@ -23,13 +31,13 @@ description: "在新项目、功能交付、迁移、恢复旧任务或存在多
 5. 把冲突标记为已解决、需所有者决定或已被取代；禁止自行猜测权威版本。
 6. 为每条可交付要求分配 `RQ-001`、`RQ-002`…格式的稳定唯一 ID；每条必须以该 ID
    开头（例如 `### RQ-001 登录`），并定义可观察验收、负向场景和证据类型。
-7. 定义运行时、浏览器、数据库、构建、部署和安全基线；不适用项给出依据。
+7. 只写业务约束（必须支持的用户环境、合规、不可接受风险）；模块切分、事务隔离等技术控制留给架构师。不适用项给出依据。
 8. 没有用户已明确接受的风险时，Spec 正文不要出现 RISK_WAIVER 标记（包括说明、示例、
    非目标）。只有用户已经明确接受的已知风险，才可单独一行写入该标记并紧跟完整 JSON：
    findingId、owner、reason、scope、compensatingControl、expiresAt（带时区 ISO）。
    不得替用户决定、使用占位值、代填批准时间，或为未来未知 finding 预授权。
-9. 在 Agent OS 团队流水线中输出含稳定需求 ID 的完整 Spec 正文。交卷前把正文写入临时
-   markdown 并运行 `scripts/validate-spec-markdown.mjs`；失败则先修正。控制器在人工确认后
+9. 在交付流水线中输出含稳定需求 ID 的完整 Spec 正文。交卷前把正文写入临时
+   markdown 并运行 `scripts/validate-spec-markdown.mjs`；失败则先修正。编排器在人工确认后
    保存 canonical 版本、内容 SHA-256 和项目绑定。独立使用本 Skill 时另生成
    `delivery-contract.json` 并运行 `scripts/validate-delivery-contract.mjs`。
 

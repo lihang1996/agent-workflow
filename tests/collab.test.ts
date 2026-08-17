@@ -10,15 +10,16 @@ test('评审只接受明确的通过结论行', () => {
   for (const answer of [
     '[APPROVED]',
     '结论：[APPROVED]',
-    '## 最终结论：LGTM',
-    '- 评审通过。',
     '核验完成。第 3 轮复审结论:**[APPROVED]**',
-    '## 复审结论:通过 ✅',
-    '复审结论：**通过**',
+    '[DECISION:approved]',
   ]) {
     assert.equal(isReviewApproved(answer), true, answer);
   }
   for (const answer of [
+    '## 最终结论：LGTM',
+    '- 评审通过。',
+    '## 复审结论:通过 ✅',
+    '复审结论：**通过**',
     '未审核通过，仍需修改',
     '不可以合并',
     '修复后可以写 [APPROVED]',
@@ -41,6 +42,7 @@ test('结构化门禁必须有显式 APPROVED 标记', () => {
 
 test('协作评审 prompt 禁止把未通过标成 RESULT:failed', () => {
   const first = buildInitialReviewPrompt('审查实现', 1);
+  assert.match(first, /这不是流水线门禁/);
   assert.match(first, /通过或未通过都用 \[RESULT:done\]/);
   assert.match(first, /禁止把「发现需改代码」写成 \[RESULT:failed\]/);
   const followUp = buildFollowUpReviewPrompt('审查实现', 2, '已按意见修改');

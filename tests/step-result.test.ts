@@ -58,10 +58,11 @@ test('开发/架构 prompt 要求 RESULT 标记，PM Spec 不要求', () => {
   assert.match(dev, /implementation-manifest\.json/);
   assert.doesNotMatch(dev, /workflow-id\/report\.json/);
   const pm = buildPipelineStepPrompt(DEFAULT_PIPELINE_STEPS[0], '目标', {});
-  assert.doesNotMatch(pm, /\[RESULT:done\]/);
+  assert.match(pm, /角色宪法/);
   assert.match(pm, /validate-spec-markdown\.mjs/);
   assert.match(pm, /不要出现 RISK_WAIVER 标记/);
   assert.match(pm, /同一 CLI 会话纠偏一次/);
+  assert.doesNotMatch(pm, /本步骤属于不可跳过的结构化质量门禁/);
 });
 
 test('架构师 planned findings 必须 RESULT:done，不得因 FIND 标 failed', () => {
@@ -128,10 +129,11 @@ test('开发、QA 与运行时审计 prompt 固定验证职责边界', () => {
   assert.match(qa, /开发 artifact 中 required=false 的环境缺证只是交接信息，不是 QA 豁免/);
   assert.match(qa, /delegatedTo="verification"[\s\S]*完全相同的 id、command argv 和 cwd/);
   assert.match(qa, /required=true \+ status=blocked\/unverified[\s\S]*\[RESULT:blocked\]/);
-  assert.match(qa, /产品代码或测试失败[\s\S]*status=fail[\s\S]*\[RESULT:failed\] 交回开发/);
+  assert.match(qa, /产品代码或测试失败[\s\S]*status=fail[\s\S]*\[DECISION:rejected\] \+ \[HANDOFF:dev\]/);
 
   const runtimeAudit = promptFor('runtime_audit');
   assert.match(runtimeAudit, /只对适用的运行时边界做真实探测/);
+  assert.match(runtimeAudit, /runtimeSurfaceKinds/);
   assert.match(runtimeAudit, /不得重复 QA 已完成的普通功能 E2E/);
   assert.match(runtimeAudit, /不得在本步重做完整 production build/);
 });
@@ -281,6 +283,7 @@ test('中间代码评审加载结构化变更审查 Skill 和 Gate 协议', () =
   assert.match(review, /review-change-set\/SKILL\.md/);
   assert.match(review, /gateId[^\n]*change-review/);
   assert.match(review, /完整变更范围和关联契约/);
+  assert.match(review, /不得以开发总结替代/);
 });
 
 test('流水线提示词只携带当前步骤所需且已去协议的有界上下文', () => {

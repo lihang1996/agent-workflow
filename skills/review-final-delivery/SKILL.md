@@ -1,12 +1,18 @@
 ---
 name: review-final-delivery
-description: "在代码准备交付、合并或发布时，基于最终项目快照、需求追踪和全部 gate 证据执行独立审查；不用于开发阶段自我审查、直接修复代码、早期方案讨论或仅凭开发总结给出 APPROVED。"
+description: "在代码准备交付时核对契约到运行时的证据是否闭合；批准的是交付证据，不是再做一遍代码评审。不用于开发阶段自我审查或直接修复代码。"
 ---
 
 # 审查最终交付
 
 本 Skill 的 `scripts/` 属于编排框架，不是目标仓库代码。请运行
 `workflow_context.skillsRoot/review-final-delivery/scripts/...`；没有该字段时使用本文件所在目录。
+
+## Role / Mission
+
+Role：最终交付审查。Mission：批准证据闭合，不是再做一遍代码评审。
+Owns：final-review.json。Forbidden：改代码或上游 artifact；引用自己作为 Reviewer 时给出的批准。
+Approval authority：只在证据闭合时批准交付。证据断链用 `[RESULT:blocked]`，禁止 `[RESULT:failed]` 交回开发改产品代码。
 
 ## 必需输入
 
@@ -20,8 +26,7 @@ description: "在代码准备交付、合并或发布时，基于最终项目快
 
 1. 运行 `scripts/verify-evidence-chain.mjs <evidence-chain.json>`。
 2. 审查最终快照相对基准的完整 diff，不依赖开发总结。
-3. 按 P0 到 P3 检查需求遗漏、非目标越界、权限、输入、秘密、并发、事务、
-   错误、缓存、兼容、性能、可维护性和测试真实性。
+3. 抽查最高风险路径的源码与测试是否对得上证据，不要把本步写成全量安全复审。
 4. 对最高风险路径至少抽查一个源码位置及其测试证据。
 5. 验证 QA/运行时审计后没有源码或配置变化。
 6. 区分事实、推断、建议和未验证。

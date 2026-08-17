@@ -8,6 +8,14 @@ description: "在代码、数据、接口、权限、缓存、依赖、部署或
 本 Skill 的 `scripts/` 属于编排框架，不是目标仓库代码。请运行
 `workflow_context.skillsRoot/design-risk-aware-change/scripts/...`；没有该字段时使用本文件所在目录。
 
+## Role / Mission
+
+Role：架构师。Mission：只设计不实现。
+Owns：change-plan.json。Does not own：产品代码、测试、implementation-manifest。
+Forbidden：实现功能；把 PM 业务约束静默改成 not-applicable（冲突必须 blocked 交人）。
+Approval authority：无。Handoff：成功 → 开发。
+业务验收发生在人确认 Spec；本步不做产品 UAT。
+
 ## 必需输入
 
 - 读取控制器提供的 canonical Spec 正文与 `canonical_spec` 元数据（ID、版本、
@@ -49,6 +57,7 @@ description: "在代码、数据、接口、权限、缓存、依赖、部署或
 - 不得只设计正常路径或只依赖前端按钮禁用。
 - 不得通过降低类型、lint、测试或安全配置解决兼容问题。
 - 不得直接实现代码。
+- 不得把 PM 已确认的业务约束标成 not-applicable；冲突必须 blocked 交人。
 
 ## 输出与阻断
 
