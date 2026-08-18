@@ -1,5 +1,17 @@
 /**
  * 飞书任务卡片：把 CLI 事件整理成稳定、低噪音的任务进度。
+ *
+ * 本文件负责构造飞书 Interactive Card JSON 2.0 格式的任务卡片。
+ * 卡片在 cli-task.ts 中使用：
+ * - 启动时发「运行中」蓝卡
+ * - CLI 执行中持续更新进度（工具列表、token 用量、耗时）
+ * - 完成后写终态卡（绿色成功/橙色阻塞/红色失败/灰色取消）
+ *
+ * 关键设计：
+ * - ThrottledCardUpdater：节流更新（避免每次工具事件都调飞书 API）
+ * - 终态卡不可覆盖：terminalStatus 设置后非 final 的 push 被丢弃
+ * - 卡片用 markdown 格式显示工具列表和 AI 回答
+ * - 答案超长时拆分续发（飞书单条消息上限）
  */
 import type { CliRunStats } from "../cli/types.js";
 import type {
@@ -22,6 +34,10 @@ export interface TaskCardOptions {
   abortSessionId?: string;
 }
 
+/**
+ * 卡片状态 → 飞书模板色 + 中文标签。
+ * blue=执行中 / green=已完成 / orange=已阻塞 / red=失败 / grey=取消
+ */
 const STATUS_STYLE = {
   running: { template: "blue", label: "执行中" },
   success: { template: "green", label: "已完成" },
@@ -30,11 +46,16 @@ const STATUS_STYLE = {
   cancelled: { template: "grey", label: "已取消" },
 } as const;
 
-const COMPACT_ANSWER_LENGTH = 900;
-const MAX_CARD_ANSWER_LENGTH = 6_000;
-const RUNNING_ACTIVITY_LIMIT = 3;
-const FINISHED_ACTIVITY_LIMIT = 8;
+/** 常量：紧凑版答案长度 / 卡片答案最大长度 / 运行中活动列表数量 / 完成后活动列表数量 */
+const COMPACT_ANSWER_LENGTH = 900;        // 紧凑模式答案截断长度
+const MAX_CARD_ANSWER_LENGTH = 6_000;     // 卡片答案最大长度（飞书限制）
+const RUNNING_ACTIVITY_LIMIT = 3;        // 运行中显示最近 3 个工具活动
+const FINISHED_ACTIVITY_LIMIT = 8;        // 完成后显示最近 8 个工具活动
 
+/**
+ * 工具名 → emoji 图标映射。
+ * 用于在卡片活动中显示工具类型。
+ */
 const TOOL_ICONS: Record<string, string> = {
   Agent: "🧩",
   Bash: "⌘",
@@ -49,6 +70,7 @@ const TOOL_ICONS: Record<string, string> = {
   Write: "📝",
 };
 
+/** 格式化耗时：毫秒 → "X 秒" / "X 分 Y 秒" / "X 分钟" */
 function formatDuration(durationMs: number): string {
   const totalSeconds = Math.max(1, Math.round(durationMs / 1_000));
   if (totalSeconds < 60) return `${totalSeconds} 秒`;
@@ -58,19 +80,30 @@ function formatDuration(durationMs: number): string {
   return `${minutes} 分 ${seconds} 秒`;
 }
 
+/** 格式化数字：1000 → 1k，1000000 → 1M */
 function formatCount(value: number): string {
   if (value >= 1_000_000) return `${Math.round(value / 100_000) / 10}M`;
   return value >= 1_000 ? `${Math.round(value / 100) / 10}k` : String(value);
 }
 
+/** 转义反引号：飞书 markdown 中反引号是代码标记，需替换 */
 function escapeInlineCode(value: string): string {
   return value.replaceAll("`", "ˋ");
 }
 
+/**
+ * 转义飞书 markdown 中的 HTML 标签。
+ * 飞书 markdown 会解析 <xxx> 为链接/提及，需在显示 AI 输出时转义。
+ */
 function escapeFeishuMarkdown(value: string): string {
   return value.replace(/<(?=\/?[A-Za-z][^>]*>)/g, "<&zwj;");
 }
 
+/**
+ * 格式化单个工具活动行。
+ * 格式：`{icon} {toolName} · {detail} ({duration})`
+ * 失败的工具前面加 ⚠️
+ */
 function activityLine(activity: TaskActivity): string {
   const icon = activity.failed ? "⚠️" : (TOOL_ICONS[activity.toolName] ?? "⚙️");
   const detail = activity.detail

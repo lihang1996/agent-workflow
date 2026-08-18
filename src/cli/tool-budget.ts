@@ -1,3 +1,16 @@
+/**
+ * CLI 工具调用预算与循环检测。
+ *
+ * 三层防护：
+ * 1. 工具调用硬上限（CLI_MAX_TOOL_COUNT，默认 500）：超过直接终止
+ * 2. 连续同目标熔断（CLI_TOOL_LOOP_STREAK，默认 15）：
+ *    连续调用同一工具且目标相同 → 疑似死循环
+ * 3. 窗口同参重复 / 同工具乒乓（警告 10 / 熔断 20）：
+ *    窗口内重复同参数调用、A↔B 交替调用（Read↔Edit 不算乒乓）
+ *
+ * 被 runner.ts 在 tool_start/tool 事件中调用 loopWatch.observe()。
+ */
+
 import type { CliEvent } from './types.js';
 
 /** 单次 CLI 工具调用硬上限。长交付会读改很多文件，不是死循环。 */

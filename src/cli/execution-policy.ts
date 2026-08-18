@@ -1,3 +1,17 @@
+/**
+ * CLI 执行策略：不同策略对应不同的写权限和沙箱配置。
+ *
+ * 5 种策略：
+ * - standard      → 普通任务：可改产品代码（PM/开发用）
+ * - read-only     → 只读：独立 /review 用
+ * - input-only    → 仅输入分析：一次性会话，不恢复旧上下文
+ * - approved      → 已审批高风险任务：放行审批范围内的操作
+ * - evidence-write → 质检步骤：只允许写证据目录
+ *
+ * 本文件为每种策略生成 prompt 前缀（promptForExecutionPolicy）
+ * 和 Codex 沙箱配置（codexRuntimePlan）。
+ */
+
 import type { CliCapabilityExpectation, CliExecutionPolicy } from './types.js';
 
 export type CodexSandbox = 'read-only' | 'workspace-write' | 'danger-full-access';

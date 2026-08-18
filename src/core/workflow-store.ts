@@ -1,3 +1,17 @@
+/**
+ * 交付工作流持久化存储（data/workflows.json）。
+ *
+ * 管理交付流水线的完整状态：步骤进度、门禁结果、证据链、租约。
+ * 被 pipeline-runner.ts 和 message-handler.ts 调用。
+ *
+ * 核心概念：
+ * - Workflow：一条交付流水线的完整状态
+ * - WorkflowStep：单个步骤的状态（pending/executing/done/blocked/failed）
+ * - 技术租约（techLease）：同一 projectRoot 只允许一条进入技术阶段的流水线
+ * - updateIfStatus()：原子条件更新（CAS 语义，防并发）
+ * - assertManualWorkflowRetryAllowed()：校验手动重试是否允许
+ */
+
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
@@ -109,6 +123,8 @@ export const DeliveryWorkflowSchema = z.object({
   }
   const allowedPriorOutputKeys = new Set([
     ...workflow.stepIds,
+    // squad 没有 pm 步骤，但仍要把已批准 Spec 快照进 priorOutputs.pm 给架构/开发读。
+    'pm',
     'canonical_spec',
     'clarification',
     'previous_spec',

@@ -12,6 +12,24 @@ import type {
   CliRunStats,
 } from './types.js';
 
+/**
+ * OpenAI Codex CLI 适配器。
+ *
+ * 负责构建 codex CLI 的命令行参数 + 解析其流式输出。
+ *
+ * Codex 特有配置：
+ * - 不传 --sandbox（会强制旧沙箱、丢掉本机 bind）
+ * - default_permissions=":danger-full-access"（对齐 Claude dontAsk）
+ * - 高风险仍靠 --ask-for-approval untrusted
+ * - -c mcp_servers.*.env：覆盖 MCP 子进程环境（把 AGENT_OS_WORKFLOW_ID 等传到 ask-server）
+ * - 问卷 MCP 必须 approval_mode=approve
+ *
+ * 事件解析（parseEvents）：
+ * Codex 的流式输出包含 item.started / item.completed 成对事件：
+ * - item.started → 工具进度只在 started 上报（避免翻倍）
+ * - turn.completed → 最终答案
+ * - Reconnecting... N/5 → 可恢复的重连消息（返回空事件数组，让 Codex 内置重连）
+ */
 interface CodexItem {
   type?: unknown;
   item_type?: unknown;

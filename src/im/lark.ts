@@ -1,5 +1,16 @@
 /**
- * 飞书接入：WS 长连接收消息 + REST 回消息。
+ * 飞书接入层：WS 长连接收消息 + REST API 回复消息。
+ *
+ * 本文件是 Agent OS 与飞书之间的唯一通道：
+ * - startBot()：创建飞书 SDK Client + WSClient 长连接 + 事件 dispatcher
+ * - Bot 接口：reply / replyCard / updateCard / createDocument / downloadResource 等
+ * - 云文档操作：Markdown → 块转换 → 批量写入 / 修订覆盖
+ * - 飞书 API 限流重试（429 / 99991400）
+ *
+ * 事件处理：
+ * - im.message.receive_v1 → onMessage 回调
+ * - card.action.trigger → onCardAction 回调
+ * - drive.notice.comment_add_v1 → onDocumentComment 回调
  */
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { createHash, randomUUID } from 'node:crypto';
@@ -492,7 +503,22 @@ async function fetchBotOpenId(client: Lark.Client): Promise<string> {
   return openId;
 }
 
-/** 启动单个飞书 Bot（WS 收消息 + REST 回复）。 */
+/**
+ * 启动单个飞书 Bot（WS 收消息 + REST 回复）。
+ *
+ * 做三件事：
+ * 1. 创建飞书 SDK Client（用 appId/appSecret 认证）
+ * 2. 调 /bot/v3/info 拉取自己的 open_id（用于群聊 @ 匹配）
+ * 3. 创建 WSClient 建立长连接，注册事件 dispatcher
+ *
+ * 事件 dispatcher 注册三类事件：
+ * - im.message.receive_v1 → 用户发消息
+ * - card.action.trigger → 用户点卡片按钮
+ * - drive.notice.comment_add_v1 → 云文档新增评论
+ *
+ * 消息去重：用 Set 记住已处理的 message_id（最多 2000 条 LRU），
+ * 飞书可能会重发同一条消息。
+ */
 export async function startBot(opts: BotOptions): Promise<Bot> {
   const { config, onMessage, onCardAction, onDocumentComment } = opts;
   const { appId, appSecret } = config;

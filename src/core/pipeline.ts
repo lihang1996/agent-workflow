@@ -1,34 +1,73 @@
 /**
- * CEO 团队交付流水线：PM → 架构 → 开发 → 评审 → 测试 → 运行时审计 → 最终审查 → CEO 汇总。
+ * CEO 团队交付流水线定义 + 各步骤 prompt 模板。
+ *
+ * 固定 8 步流水线：PM → 架构 → 开发 → 评审 → 测试 → 运行时审计 → 最终审查 → CEO 汇总。
+ * PIPELINE_STEPS 环境变量只能声明完整顺序，不能裁剪或重排质量门禁。
+ *
+ * 本文件核心职责：
+ * 1. 定义 PipelineStep 类型和 8 个步骤常量
+ * 2. 解析 PIPELINE_STEPS 环境变量
+ * 3. 查找缺失的 Bot 角色
+ * 4. 解析步骤的逻辑角色（会话隔离用）
+ * 5. 为每个步骤构造完整的 CLI prompt（buildPipelineStepPrompt）
+ *
+ * prompt 构造逻辑：
+ *   roleConstitution()           → 全局角色边界声明
+ *   roleBriefForStep(stepId)     → 本步骤的角色简介
+ *   skillInstruction(step)       → 强制读取哪个 Skill
+ *   evidenceOwnershipInstruction → 本步骤只能写哪个 artifact
+ *   priorBlock(step, priorOutputs) → 前置步骤的输出摘要
+ *   gatedTail(step)              → [RESULT:xxx] 和 [GATE_RESULT] 格式说明
  */
+
+// ─── 导入：依赖模块 ───
+// step-result.ts 提供 [RESULT:done|blocked|failed] 格式说明
 import { pipelineResultInstruction } from './step-result.js';
+// quality-gates.ts 提供 [GATE_RESULT] 格式说明 + 步骤对应的 Skill 名
 import { gateResultInstruction, skillNameForStep } from './quality-gates.js';
+// role-constitution.ts 提供全局角色边界 + 各步骤的角色简介
 import { roleBriefForStep, roleConstitution } from './role-constitution.js';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
+// agent-output.ts 提供文本压缩（截取摘要，去掉冗余行）
 import { compactAgentOutput } from './agent-output.js';
 
+/**
+ * 流水线步骤 ID（8 个固定步骤）。
+ * 顺序即执行顺序，不可重排。
+ */
 export type PipelineStepId =
-  | 'pm'
-  | 'architect'
-  | 'dev'
-  | 'review'
-  | 'qa'
-  | 'runtime_audit'
-  | 'final_review'
-  | 'summary';
+  | 'pm'            // 产品经理：需求澄清 + Spec
+  | 'architect'     // 架构师：技术方案设计（只设计不实现）
+  | 'dev'           // 开发工程师：代码实现
+  | 'review'        // 代码评审：审查变更
+  | 'qa'            // 测试工程师：完整验收
+  | 'runtime_audit' // 运行时边界审计（可选独立 Bot）
+  | 'final_review'  // 最终交付审查（可选独立 Bot）
+  | 'summary';      // CEO 汇总
 
+/**
+ * 单个流水线步骤的定义。
+ */
 export interface PipelineStep {
+  /** 步骤唯一 ID */
   id: PipelineStepId;
-  /** 缺独立 Bot 时使用的飞书角色；summary / review 有特殊编排 */
+  /** 缺独立 Bot 时使用的飞书角色；summary 由 CEO 做，review 由 reviewer 做 */
   botId: 'pm' | 'architect' | 'dev' | 'qa' | 'ceo' | 'reviewer';
   /** 会话隔离用的逻辑角色；与 botId 相同时可省略 */
   logicalRole?: string;
   /** 若已配置独立飞书 Bot，优先使用；未配置不阻断流水线 */
   preferredBotId?: 'runtime_auditor' | 'final_reviewer';
+  /** 步骤显示名（用于卡片和日志） */
   title: string;
 }
 
+/**
+ * 默认流水线步骤（固定顺序，不可裁剪或重排）。
+ *
+ * 运行时审计和最终审查可配独立 Bot（preferredBotId）。
+ * 未配置独立 Bot 时回退到 QA / reviewer，不阻断流水线。
+ */
 export const DEFAULT_PIPELINE_STEPS: PipelineStep[] = [
   { id: 'pm', botId: 'pm', logicalRole: 'pm', title: '需求澄清 / Spec' },
   { id: 'architect', botId: 'architect', logicalRole: 'architect', title: '技术方案' },
@@ -52,7 +91,11 @@ export const DEFAULT_PIPELINE_STEPS: PipelineStep[] = [
   { id: 'summary', botId: 'ceo', logicalRole: 'ceo', title: '交付汇总' },
 ];
 
-/** 开发内部交付小队固定包含完整的技术交付闭环，不允许通过配置裁剪。 */
+/**
+ * 开发内部交付小队（/squad）固定步骤。
+ * 包含完整的技术交付闭环（不含 PM 需求和 CEO 汇总），不允许通过配置裁剪。
+ * 用途：开发工程师或 CEO 直接发起技术交付，跳过需求澄清阶段。
+ */
 export const DELIVERY_SQUAD_STEPS: PipelineStep[] = DEFAULT_PIPELINE_STEPS.filter((step) =>
   step.id === 'architect'
   || step.id === 'dev'
@@ -62,7 +105,15 @@ export const DELIVERY_SQUAD_STEPS: PipelineStep[] = DEFAULT_PIPELINE_STEPS.filte
   || step.id === 'final_review');
 
 /**
- * 解析固定交付链。环境变量只能显式声明完整规范顺序，不能裁剪或重排质量门禁。
+ * 解析 PIPELINE_STEPS 环境变量。
+ *
+ * 规则：只能显式声明完整规范顺序，不能裁剪或重排质量门禁。
+ * 如果用户写了 "pm,architect,dev"（缺步骤）或 "dev,pm,..."（重排），
+ * 都会抛出错误，防止绕过门禁。
+ *
+ * @param value - 环境变量 PIPELINE_STEPS 的值
+ * @returns 固定的 DEFAULT_PIPELINE_STEPS（任何合法输入都返回同样的东西）
+ * @throws 如果步骤名不对、有重复、顺序不对
  */
 export function parsePipelineSteps(value: string | undefined): PipelineStep[] {
   if (!value?.trim()) return DEFAULT_PIPELINE_STEPS;
@@ -79,7 +130,16 @@ export function parsePipelineSteps(value: string | undefined): PipelineStep[] {
   return DEFAULT_PIPELINE_STEPS;
 }
 
-/** 返回一组步骤实际运行所缺少的 Bot；评审步骤同时依赖 reviewer 与 dev。独立审计/终审 Bot 可选。 */
+/**
+ * 返回一组步骤实际运行所缺少的 Bot。
+ *
+ * 评审步骤同时依赖 reviewer 与 dev（协作回传开发修复）。
+ * 独立审计/终审 Bot 是可选的（preferredBotId），缺失不阻断。
+ *
+ * @param steps          - 要检查的步骤列表
+ * @param availableBotIds - 当前已连接的 Bot ID 集合
+ * @returns 缺失的 Bot ID 列表（空数组表示全部可用）
+ */
 export function missingBotIdsForSteps(
   steps: readonly PipelineStep[],
   availableBotIds: ReadonlySet<string>,
@@ -92,7 +152,15 @@ export function missingBotIdsForSteps(
   return [...required].filter((botId) => !availableBotIds.has(botId));
 }
 
-/** 逻辑角色：用于 CLI 会话隔离；同 Bot 扮演的不同步骤不得共用上下文。 */
+/**
+ * 获取步骤的逻辑角色名。
+ *
+ * 逻辑角色用于 CLI 会话隔离：同一个飞书 Bot 扮演不同步骤时，
+ * CLI 上下文必须隔离，不能串线。
+ *
+ * 例如 QA Bot 同时扮演 qa 和 runtime_auditor，
+ * 它们的 CLI 会话是分开的。
+ */
 export function logicalRoleForStep(step: PipelineStep): string {
   if (step.logicalRole?.trim()) return step.logicalRole.trim();
   if (step.id === 'runtime_audit') return 'runtime_auditor';
@@ -101,7 +169,12 @@ export function logicalRoleForStep(step: PipelineStep): string {
   return step.botId;
 }
 
-/** 已配置独立 Bot 时用之，否则回退到步骤 botId。 */
+/**
+ * 解析步骤实际使用的 Bot ID。
+ *
+ * 如果步骤有 preferredBotId 且该独立 Bot 已连接，优先使用。
+ * 否则回退到步骤的 botId（如 runtime_audit 回退到 qa）。
+ */
 export function resolvePipelineActorId(
   step: PipelineStep,
   availableBotIds: ReadonlySet<string>,
@@ -110,6 +183,15 @@ export function resolvePipelineActorId(
   return step.botId;
 }
 
+/**
+ * 每个步骤需要看到的前置产出 key 列表（按优先级排序）。
+ *
+ * priorOutputs 是一个 Record<string, string>，记录了之前步骤的输出。
+ * 每个步骤只需要看部分前置产出，避免上下文过长。
+ *
+ * 例如 dev 需要看 pm(Spec) + architect(技术方案) + 各种 blocked_* (修复请求)，
+ * 但不需要看 summary（还没到那步）。
+ */
 const PRIOR_CONTEXT_KEYS: Record<PipelineStepId, readonly string[]> = {
   pm: ['clarification', 'previous_spec', 'confirmation_feedback'],
   architect: ['pm', 'canonical_spec', 'workflow_context', 'quality_evidence', 'fingerprint_drift', 'quality_fix_request'],
@@ -146,6 +228,7 @@ const PRIOR_CONTEXT_KEYS: Record<PipelineStepId, readonly string[]> = {
   ],
 };
 
+/** 前置产出总字符数上限：36K（避免 prompt 过长挤掉 CLI 上下文窗口） */
 const PRIOR_CONTEXT_TOTAL_LIMIT = 36_000;
 
 const CANONICAL_WAIVER_SPEC_INSTRUCTION =
@@ -158,6 +241,19 @@ const CANONICAL_WAIVER_SPEC_INSTRUCTION =
   + ' <该文件>；脚本失败则先修正再输出，不要把未校验正文交给控制器。'
   + '若控制器因 Spec 结构拒绝，会在同一 CLI 会话纠偏一次（Claude/Codex/Cursor 相同），不要重新做项目发现。';
 
+/**
+ * 构造前置产出文本块。
+ *
+ * 从 priorOutputs 中按 PRIOR_CONTEXT_KEYS 顺序提取，
+ * 每项压缩到 perItemLimit（pm 8K，quality_evidence 12K，其他 6K），
+ * 总计不超过 36K。
+ *
+ * 输出格式：
+ * ### pm
+ * <PM Spec 摘要>
+ * ### architect
+ * <技术方案摘要>
+ */
 function priorBlock(step: PipelineStep, priorOutputs: Record<string, string>): string {
   const entries = PRIOR_CONTEXT_KEYS[step.id]
     .flatMap((key) => priorOutputs[key] === undefined ? [] : [[key, priorOutputs[key]] as const]);
@@ -176,6 +272,13 @@ function priorBlock(step: PipelineStep, priorOutputs: Record<string, string>): s
   return sections.join('\n\n') || '(暂无前置产出)';
 }
 
+/**
+ * 构造 Skill 读取指令。
+ *
+ * 每个步骤有对应的 Skill（如 establish-delivery-contract、design-risk-aware-change 等）。
+ * Agent 必须完整读取 SKILL.md，并按渐进式路由读取 references/ 和运行 scripts/。
+ * 交卷前必须跑通 validate-*.mjs 脚本。
+ */
 function skillInstruction(step: PipelineStep): string {
   const skillName = skillNameForStep(step.id);
   if (!skillName) return '';
@@ -192,6 +295,11 @@ function skillInstruction(step: PipelineStep): string {
   return lines.join('\n');
 }
 
+/**
+ * 各步骤拥有的主 artifact 文件名。
+ * 用于 evidenceOwnershipInstruction() 生成证据边界指令。
+ * Agent 只能写自己的 artifact，不得改其他步骤的。
+ */
 const OWNED_PRIMARY_ARTIFACT: Partial<Record<PipelineStepId, string>> = {
   architect: 'change-plan.json',
   dev: 'implementation-manifest.json',
@@ -201,6 +309,12 @@ const OWNED_PRIMARY_ARTIFACT: Partial<Record<PipelineStepId, string>> = {
   final_review: 'final-review.json',
 };
 
+/**
+ * 构造证据职责边界指令。
+ *
+ * 告诉 Agent：你只能写你的 artifact，不得改别人的。
+ * canonical-spec.md 和 evidence-chain.json 是控制器生成的，只读。
+ */
 function evidenceOwnershipInstruction(step: PipelineStep): string {
   const fileName = OWNED_PRIMARY_ARTIFACT[step.id];
   if (!fileName) return '';
@@ -211,6 +325,10 @@ function evidenceOwnershipInstruction(step: PipelineStep): string {
   ].join('\n');
 }
 
+/**
+ * 解析 Skill 目录根路径。
+ * 优先用 AGENT_OS_SKILLS_DIR 环境变量，否则回退到项目内 skills/ 目录。
+ */
 export function resolveSkillsRoot(): string {
   const configuredRoot = process.env.AGENT_OS_SKILLS_DIR?.trim();
   return configuredRoot
@@ -218,21 +336,52 @@ export function resolveSkillsRoot(): string {
     : fileURLToPath(new URL('../../skills/', import.meta.url));
 }
 
+/** 拼接某个 Skill 的 SKILL.md 绝对路径 */
 function skillPath(skillName: string): string {
   return resolve(resolveSkillsRoot(), skillName, 'SKILL.md');
 }
 
+/**
+ * 构造步骤 prompt 的结尾部分：[RESULT:xxx] 格式说明 + [GATE_RESULT] 格式说明。
+ * 非 PM 步骤必须输出 [RESULT:done|blocked|failed]。
+ * 有门禁的步骤还要输出 [GATE_RESULT] JSON。
+ */
 function gatedTail(step: PipelineStep): string[] {
   const instruction = gateResultInstruction(step.id);
   const resultInstruction = pipelineResultInstruction(step.id);
   return instruction ? ['', resultInstruction, '', instruction] : ['', resultInstruction];
 }
 
+/**
+ * 组装完整的步骤 prompt。
+ * 结构：角色边界声明 + 角色简介 + 步骤正文。
+ */
 function composeStepPrompt(step: PipelineStep, body: string[]): string {
   return [roleConstitution(), roleBriefForStep(step.id), ...body].join('\n');
 }
 
-/** 构造各角色在流水线中的任务 prompt。 */
+/**
+ * ★ 构造各角色在流水线中的完整任务 prompt。
+ *
+ * 这是流水线最核心的函数：为每个步骤生成完整的 CLI prompt，包含：
+ * - 角色边界声明（全局）
+ * - 角色简介（本步骤）
+ * - Skill 读取指令
+ * - 证据职责边界
+ * - 前置产出摘要
+ * - 步骤具体指令（每个角色不同）
+ * - [RESULT] 和 [GATE_RESULT] 格式说明
+ *
+ * PM 步骤有三种分支：
+ * 1. confirmation_feedback 存在 → 修订模式（负责人退回了 Spec）
+ * 2. clarification 存在 → 用户已澄清，输出 Spec
+ * 3. 都没有 → 首次执行，可能需要发问卷
+ *
+ * @param step         - 步骤定义
+ * @param goal         - 用户目标（CEO 传入的自然语言目标）
+ * @param priorOutputs - 前置步骤的输出（Record<string, string>）
+ * @returns 完整的 CLI prompt 字符串
+ */
 export function buildPipelineStepPrompt(
   step: PipelineStep,
   goal: string,

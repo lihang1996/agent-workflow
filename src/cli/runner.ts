@@ -19,19 +19,24 @@ export { resolveCliMaxToolCount, resolveCliToolLoopStreak } from './tool-budget.
 
 /**
  * 长工作流策略：
- * - CLI_TIMEOUT_MS：从启动起的绝对上限（默认 6 小时），防止失控进程永挂
- * - CLI_IDLE_TIMEOUT_MS：无 stream 事件多久视为卡住（默认 20 分钟）；有输出就续命
- * - CLI_MAX_TOOL_COUNT：工具调用硬上限（默认 500）
- * - CLI_TOOL_LOOP_STREAK：连续同目标熔断（默认 15）。另检测窗口同参重复和同工具乒乓（警告 10 / 熔断 20）
- * 几小时的持续编码靠「有活动续命」，不要只把墙钟超时硬拉长。
+ *
+ * 持续编码可能数小时，不能只靠短墙钟超时。策略是「绝对上限 + 空闲续命」：
+ *
+ * - CLI_TIMEOUT_MS（绝对上限）：从启动起的硬上限（默认 6 小时），防止失控进程永挂
+ * - CLI_IDLE_TIMEOUT_MS（空闲超时）：无 stream 输出多久视为卡住（默认 20 分钟）；
+ *   有工具/旁白/结果/stderr 输出就自动续命
+ * - CLI_MAX_TOOL_COUNT（工具调用上限）：默认 500，防止无限循环
+ * - CLI_TOOL_LOOP_STREAK（循环检测）：连续同目标多少次熔断（默认 15）。
+ *   另检测窗口同参重复和同工具乒乓（警告 10 / 熔断 20）
+ *   Read↔Edit 交错不算乒乓
  */
-const DEFAULT_TIMEOUT_MS = 6 * 60 * 60 * 1000;
-const DEFAULT_IDLE_TIMEOUT_MS = 20 * 60 * 1000;
-const MIN_ENV_TIMEOUT_MS = 60_000;
-const MAX_TIMEOUT_MS = 12 * 60 * 60 * 1000;
-const MAX_STDERR_CHARS = 64 * 1024;
-const MAX_EVENT_LINE_CHARS = 4 * 1024 * 1024;
-const useProcessGroup = process.platform !== 'win32';
+const DEFAULT_TIMEOUT_MS = 6 * 60 * 60 * 1000;       // 6 小时
+const DEFAULT_IDLE_TIMEOUT_MS = 20 * 60 * 1000;        // 20 分钟
+const MIN_ENV_TIMEOUT_MS = 60_000;                     // 环境变量最小 1 分钟
+const MAX_TIMEOUT_MS = 12 * 60 * 60 * 1000;             // 最大 12 小时
+const MAX_STDERR_CHARS = 64 * 1024;                     // stderr 最多保留 64KB
+const MAX_EVENT_LINE_CHARS = 4 * 1024 * 1024;           // 单行 stream-json 最大 4MB
+const useProcessGroup = process.platform !== 'win32';  // 非 Windows 用进程组
 
 export interface RunCliOptions {
   adapter: CliAdapter;
@@ -116,7 +121,15 @@ function clampEnvTimeoutMs(value: number): number {
   return Math.floor(value);
 }
 
-/** 杀掉 CLI 进程组（含孙子进程）。 */
+/**
+ * 杀掉 CLI 进程组（含孙子进程）。
+ *
+ * CLI 子进程可能 spawn 了孙子进程（如 dev server、浏览器、数据库），
+ * 只 kill 直接子进程会留下孤儿。用进程组 kill（process.kill(-pid)）
+ * 可以连带杀掉同组的所有子孙进程。
+ *
+ * 进度：先 SIGTERM（优雅终止），2 秒后如果还没退出 → SIGKILL（强制）
+ */
 function killProcessTree(child: ChildProcess, sig: NodeJS.Signals = 'SIGTERM'): void {
   const pid = child.pid;
   if (!pid) return;
@@ -135,7 +148,23 @@ function killProcessTree(child: ChildProcess, sig: NodeJS.Signals = 'SIGTERM'): 
   }
 }
 
-/** 启动 CLI 子进程，解析 stream-json，支持取消/绝对超时/空闲超时。 */
+/**
+ * ★ 启动 CLI 子进程，逐行解析 stream-json，支持取消/绝对超时/空闲超时/工具计数/循环检测。
+ *
+ * 这是 CLI 执行层的核心函数，由 cli-task.ts 调用。
+ *
+ * 执行流程：
+ * 1. 解析超时参数（CLI_TIMEOUT_MS / CLI_IDLE_TIMEOUT_MS）
+ * 2. 构建命令行参数（adapter.buildArgs 或 buildResumeArgs）
+ * 3. spawn 子进程，stdin 忽略，stdout/stderr 管道
+ * 4. readline 逐行读 stdout，调 adapter.parseEvents 解析事件
+ * 5. 每行续命空闲定时器；空闲超时或绝对超时 → SIGTERM + SIGKILL
+ * 6. 工具事件计数 + 循环检测（ToolLoopWatch）
+ * 7. result 事件保存 finalResult
+ * 8. close 事件：exit code 0 且有 finalResult → resolve；否则 reject
+ *
+ * @returns Promise<CliRunResult>，包含 AI 回答、会话 ID、统计信息
+ */
 export function runCli(options: RunCliOptions): Promise<CliRunResult> {
   const {
     adapter,
@@ -195,7 +224,7 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
   }
 
   return new Promise((resolve, reject) => {
-    // detached 让子进程成为新进程组组长，便于连带杀掉孙子进程。
+    // detached: true 让子进程成为新进程组组长，便于 killProcessTree 杀掉孙子进程
     const child = spawn(adapter.command, args, {
       cwd: spawnCwd,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -353,8 +382,9 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
       }
     });
 
+    // stderr 处理：编译警告/进度信息常走 stderr
+    // P1 修复：stderr 输出也算活动，应续命 idle timer（之前只看 stdout）
     child.stderr.on('data', (chunk: Buffer | string) => {
-      // P1 修复：stderr 输出也算活动（编译警告/进度信息常走 stderr），应续命 idle timer。
       armIdleTimer();
       stderr = `${stderr}${chunk.toString()}`.slice(-MAX_STDERR_CHARS);
     });
@@ -369,6 +399,9 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
       }
       fail(error);
     });
+    // CLI 进程结束事件：判断成功还是失败
+    // 优先级：settled（已处理）> internalError（内部错误）> timedOut（超时）
+    //         > signal.aborted（被取消）> code !== 0（非零退出码）> finalResult
     child.once('close', (code) => {
       if (settled) return;
       if (internalError) return fail(internalError);

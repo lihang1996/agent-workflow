@@ -1,3 +1,16 @@
+/**
+ * 活跃任务管理：快照持久化 + 孤儿卡收尾 + 停机收尾。
+ *
+ * 被 index.ts（启动恢复）和 cli-task.ts（运行时）调用：
+ * - snapshotActiveRuns()：导出未成功结束的任务快照
+ * - flushPersistActiveRuns()：防抖落盘到 data/active-runs.json
+ * - schedulePersistActiveRuns()：安排延迟落盘（800ms 防抖）
+ * - reconcileOrphanedCards()：启动时收尾遗留的「运行中」卡（tsx watch 热重启）
+ * - shutdownActiveRuns()：停机时中断所有 CLI + 刷中断卡
+ * - finishInterruptedRun()：写中断终态卡
+ * - freezeRunCard() / interruptedCard()：卡片冻结/中断态
+ */
+
 import { buildTaskCard } from '../im/card.js';
 import type { PersistedActiveRun } from '../core/active-run-store.js';
 import { sanitizeErrorForLog } from '../core/log-inspection.js';

@@ -1,3 +1,15 @@
+/**
+ * 会话辅助函数。
+ *
+ * 提供会话相关的工具函数，被 cli-task.ts 和 message-handler.ts 调用：
+ * - topicIdOf()：提取话题 ID（thread > root > message）
+ * - workdirFor()：解析本次任务的工作目录（话题 > Bot > CLI 回退 > cwd）
+ * - ensureRunnableSession()：确保会话可运行（空闲或已关闭）
+ * - formatSessionStatus()：格式化会话状态文本
+ * - markSessionIdle()：把会话标记为空闲
+ * - truncate()：截断文本（用于日志）
+ */
+
 import { getAdapter } from '../cli/registry.js';
 import { resolveWorkdir } from '../core/workdir.js';
 import type { Session } from '../core/session-manager.js';

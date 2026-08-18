@@ -1,3 +1,16 @@
+/**
+ * 任务进度追踪器。
+ *
+ * 接收 CLI 流式事件（tool_start/tool_end/context），维护：
+ * - 当前活动列表（最近 N 个工具调用）
+ * - 已用时间
+ * - 上下文 token 用量
+ * - 工具总数
+ *
+ * snapshot() 产出 TaskProgressSnapshot，被 card.ts 用于渲染飞书卡片。
+ * 被 cli-task.ts 创建，每个 ActiveRun 一个 tracker 实例。
+ */
+
 import type { CliEvent } from '../cli/types.js';
 
 export interface TaskActivity {

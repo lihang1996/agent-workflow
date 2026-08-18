@@ -940,6 +940,36 @@ test('用户停止任务后流水线进入 paused，重启不会自动续跑，r
     assert.equal(resumed.status, 'ready');
     assert.equal(resumed.nextStepIndex, 2);
     assert.equal(resumed.error, undefined);
+
+    const reviewIndex = stepIds.indexOf('review');
+    const qaIndex = stepIds.indexOf('qa');
+    const looped = await workflows.create({
+      kind: 'team',
+      name: '编排误移交',
+      initiatorBotId: 'ceo',
+      goal: '独立项目-编排',
+      stepIds,
+      qualityPolicy: 'gated',
+      projectRoot: '/project/orchestration-loop',
+      message: { messageId: 'om-4', chatId: 'oc', chatType: 'group', rootId: '', threadId: 'omt-4', senderOpenId: 'ou' },
+    });
+    await workflows.update(looped.id, {
+      status: 'executing',
+      nextStepIndex: reviewIndex,
+      priorOutputs: {
+        pm: 'spec',
+        architect: 'plan',
+        dev: 'impl',
+        quality_fix_request: '来源步骤：测试验收（qa）\n缺陷摘要：RetriableError: [resource_exhausted] Error',
+        blocked_qa: 'RetriableError: [resource_exhausted] Error',
+      },
+    });
+    await pauseWorkflowOnUserStop(ctx, looped.id);
+    const restoredLoop = await resumePausedOrOrphanedWorkflow(ctx, looped.id);
+    assert.equal(restoredLoop.status, 'ready');
+    assert.equal(restoredLoop.nextStepIndex, qaIndex);
+    assert.equal(restoredLoop.priorOutputs.quality_fix_request, undefined);
+    assert.equal(restoredLoop.error, undefined);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1506,6 +1536,20 @@ test('内部交付小队持久化时拒绝缺步骤或重复步骤', async () =>
       store.create({ ...base, kind: 'team', stepIds: ['dev', 'dev'] }),
       /不能重复/,
     );
+    const gatedSquad = await store.create({
+      ...base,
+      kind: 'squad',
+      qualityPolicy: 'gated',
+      projectRoot: root,
+      stepIds: ['architect', 'dev', 'review', 'qa', 'runtime_audit', 'final_review'],
+    });
+    const withSpec = await store.update(gatedSquad.id, {
+      priorOutputs: {
+        pm: '### RQ-001 搜索页\n用 Suspense 处理 searchParams。',
+        canonical_spec: '{"id":"spec-1","version":1,"sha256":"abc"}',
+      },
+    });
+    assert.equal(withSpec.priorOutputs.pm.startsWith('### RQ-001'), true);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

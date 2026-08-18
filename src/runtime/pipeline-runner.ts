@@ -1,3 +1,46 @@
+/**
+ * ★ 交付流水线状态机（项目最大文件，2660+ 行）。
+ *
+ * 管理从「CEO 发起目标」到「交付汇总」的完整 8 步流水线生命周期。
+ *
+ * 核心导出函数（按调用顺序）：
+ *
+ * 流水线启动：
+ * - runTeamPipeline()           → CEO 发起 /pipeline <目标>
+ * - runDeliverySquad()         → 开发/CEO 发起 /squad <目标>（跳过 PM 需求）
+ *
+ * PM 阶段：
+ * - pipelineRunner 内部调 startCliTask → PM CLI 产出 Spec
+ * - confirmSpecForReview()      → 用户确认 → 发布到云文档评审
+ * - confirmSpecAndStartDelivery → 用户确认 → 直接开始技术交付
+ * - rejectSpecConfirmation()    → 用户退回 → PM 修订
+ * - resumeWorkflowAfterQuestionnaire → 问卷作答后恢复 PM
+ *
+ * 技术交付阶段（架构→开发→评审→QA→审计→终审）：
+ * - continueDeliveryWorkflow()  → 推进到下一步骤
+ * - resumeBlockedWorkflowStep() → 用户重试阻塞步骤
+ * - handOffBlockedWorkflowIfQualityFix → 质量失败自动退回开发
+ * - pauseWorkflowOnUserStop()   → 用户停止 → 标记 paused
+ * - resumePausedOrOrphanedWorkflow → 重启恢复 paused 流水线
+ *
+ * 门禁校验（validateSuccess 回调）：
+ * - createGateRun / assertGateLineage / assertPlannedFindingsClosed
+ * - assertEvidenceChainComplete / assertFindingContinuity
+ * - FingerprintDriftError（源码指纹漂移检测）
+ *
+ * 证据链管理：
+ * - canonical-spec.md（控制器固化的需求规格）
+ * - evidence-chain.json（v2 证据链）
+ * - 各步骤的 artifact（change-plan / implementation-manifest / change-review 等）
+ *
+ * 核心概念：
+ * - GATE_RESULT：步骤产出的门禁结果 JSON（pass/reject + findings）
+ * - RESULT 标记：[RESULT:done|blocked|failed] 终态语义
+ * - DECISION：[DECISION:approved|rejected] 评审决策
+ * - HANDOFF：[HANDOFF:dev|review|architect] 协作回传目标
+ * - blockVersion：阻塞卡版本（= workflow.updatedAt），防止旧卡放行
+ * - quality_fix_request：质量失败退回开发的修复请求
+ */
 import { lstat, mkdir, readFile, realpath, rename, unlink, writeFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
@@ -60,6 +103,7 @@ import {
   findMisroutedEnvironmentBlock,
   handoffStepIdFromQualityMessage,
   hasExplicitStepResult,
+  isOrchestrationFailureReason,
   parseStepOutcome,
   parseStepResult,
   requiresTestResourceAuthorization,
@@ -212,16 +256,24 @@ async function createAndStartWorkflow(
     message: storedMessage(msg),
   });
   if (canonicalSpec && Object.keys(workflow.priorOutputs).length === 0) {
-    workflow = await ctx.workflows.update(workflow.id, {
-      priorOutputs: {
-        pm: canonicalSpec.content,
-        canonical_spec: JSON.stringify({
-          id: canonicalSpec.id,
-          version: canonicalSpec.version,
-          sha256: canonicalSpec.contentHash,
-        }),
-      },
-    });
+    try {
+      workflow = await ctx.workflows.update(workflow.id, {
+        priorOutputs: {
+          pm: canonicalSpec.content,
+          canonical_spec: JSON.stringify({
+            id: canonicalSpec.id,
+            version: canonicalSpec.version,
+            sha256: canonicalSpec.contentHash,
+          }),
+        },
+      });
+    } catch (error) {
+      await ctx.workflows.updateIfStatus(workflow.id, ['ready'], {
+        status: 'failed',
+        error: `写入 canonical Spec 上下文失败：${persistentErrorMessage(error, 2_000)}`,
+      });
+      throw error;
+    }
   }
   try {
     await prepareEvidenceRoot(workflow);
@@ -501,39 +553,11 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
           );
         },
         onFailure: async (error) => {
-          if (await pauseForRuntimeSourceChangeIfNeeded(
-            ctx,
-            workflow.id,
-            error,
-            { stepIndex, stepId: step.id },
-          )) return;
-          if (await tryRewindForFingerprintDrift(ctx, workflow.id, error, { stepIndex, stepId: step.id })) {
-            return;
-          }
-          const handoff = resolveQualityHandoffTarget(step.id, error.message)
-            ?? ( /未处理 P0\/P1|仍有未处理 P0\/P1/.test(error.message)
-              && !/与审查 artifact 不一致|findings 集合不一致|格式错误/.test(error.message)
-              ? 'dev' as const
-              : undefined);
-          if (handoff) {
-            await handOffQualityFix(
-              ctx,
-              workflow.id,
-              {
-                fromStepId: step.id,
-                fromStepIndex: stepIndex,
-                targetStepId: handoff,
-                reason: error.message,
-              },
-            );
-            return;
-          }
-          await failWorkflow(
-            ctx,
-            workflow.id,
-            error.message,
-            { stepIndex, stepId: step.id },
-          );
+          await routePipelineCliFailure(ctx, workflow.id, error, {
+            stepIndex,
+            stepId: step.id,
+            stepTitle: step.title,
+          });
         },
       });
       return;
@@ -610,7 +634,8 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
           const stepResult = normalizedResult ?? parseStepResult(answer);
           const outcome = parseStepOutcome(answer);
           const routingReason = stepResult.reason || outcome.reason || '';
-          if (shouldPauseAsEvidenceBlock(step.id, routingReason, answer)) {
+          // 门禁已通过的 [RESULT:done] 禁止再因正文里的 sha256 / GATE_RESULT 假暂停。
+          if (stepResult.kind !== 'done' && shouldPauseAsEvidenceBlock(step.id, routingReason, answer)) {
             await pauseWorkflowForStepBlock(
               ctx,
               workflow.id,
@@ -623,6 +648,18 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
             return;
           }
           if (stepResult.kind === 'failed') {
+            if (isOrchestrationFailureReason(`${routingReason}\n${answer}`)) {
+              await pauseWorkflowForStepBlock(
+                ctx,
+                workflow.id,
+                stepIndex,
+                step.id,
+                step.title,
+                answer,
+                routingReason || 'CLI 编排层故障，当前步骤未完成',
+              );
+              return;
+            }
             const handoff = resolveQualityHandoffTarget(step.id, routingReason, answer);
             if (handoff) {
               await handOffQualityFix(
@@ -738,40 +775,11 @@ export async function continueDeliveryWorkflow(ctx: AppContext, workflowId: stri
         }
       },
       onFailure: async (error) => {
-        if (await pauseForRuntimeSourceChangeIfNeeded(
-          ctx,
-          workflow.id,
-          error,
-          { stepIndex, stepId: step.id },
-        )) return;
-        if (await tryRewindForFingerprintDrift(ctx, workflow.id, error, { stepIndex, stepId: step.id })) {
-          return;
-        }
-        const handoff = resolveQualityHandoffTarget(step.id, error.message)
-          ?? ( /未处理 P0\/P1|仍有未处理 P0\/P1/.test(error.message)
-            && !/与审查 artifact 不一致|findings 集合不一致|格式错误/.test(error.message)
-            && (step.id === 'qa' || step.id === 'runtime_audit' || step.id === 'final_review' || step.id === 'review')
-            ? 'dev' as const
-            : undefined);
-        if (handoff) {
-          await handOffQualityFix(
-            ctx,
-            workflow.id,
-            {
-              fromStepId: step.id,
-              fromStepIndex: stepIndex,
-              targetStepId: handoff,
-              reason: error.message,
-            },
-          );
-          return;
-        }
-        await failWorkflow(
-          ctx,
-          workflow.id,
-          error.message,
-          { stepIndex, stepId: step.id },
-        );
+        await routePipelineCliFailure(ctx, workflow.id, error, {
+          stepIndex,
+          stepId: step.id,
+          stepTitle: step.title,
+        });
       },
     });
   } catch (error) {
@@ -1255,6 +1263,71 @@ async function tryRewindForFingerprintDrift(
     await failWorkflow(ctx, workflowId, (continueError as Error).message);
   });
   return true;
+}
+
+/**
+ * CLI 进程级失败：编排故障停在当前步骤；代码缺陷才移交开发；其余 fail closed。
+ */
+async function routePipelineCliFailure(
+  ctx: AppContext,
+  workflowId: string,
+  error: Error,
+  options: {
+    stepIndex: number;
+    stepId: PipelineStep['id'];
+    stepTitle: string;
+  },
+): Promise<void> {
+  if (await pauseForRuntimeSourceChangeIfNeeded(
+    ctx,
+    workflowId,
+    error,
+    { stepIndex: options.stepIndex, stepId: options.stepId },
+  )) return;
+  if (await tryRewindForFingerprintDrift(ctx, workflowId, error, {
+    stepIndex: options.stepIndex,
+    stepId: options.stepId,
+  })) {
+    return;
+  }
+  if (isOrchestrationFailureReason(error.message)) {
+    await pauseWorkflowForStepBlock(
+      ctx,
+      workflowId,
+      options.stepIndex,
+      options.stepId,
+      options.stepTitle,
+      error.message,
+      error.message,
+    );
+    return;
+  }
+  const handoff = resolveQualityHandoffTarget(options.stepId, error.message)
+    ?? ( /未处理 P0\/P1|仍有未处理 P0\/P1/.test(error.message)
+      && !/与审查 artifact 不一致|findings 集合不一致|格式错误/.test(error.message)
+      && (
+        options.stepId === 'qa'
+        || options.stepId === 'runtime_audit'
+        || options.stepId === 'final_review'
+        || options.stepId === 'review'
+      )
+      ? 'dev' as const
+      : undefined);
+  if (handoff) {
+    await handOffQualityFix(ctx, workflowId, {
+      fromStepId: options.stepId,
+      fromStepIndex: options.stepIndex,
+      targetStepId: handoff,
+      reason: error.message,
+    });
+    return;
+  }
+  await failWorkflow(
+    ctx,
+    workflowId,
+    error.message,
+    { stepIndex: options.stepIndex, stepId: options.stepId },
+  );
 }
 
 /**
@@ -2325,7 +2398,9 @@ async function pauseWorkflowForStepBlock(
               : '请准备本机测试环境后重试'
             : blockKind === 'gate-evidence'
               ? '请补齐或重新生成当前步骤的 Gate/artifact 证据'
-              : '请解决上述前置条件',
+              : blockKind === 'orchestration'
+                ? '请等 Cursor/引擎配额或探活恢复后重试当前步骤，不要退回开发改代码'
+                : '请解决上述前置条件',
         `用 \`/workflow retry ${workflowId}\` 重新发送阻塞卡。`,
       ].join('\n'),
       hasThread(msg),
@@ -2512,13 +2587,31 @@ export async function resumePausedOrOrphanedWorkflow(
   if (workflowHasLiveCli(ctx, workflowId)) {
     throw new Error('当前步骤的 CLI 仍在退出，请稍后再发送 /workflow retry。');
   }
+  const currentStepId = workflow.stepIds[workflow.nextStepIndex];
+  const misrouted = findMisroutedEnvironmentBlock(currentStepId, workflow.priorOutputs);
+  const sourceIndex = misrouted ? workflow.stepIds.indexOf(misrouted.sourceStepId) : -1;
+  const nextPrior = { ...workflow.priorOutputs };
+  if (misrouted) {
+    delete nextPrior.quality_fix_request;
+    delete nextPrior.blocked_workdir;
+  }
   const restored = await ctx.workflows.updateIfStatus(
     workflowId,
     workflow.status,
-    { status: 'ready', error: undefined },
+    {
+      status: 'ready',
+      error: undefined,
+      ...(misrouted && sourceIndex >= 0 ? {
+        nextStepIndex: sourceIndex,
+        priorOutputs: nextPrior,
+      } : {}),
+    },
   );
   if (!restored) {
     throw new Error(`工作流当前状态为 ${ctx.workflows.get(workflowId)?.status ?? 'unknown'}，无法从暂停恢复。`);
+  }
+  if (misrouted && sourceIndex >= 0) {
+    console.warn(`[工作流] 暂停恢复时纠正误移交：${currentStepId} → ${misrouted.sourceStepId}`);
   }
   return restored;
 }

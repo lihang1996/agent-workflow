@@ -1,3 +1,16 @@
+/**
+ * 工作目录解析。
+ *
+ * 工作目录优先级（高 → 低）：
+ * 1. 话题目录（/workdir 绑定，全角色共享）
+ * 2. BOT_*_WORKDIR（Bot 级默认）
+ * 3. CLAUDE_WORKDIR / CODEX_WORKDIR / CURSOR_WORKDIR（引擎级默认）
+ * 4. process.cwd()
+ *
+ * assertWorkdir() 校验路径在 AGENT_OS_ALLOWED_ROOTS 白名单内，
+ * 防止从自然语言误猜路径。流水线不自动绑定目录。
+ */
+
 import { realpath, stat } from 'node:fs/promises';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import type { CliId } from '../cli/types.js';

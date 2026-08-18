@@ -1,3 +1,19 @@
+/**
+ * 定时任务调度器。
+ *
+ * /schedule 创建的定时任务存储在 data/schedules.json。
+ * startScheduler() 启动 1 分钟间隔的轮询定时器，
+ * 检查是否有到期任务需要执行。
+ *
+ * 支持的定时任务类型：
+ * - 普通任务：到时间 @Bot 发消息
+ * - 团队流水线：到时间启动 /pipeline
+ * - 只读日志巡检：读日志尾部 → 分析异常
+ *
+ * 高风险动作仍走审批门：定时任务先发审批卡，
+ * 人工确认后才真正执行。
+ */
+
 import type { ScheduledJob } from '../core/schedule-store.js';
 import {
   buildLogInspectionPrompt,

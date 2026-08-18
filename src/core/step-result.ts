@@ -20,7 +20,7 @@ export interface StepOutcome extends StepResult {
 
 export type QualityHandoffTarget = 'dev' | 'architect';
 export type QualitySourceStep = 'review' | 'qa' | 'runtime_audit' | 'final_review';
-export type StepBlockKind = 'workdir' | 'environment' | 'test-resource' | 'gate-evidence' | 'other';
+export type StepBlockKind = 'workdir' | 'environment' | 'test-resource' | 'gate-evidence' | 'orchestration' | 'other';
 
 export interface MisroutedEnvironmentBlock {
   sourceStepId: QualitySourceStep;
@@ -33,6 +33,7 @@ const BLOCK_KIND_VALUES = new Set<StepBlockKind>([
   'environment',
   'test-resource',
   'gate-evidence',
+  'orchestration',
 ]);
 
 // 支持：
@@ -42,6 +43,9 @@ const BLOCK_KIND_VALUES = new Set<StepBlockKind>([
 // 标记必须在行首（(?:^|\n)），避免普通回答里举例 [RESULT:failed] 被误判为失败。
 const RESULT_RE = /(?:^|\n)\s*\[RESULT:\s*(done|blocked|failed)(?:\s*[|：:]\s*([^\]]+))?\]\s*([^\n\r]*)/gi;
 const EXPLICIT_RESULT_RE = /(?:^|\n)\s*\[RESULT:\s*(?:done|blocked|failed)(?:\s*[|：:]\s*[^\]]+)?\]/i;
+/** RESULT 同行后面若紧跟其它协议标记，不能当成人类原因。 */
+const TRAILING_PROTOCOL_MARKER_RE =
+  /\[(?:GATE_RESULT|DECISION:[^\]]*|HANDOFF:[^\]]*|BLOCK_KIND:[^\]]*|APPROVED|REJECTED|RESULT:\s*(?:done|blocked|failed)[^\]]*)\]/i;
 const DECISION_RE = /(?:^|\n)\s*\[DECISION:\s*(approved-with-waiver|approved|rejected)\]/gi;
 const HANDOFF_RE = /(?:^|\n)\s*\[HANDOFF:\s*(dev|architect|pm|qa|runtime_auditor|human)\]/gi;
 const BLOCK_KIND_RE = /(?:^|\n)\s*\[BLOCK_KIND:\s*(environment|workdir|test-resource|gate-evidence)\]/gi;
@@ -57,6 +61,18 @@ function lastMatch<T>(text: string, regex: RegExp, pick: (match: RegExpMatchArra
   const matches = [...text.matchAll(regex)];
   const match = matches[matches.length - 1];
   return match ? pick(match) : undefined;
+}
+
+/** 保留 `[RESULT:blocked] 工作目录不可写`，丢掉 `[RESULT:done][GATE_RESULT] {...}`。 */
+function humanReasonFromResultMatch(match: RegExpMatchArray): string | undefined {
+  const bracketReason = match[2]?.trim();
+  if (bracketReason) return bracketReason;
+  let trailing = match[3]?.trim() ?? '';
+  if (!trailing) return undefined;
+  const cut = trailing.search(TRAILING_PROTOCOL_MARKER_RE);
+  if (cut === 0) return undefined;
+  if (cut > 0) trailing = trailing.slice(0, cut).trim();
+  return trailing || undefined;
 }
 
 /** 流水线控制器用它执行 fail-closed；parseStepResult 本身继续兼容旧调用方。 */
@@ -75,7 +91,7 @@ export function parseStepResult(answer: string): StepResult {
   if (matches.length === 0) return { kind: 'done' };
   const match = matches[matches.length - 1]; // 多个标记时取最后一个
   const kind = match[1].toLowerCase() as StepResultKind;
-  const reason = (match[2] || match[3] || '').trim();
+  const reason = humanReasonFromResultMatch(match);
   return reason ? { kind, reason } : { kind };
 }
 
@@ -135,13 +151,16 @@ export function classifyStepBlockReason(reason: string): StepBlockKind {
   if (/(?:工作目录|workdir|项目目录|话题目录|绑定.?目录|目标路径).{0,24}(?:不可写|不能写|无法访问|不存在|无效|错误|未绑定|missing|invalid|unwritable|not writable|unavailable|cannot access)|(?:不可写|不能写|无法访问|不存在|无效|错误|未绑定|missing|invalid|unwritable|not writable|unavailable|cannot access).{0,24}(?:工作目录|workdir|项目目录|话题目录|绑定.?目录|目标路径)|无代码仓库|缺少项目(?:目录|骨架)|项目骨架(?:缺失|不存在)/i.test(text)) {
     return 'workdir';
   }
+  if (isOrchestrationFailureReason(text)) {
+    return 'orchestration';
+  }
   if (/沙箱|sandbox|EPERM|EACCES|Operation not permitted|禁止监听|无法监听|loopback|localhost|127\.0\.0\.1|::1|本地端口|端口被占用|浏览器.{0,20}(不可用|未安装|无实例|无法启动|启动失败)|Playwright.{0,32}(?:EPERM|EACCES|禁止|未安装|无可用浏览器|无法启动|启动失败|no executable|browser executable)|PostgreSQL.{0,24}(拒绝|不可达|无法|EPERM)|数据库.{0,16}(拒绝访问|不可达|连接失败)|网络.{0,12}(禁止|不可用)|依赖未安装/i.test(text)) {
     return 'environment';
   }
   if (requiresTestResourceAuthorization(text)) {
     return 'test-resource';
   }
-  if (/与审查 artifact 不一致|findings 集合不一致|Gate 结果格式错误|缺少可解析的 \[GATE_RESULT\]|缺少显式 \[RESULT:|终态标记|sha256|证据目录|hash 不匹配|waiver 不完整|尝试上限|无限返工|审查本身无法完成|缺 implementation|fingerprint 对不上|validate-review-report 无法|validate-final-review 无法|证据断链|缺 gate/i.test(text)) {
+  if (/与审查 artifact 不一致|findings 集合不一致|Gate 结果格式错误|缺少可解析的 \[GATE_RESULT\]|缺少显式 \[RESULT:|终态标记|sha256.{0,48}(?:不匹配|mismatch|invalid|错误)|(?:不匹配|mismatch|invalid).{0,48}sha256|缺少证据目录|证据目录.{0,16}(?:不可|缺失|错误|不匹配)|hash 不匹配|waiver 不完整|尝试上限|无限返工|审查本身无法完成|缺 implementation|fingerprint 对不上|validate-review-report 无法|validate-final-review 无法|证据断链|缺 gate/i.test(text)) {
     return 'gate-evidence';
   }
   return 'other';
@@ -167,6 +186,30 @@ export function isEnvironmentBlockReason(reason: string): boolean {
 
 export function isGateEvidenceBlockReason(reason: string): boolean {
   return classifyStepBlockReason(reason) === 'gate-evidence';
+}
+
+/**
+ * Cursor/Claude/Codex 进程级编排故障：配额耗尽、探活超时、gRPC unavailable。
+ * 不是产品代码缺陷，不能据此退回开发。
+ */
+export function isOrchestrationFailureReason(reason: string): boolean {
+  const text = reason.trim();
+  if (!text) return false;
+  if (/\bRetriableError\b/i.test(text)) return true;
+  if (/\[(?:resource_exhausted|unavailable|deadline_exceeded|cancelled|internal)\]/i.test(text)) return true;
+  if (/\bPING timed out\b/i.test(text)) return true;
+  if (/\b(?:resource[_ ]exhausted|quota[_ -]?exceeded|rate[_ -]?limit(?:ed)?|overloaded(?:_error)?)\b/i.test(text)) {
+    return true;
+  }
+  return false;
+}
+
+/** 环境、编排、证据类问题应停在当前质量步骤，不要记 quality_fix_request。 */
+export function shouldStayOnQualityStep(reason: string, answer = ''): boolean {
+  const evidence = [reason, answer].filter(Boolean).join('\n');
+  return isOrchestrationFailureReason(evidence)
+    || isEnvironmentBlockReason(evidence)
+    || classifyStepBlockReason(evidence) === 'gate-evidence';
 }
 
 /**
@@ -201,16 +244,15 @@ export function findMisroutedEnvironmentBlock(
   currentStepId: string | undefined,
   priorOutputs: Record<string, string>,
 ): MisroutedEnvironmentBlock | undefined {
-  if (currentStepId !== 'dev' && currentStepId !== 'architect') return undefined;
   const request = priorOutputs.quality_fix_request?.trim();
   if (!request) return undefined;
   const source = request.match(/来源步骤：[^\n]*[（(](review|qa|runtime_audit|final_review)[）)]/i)?.[1]
     ?.toLowerCase() as QualitySourceStep | undefined;
   if (!source || !QUALITY_HANDOFF_STEPS.has(source)) return undefined;
+  if (currentStepId === source) return undefined;
   const summary = request.match(/缺陷摘要：([^\n]+)/)?.[1]?.trim() || request;
   const blockedOutput = priorOutputs[`blocked_${source}`] || '';
-  const evidence = [summary, blockedOutput].filter(Boolean).join('\n');
-  return isEnvironmentBlockReason(evidence)
+  return shouldStayOnQualityStep(summary, blockedOutput)
     ? { sourceStepId: source, reason: summary }
     : undefined;
 }
@@ -234,8 +276,7 @@ export function resolveQualityHandoffTarget(
   const explicit = explicitHandoffTarget(evidence);
   if (parseHandoff(evidence) === 'human') return undefined;
   if (!QUALITY_HANDOFF_STEPS.has(stepId)) return undefined;
-  if (isEnvironmentBlockReason(evidence)) return undefined;
-  if (classifyStepBlockReason(evidence) === 'gate-evidence') return undefined;
+  if (shouldStayOnQualityStep(reason, answer)) return undefined;
   if (explicit) return explicit;
   if (/重新设计|架构(方案|缺陷|门禁)|方案不可行|需架构师|改 change-plan|重新做技术方案|design gate/i.test(evidence)) {
     return 'architect';
@@ -246,6 +287,8 @@ export function resolveQualityHandoffTarget(
 /** 证据/格式失败应停在本步或 rewind，不能当成代码缺陷退回开发。 */
 export function shouldPauseAsEvidenceBlock(stepId: string, reason: string, answer = ''): boolean {
   if (!QUALITY_HANDOFF_STEPS.has(stepId) && stepId !== 'architect' && stepId !== 'dev') return false;
+  // 合格 GATE_RESULT 必然含 sha256；[RESULT:done] 表示本步已完成，不能再据此假暂停。
+  if (hasExplicitStepResult(answer) && parseStepResult(answer).kind === 'done') return false;
   return classifyStepBlockReason(`${reason}\n${answer}`) === 'gate-evidence';
 }
 

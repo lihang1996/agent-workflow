@@ -1,3 +1,21 @@
+/**
+ * 飞书云文档 Spec 评审同步。
+ *
+ * Spec 确认后的两种路径：
+ * 1. 「确认方案」→ 发布到云文档评审：
+ *    publishSpecToDoc() → 创建飞书云文档 → 写入 Spec 正文
+ *    用户在云文档评论修改意见 → handleDocumentComment() 回调
+ *    approveSpecReview() → 标记 Spec 已批准
+ * 2. 「确认并直接开始技术交付」→ confirmSpecAndStartDelivery
+ *    跳过云文档，直接启动流水线
+ *
+ * 含 [RISK_WAIVER] 的 Spec 必须走云文档路径（不允许直接开始）。
+ * 云文档操作坑：
+ * - title 不能含换行（sanitizeDocumentTitle）
+ * - client_token 必须是 UUID 形态
+ * - Markdown→块后写嵌套块前必须删 merge_info
+ */
+
 import type { ProductSpec } from '../core/spec-store.js';
 import { sanitizeForLog } from '../core/log-inspection.js';
 import {

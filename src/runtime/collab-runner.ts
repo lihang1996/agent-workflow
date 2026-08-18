@@ -1,3 +1,17 @@
+/**
+ * 评审↔开发协作执行器。
+ *
+ * 独立 /review <任务> 是只读的，不自动改代码。
+ * 流水线内评审步骤的协作回传：
+ * 1. 评审 Bot 先跑一轮 review → 发现 P0/P1
+ * 2. runCollabReview() 把 finding 回传给开发 Bot 修复
+ * 3. 开发修复后回传给评审 Bot 再审
+ * 4. 循环直到 [APPROVED] 或达到 COLLAB_MAX_ROUNDS（默认 2）
+ *
+ * 协作 prompt 由 collab.ts 的 buildFixFromReviewPrompt / buildFollowUpReviewPrompt 生成。
+ * 协作轮次记录在 data/collab-rounds.json。
+ */
+
 import {
   buildFixFromReviewPrompt,
   buildFollowUpReviewPrompt,

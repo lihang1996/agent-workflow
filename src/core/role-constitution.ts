@@ -1,3 +1,17 @@
+/**
+ * 角色宪法 + 各步骤角色简介。
+ *
+ * roleConstitution() 是全局角色边界声明（所有角色共享，优先级最高）：
+ * 1. 只承担当前角色，不改别人的 artifact
+ * 2. 契约文件和证据链只读
+ * 3. 风险接受权只属于人
+ * 4. 禁止自我批准
+ * 5. 终态标记语义
+ *
+ * roleBriefForStep(stepId) 返回每个步骤的角色简介。
+ * 被 pipeline.ts 的 composeStepPrompt() 调用。
+ */
+
 import type { PipelineStepId } from './pipeline.js';
 
 /** 所有流水线角色共享，后续任何角色说明不得覆盖。 */

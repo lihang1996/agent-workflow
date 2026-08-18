@@ -1,3 +1,18 @@
+/**
+ * 高风险审批执行器。
+ *
+ * 当 isHighRiskTask() 检测到高风险操作时：
+ * 1. requestHighRiskApproval()：发审批卡到飞书
+ * 2. 用户点「批准」→ executeApprovedAction()：以 approved 策略重跑 CLI
+ * 3. 用户点「拒绝」→ 标记失败，不执行
+ *
+ * 审批安全：
+ * - assertOwnedBy()：只认 OWNER_OPEN_ID（多 Bot 场景跨应用拒绝同一用户）
+ * - approvedScope：只放行原请求命中的风险类别（防「批准 git push」被扩大成删除数据）
+ * - 高风险类别：production-change / destructive-change / external-publish 等
+ * - 审批通过后 settleApprovalSchedule()：回写定时任务的真实终态
+ */
+
 import type { ApprovalRequest } from '../core/approval-store.js';
 import { assertOwnedBy } from '../core/access.js';
 import { normalizeIdentity, type IdentityInput } from '../core/identity-registry.js';

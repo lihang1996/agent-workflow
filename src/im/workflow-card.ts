@@ -1,3 +1,20 @@
+/**
+ * 飞书工作流卡片构建器。
+ *
+ * 构建 Interactive Card JSON 2.0 格式的业务卡片（区别于 card.ts 的任务进度卡）：
+ * - buildApprovalCard()：高风险审批卡（批准/拒绝/重试按钮）
+ * - buildSpecConfirmationCard()：Spec 确认卡（确认/退回/发布按钮）
+ * - buildSpecReviewCard()：云文档 Spec 评审卡
+ * - buildSpecStatusCard()：Spec 状态查看卡
+ * - buildQuestionnaireCard()：结构化问卷卡（select_static/input）
+ * - buildStepBlockedActionCard()：阻塞步骤操作卡（重试/终止按钮 + blockVersion）
+ *
+ * 飞书卡片坑：
+ * - form_action_type: "submit" 必须放在按钮顶层
+ * - select_static 不能写 label
+ * - 阻塞卡必须带 blockVersion（= workflow.updatedAt）
+ */
+
 import { createHash } from 'node:crypto';
 import type { ApprovalRequest } from '../core/approval-store.js';
 import type { Questionnaire, Question } from '../core/questionnaire-store.js';
@@ -42,7 +59,9 @@ export function buildStepBlockedCard(options: {
         ? '资源授权完成后重试'
         : blockKind === 'gate-evidence'
           ? '修正证据后重试'
-          : '重试当前步骤';
+          : blockKind === 'orchestration'
+            ? '编排恢复后重试'
+            : '重试当前步骤';
   return {
     schema: '2.0',
     config: { update_multi: true, summary: { content: `流水线已阻塞：${options.stepTitle}` } },
@@ -175,6 +194,9 @@ function blockGuidance(
   }
   if (kind === 'gate-evidence') {
     return '**处理方式**：保持当前项目目录不变，补齐或重新生成本步骤的 Gate/artifact 证据后重试。';
+  }
+  if (kind === 'orchestration') {
+    return '**处理方式**：这是 CLI/模型编排层故障（配额耗尽、探活超时等），不是产品代码缺陷。等 Cursor/引擎恢复后再重试**当前步骤**，不要退回开发改代码。';
   }
   return '**处理方式**：保持当前项目目录不变，解决上面的前置条件后重试。';
 }

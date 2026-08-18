@@ -53,6 +53,7 @@ import { runCollabReview } from './collab-runner.js';
 import { canonicalSpecHasRiskWaivers, rewindStepIdFromDriftMessage } from '../core/quality-gates.js';
 import {
   findMisroutedEnvironmentBlock,
+  isOrchestrationFailureReason,
   requiresTestResourceAuthorization,
 } from '../core/step-result.js';
 import { assertManualWorkflowRetryAllowed } from '../core/workflow-store.js';
@@ -85,7 +86,53 @@ import {
   workdirFor,
 } from './sessions.js';
 
-/** 处理单条入站消息：命令或交给 CLI。 */
+/**
+ * ★ 消息路由 + 卡片按钮回调（项目最核心文件，1628 行）。
+ *
+ * 本文件包含两个核心导出函数：
+ *
+ * 1. handleMessage(ctx, msg, bot) — 飞书消息入口
+ *    职责：权限校验 → 解析命令 → 路由到对应处理逻辑
+ *    支持的命令：
+ *    - /help          → 帮助文本（CEO 和其他角色不同）
+ *    - /status        → 查看会话状态
+ *    - /workdir       → 查看/设置/清除话题项目目录
+ *    - /engine        → 统一切换话题引擎
+ *    - /form          → 渲染需求问卷卡片
+ *    - /spec          → 查看/发布产品 Spec
+ *    - /handoff       → 进程内任务交接
+ *    - /review        → 独立只读审查
+ *    - /pipeline      → CEO 启动团队流水线
+ *    - /squad         → 开发/CEO 启动内部交付小队
+ *    - /approval      → 发起高风险审批
+ *    - /schedule      → 创建/管理定时任务
+ *    - /reset         → 清理 CLI 上下文
+ *    - /reopen        → 重新打开已关闭会话
+ *    - /clean         → 删除已关闭会话
+ *    - /close         → 关闭当前会话
+ *    - /workflow      → 重试/终止工作流
+ *    - CEO 收自然语言 → 自动启动流水线
+ *    - 其他自然语言  → 普通聊天任务
+ *
+ * 2. handleCardAction(ctx, action) — 飞书卡片按钮回调
+ *    职责：处理卡片上的按钮点击
+ *    支持的 action：
+ *    - abort_task                 → 停止任务
+ *    - approve_high_risk          → 批准高风险操作
+ *    - reject_high_risk           → 拒绝高风险操作
+ *    - retry_high_risk            → 重试高风险操作
+ *    - confirm_spec               → 确认 Spec
+ *    - reject_spec                → 退回 Spec
+ *    - confirm_spec_start         → 确认 Spec 并直接开始交付
+ *    - publish_spec               → 发布 Spec 到飞书云文档
+ *    - approve_spec_review        → 批准 Spec 评审
+ *    - request_spec_changes       → 要求 Spec 修改
+ *    - submit_questionnaire       → 提交问卷答案
+ *    - retry_blocked_step         → 重试阻塞步骤
+ *    - retry_blocked_step_with_workdir → 带目录重试阻塞步骤
+ *    - authorize_test_resource_and_retry → 授权测试资源并重试
+ *    - abort_blocked_workflow     → 终止阻塞的流水线
+ */
 export async function handleMessage(
   ctx: AppContext,
   msg: IncomingMessage,
@@ -751,8 +798,13 @@ export async function handleMessage(
             return;
           }
           const stepName = restored.stepIds[restored.nextStepIndex] ?? '(结束)';
+          const misroutedEvidence = misrouted
+            ? [misrouted.reason, workflow.priorOutputs[`blocked_${misrouted.sourceStepId}`]].filter(Boolean).join('\n')
+            : '';
           const hint = misrouted
-            ? `（检测到环境阻塞曾被误转开发，已回到 ${misrouted.sourceStepId} 重试）`
+            ? isOrchestrationFailureReason(misroutedEvidence)
+              ? `（检测到 CLI 编排故障曾被误转开发，已回到 ${misrouted.sourceStepId} 重试）`
+              : `（检测到环境阻塞曾被误转开发，已回到 ${misrouted.sourceStepId} 重试）`
             : driftRewindTo
               ? `（检测到证据指纹漂移，已退回 ${driftRewindTo} 重建后再继续）`
               : '';
@@ -776,10 +828,13 @@ export async function handleMessage(
         try {
           const restored = await resumePausedOrOrphanedWorkflow(ctx, workflowId);
           const stepName = restored.stepIds[restored.nextStepIndex] ?? '(结束)';
+          const restoredHint = restored.nextStepIndex !== workflow.nextStepIndex
+            ? `（检测到编排/环境故障曾被误转，已回到 ${stepName} 重试）`
+            : '';
           try {
             await bot.reply(
               msg.messageId,
-              `流水线已从暂停恢复，正在从步骤 ${stepName} 继续…`,
+              `流水线已从暂停恢复，正在从步骤 ${stepName} 继续…${restoredHint}`,
               hasThread,
             );
           } catch (notifyError) {
@@ -986,7 +1041,12 @@ export async function handleMessage(
   });
 }
 
-/** 按角色生成 /help：CEO 强调统一入口，其他角色引导先找 CEO。 */
+/**
+ * 按角色生成 /help 帮助文本。
+ *
+ * CEO 的帮助文本强调统一入口（直接描述目标 → 自动启动流水线）。
+ * 其他角色引导先找 CEO。
+ */
 function buildHelpText(bot: Bot): string {
   if (bot.id === 'ceo') {
     return [
@@ -1024,7 +1084,18 @@ function buildHelpText(bot: Bot): string {
   ].join('\n');
 }
 
-/** 卡片「停止任务」按钮：仅发起人可停。 */
+/**
+ * ★ 飞书卡片按钮回调处理（停止任务/审批/Spec/问卷/阻塞重试）。
+ *
+ * 这是 message-handler 的第二大入口，由飞书 card.action.trigger 事件触发。
+ * 用户点击任务卡片上的按钮时调用。
+ *
+ * 返回 CardActionResponse：
+ * - toast：飞书提示气泡
+ * - card：更新原卡片为新状态
+ *
+ * 回调必须在 3 秒内返回（飞书超时限制），所以异步续跑用 fire-and-forget。
+ */
 export async function handleCardAction(
   ctx: AppContext,
   action: CardAction,

@@ -1,3 +1,19 @@
+/**
+ * 会话管理器：管理每个话题下每个角色的 CLI 会话状态机。
+ *
+ * 会话状态：creating → active → idle → closed
+ * - creating：刚创建还没开始跑 CLI
+ * - active：CLI 正在执行
+ * - idle：CLI 执行完，等待新任务
+ * - closed：用户 /close 关闭了，可 /reopen 恢复
+ *
+ * 会话隔离维度：botId + logicalRole + chatId + threadId
+ * 同一个 Bot 扮演不同逻辑角色时（如 qa 和 runtime_auditor），
+ * CLI 上下文完全隔离，不串线。
+ *
+ * 被 cli-task.ts、message-handler.ts、sessions.ts 调用。
+ */
+
 import { randomUUID } from 'node:crypto';
 import type { CliId } from '../cli/types.js';
 import type { SessionStore } from './session-store.js';

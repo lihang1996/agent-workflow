@@ -9,6 +9,25 @@ import type {
   CliRunStats,
 } from './types.js';
 
+/**
+ * Cursor Agent CLI 适配器。
+ *
+ * 负责构建 agent CLI 的命令行参数 + 解析其流式输出。
+ *
+ * Cursor 特有配置：
+ * - --force：无头模式落盘（YOLO，没有 PreToolUse hook 拦截）
+ * - --sandbox disabled：放行本机网络（普通/已审批任务）
+ * - --mode ask + --sandbox enabled：只读模式（独立 /review）
+ * - 所有角色固定 --model cursor-grok-4.6-high
+ * - CURSOR_MODEL=auto 或非 cursor-grok-4.6-high 的值会被忽略
+ * - MCP：隔离 overlay + --add-dir / --approve-mcps
+ * - 仅输入分析：cwd 和 --workspace 都改到仓库外隔离目录
+ *
+ * 事件解析（parseEvents）：
+ * 官方终态 result 会把多段 assistant 文本无换行粘在一起，
+ * 适配器必须自行缓存各段消息再拼，否则行首 [RESULT:done] / [APPROVED] 会失效。
+ * 不要开 --stream-partial-output。
+ */
 interface CursorEvent {
   type?: unknown;
   subtype?: unknown;

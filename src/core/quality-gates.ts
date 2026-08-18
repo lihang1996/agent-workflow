@@ -1,3 +1,30 @@
+/**
+ * 质量门禁核心逻辑（2800+ 行）。
+ *
+ * 定义了流水线中所有质量门禁的校验规则、Schema 和辅助函数。
+ * 被 pipeline-runner.ts 和 pipeline.ts 调用。
+ *
+ * 核心概念：
+ * - GATE_RESULT：步骤产出的门禁结果 JSON
+ *   { status: "pass"|"reject", findings: [...], gateChecks: [...], evidence: {...} }
+ * - GateFinding：发现的问题（P0/P1/P2）
+ *   { id, severity, category, status: "open"|"planned"|"resolved"|"waived", ... }
+ * - GateCheck：执行过的检查
+ *   { id, command: [argv], cwd, exitCode, required, status: "pass"|"fail"|"blocked", ... }
+ * - EvidenceChain v2：控制器拥有的证据链
+ *   { schemaVersion: "2.0", controllerOwned: true, ... }
+ * - FingerprintDriftError：源码指纹漂移（src/ 被改过）
+ *
+ * 关键校验函数：
+ * - assertGateLineage()：检查同 ID finding 不得在后续门禁偷偷降级
+ * - assertPlannedFindingsClosed()：planned P0/P1 必须以证据闭环
+ * - assertEvidenceChainComplete()：证据链完整性校验
+ * - assertFindingContinuity()：finding 状态连续性
+ * - assertGateAttemptBudget()：单 gate 最多 8 次 attempt
+ * - bindGateWaiversToCanonicalSpec()：waiver 绑定 canonical Spec
+ * - hashPathArtifact()：文件/目录 sha256 计算
+ */
+
 import { createHash, randomUUID } from 'node:crypto';
 import { lstat, readFile, realpath } from 'node:fs/promises';
 import { basename, isAbsolute, relative, resolve, sep } from 'node:path';

@@ -9,6 +9,24 @@ import type {
   CliRunStats,
 } from "./types.js";
 
+/**
+ * Claude Code CLI 适配器。
+ *
+ * 负责构建 claude CLI 的命令行参数 + 解析其 stream-json 输出。
+ *
+ * Claude 特有配置：
+ * - --mcp-config：加载提问 MCP（ask-server）
+ * - --permission-mode dontAsk：未预授权的 Write/Bash 直接拒绝
+ * - runtime settings：预授权工作区读写 + PreToolUse hook 高风险拦截
+ * - --output-format stream-json --verbose：流式输出
+ *
+ * 事件解析（parseEvents）：
+ * Claude 的 stream-json 每行是一个 JSON 对象，type 字段标识类型：
+ * - 'system' with subtype 'init'      → session_id
+ * - 'assistant'                       → AI 文本 + tool_use 块
+ * - 'user' with tool_result           → tool_end
+ * - 'result'                          → 最终结果 + usage 统计
+ */
 interface ClaudeEvent {
   type?: unknown;
   subtype?: unknown;

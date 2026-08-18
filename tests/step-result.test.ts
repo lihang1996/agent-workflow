@@ -13,9 +13,11 @@ import {
   resolveQualityHandoffTarget,
   resolveRejectedDecisionHandoff,
   isEnvironmentBlockReason,
+  isOrchestrationFailureReason,
   shouldAcceptArchitectFailedAsDone,
   shouldAutoCorrectDevEnvironmentBlock,
   shouldPauseAsEvidenceBlock,
+  shouldStayOnQualityStep,
   shouldTreatFailedResultAsDone,
 } from '../src/core/step-result.js';
 import { buildStepBlockedActionCard, buildStepBlockedCard } from '../src/im/workflow-card.js';
@@ -32,6 +34,14 @@ test('parseStepResult 只认显式标记，避免误判', () => {
     reason: '构建失败',
   });
   assert.equal(parseStepResult('[RESULT:done]').kind, 'done');
+  assert.deepEqual(
+    parseStepResult('[RESULT:done][GATE_RESULT] {"gateId":"design","status":"pass","artifacts":[{"sha256":"' + 'a'.repeat(64) + '"}]}'),
+    { kind: 'done' },
+  );
+  assert.deepEqual(
+    parseStepResult('[RESULT:blocked] 工作目录不可写 [GATE_RESULT] {"status":"blocked"}'),
+    { kind: 'blocked', reason: '工作目录不可写' },
+  );
 });
 
 test('流水线可区分兼容性默认 done 与真实显式终态', () => {
@@ -229,6 +239,35 @@ test('终审证据失败不得移交开发', () => {
   );
 });
 
+test('合格 GATE_RESULT 的 sha256 不得把 done 误判成证据阻塞', () => {
+  const passing = [
+    '技术方案已经落到 change-plan.json。',
+    '[RESULT:done]',
+    `[GATE_RESULT] {"gateId":"design","status":"pass","summary":"ok","requirementIds":["RQ-001"],"checks":[],"evidence":["/tmp/change-plan.json"],"artifacts":[{"path":"/tmp/change-plan.json","sha256":"${'a'.repeat(64)}","kind":"plan"}],"findings":[]}`,
+  ].join('\n');
+  const glued = `[RESULT:done][GATE_RESULT] {"gateId":"design","status":"pass","artifacts":[{"sha256":"${'b'.repeat(64)}"}]}`;
+  assert.equal(classifyStepBlockReason(passing), 'other');
+  assert.equal(shouldPauseAsEvidenceBlock('architect', '', passing), false);
+  assert.equal(shouldPauseAsEvidenceBlock('architect', glued, glued), false);
+  assert.equal(shouldPauseAsEvidenceBlock('dev', '', passing.replace('design', 'implementation')), false);
+  assert.equal(
+    classifyStepBlockReason('artifacts.1.sha256 与文件内容不匹配'),
+    'gate-evidence',
+  );
+  assert.equal(
+    shouldPauseAsEvidenceBlock('architect', 'sha256 不匹配', '[RESULT:blocked] sha256 不匹配'),
+    true,
+  );
+  assert.equal(
+    resolveQualityHandoffTarget(
+      'qa',
+      'Playwright 断言失败：按钮提交后没有显示成功状态',
+      `${passing}\n[RESULT:failed] 断言失败`,
+    ),
+    'dev',
+  );
+});
+
 test('运行时/QA 的代码缺陷应移交开发，目录问题不移交', () => {
   const rb = '运行时审计发现 P1：生产构建下 Auth.js UntrustedHost 导致 /api/auth/* 全部 500（FIND-RB-001）；需 implementation 修复 trustHost/AUTH_URL 后重跑本门禁';
   assert.equal(isEnvironmentBlockReason(rb), false);
@@ -274,6 +313,40 @@ test('运行时/QA 的代码缺陷应移交开发，目录问题不移交', () =
   assert.equal(findMisroutedEnvironmentBlock('dev', {
     quality_fix_request: `来源步骤：运行时审计（runtime_audit）\n缺陷摘要：${rb}`,
     blocked_runtime_audit: rb,
+  }), undefined);
+});
+
+test('CLI 编排故障不得当成质量缺陷退回开发', () => {
+  const pingTimeout = 'RetriableError: [unavailable] PING timed out';
+  const quota = 'RetriableError: [resource_exhausted] Error';
+  assert.equal(isOrchestrationFailureReason(pingTimeout), true);
+  assert.equal(isOrchestrationFailureReason(quota), true);
+  assert.equal(isOrchestrationFailureReason('FATAL database unavailable'), false);
+  assert.equal(classifyStepBlockReason(pingTimeout), 'orchestration');
+  assert.equal(classifyStepBlockReason(quota), 'orchestration');
+  assert.equal(shouldStayOnQualityStep(pingTimeout), true);
+  assert.equal(resolveQualityHandoffTarget('qa', pingTimeout), undefined);
+  assert.equal(resolveQualityHandoffTarget('qa', quota), undefined);
+  assert.equal(resolveQualityHandoffTarget('review', quota), undefined);
+  assert.equal(
+    resolveQualityHandoffTarget('qa', 'Playwright 用例已运行，断言失败：按钮提交后没有显示成功状态'),
+    'dev',
+  );
+
+  const misroutedFromDev = findMisroutedEnvironmentBlock('dev', {
+    quality_fix_request: `来源步骤：测试验收（qa）\n缺陷摘要：${quota}`,
+    blocked_qa: quota,
+  });
+  assert.deepEqual(misroutedFromDev, { sourceStepId: 'qa', reason: quota });
+
+  const misroutedFromReview = findMisroutedEnvironmentBlock('review', {
+    quality_fix_request: `来源步骤：测试验收（qa）\n缺陷摘要：${pingTimeout}`,
+    blocked_qa: pingTimeout,
+  });
+  assert.deepEqual(misroutedFromReview, { sourceStepId: 'qa', reason: pingTimeout });
+  assert.equal(findMisroutedEnvironmentBlock('qa', {
+    quality_fix_request: `来源步骤：测试验收（qa）\n缺陷摘要：${quota}`,
+    blocked_qa: quota,
   }), undefined);
 });
 
@@ -396,6 +469,26 @@ test('阻塞卡与任务卡使用橙色已阻塞样式', () => {
     'abort_blocked_workflow',
   ]);
   assert.match(resourceAuthorizationCard.body.elements[0].content, /预检仍会拒绝开发\/生产库/);
+
+  const orchestrationCard = buildStepBlockedCard({
+    workflowId: '00000000-0000-4000-8000-000000000001',
+    stepId: 'qa',
+    stepTitle: '测试验收',
+    reason: 'RetriableError: [resource_exhausted] Error',
+    blockVersion: '2025-01-01T00:00:00.000Z',
+  }) as any;
+  const orchestrationActions = orchestrationCard.body.elements
+    .filter((item: any) => item.tag === 'button')
+    .map((item: any) => ({
+      action: item.behaviors[0].value.action,
+      text: item.text.content,
+    }));
+  assert.deepEqual(orchestrationActions, [
+    { action: 'retry_blocked_step', text: '编排恢复后重试' },
+    { action: 'abort_blocked_workflow', text: '终止流水线' },
+  ]);
+  assert.match(orchestrationCard.body.elements[0].content, /不是产品代码缺陷/);
+  assert.doesNotMatch(orchestrationCard.body.elements[0].content, /建议目录|\/workdir/);
 
   const retryingCard = buildStepBlockedActionCard({
     stepTitle: '测试验收',

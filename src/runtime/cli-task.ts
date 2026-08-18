@@ -33,7 +33,30 @@ import {
 } from './active-runs.js';
 import { markSessionIdle, topicIdOf, truncate, workdirFor } from './sessions.js';
 
-/** 发卡 + 跑 CLI + 流式更新；支持完成后回调。 */
+/**
+ * ★ 发卡 + 跑 CLI + 流式更新 + 终态卡 + 回调。
+ *
+ * 这是 CLI 任务的完整生命周期管理，由 message-handler.ts 和 pipeline-runner.ts 调用。
+ *
+ * 执行流程：
+ * 1. 确认会话状态（非 active 才能启动）
+ * 2. 解析工作目录 + 创建 adapter + 发出「运行中」卡片
+ * 3. 创建 ActiveRun 对象并存入 ctx.activeRuns + 持久化快照
+ * 4. 可选：下载消息中的图片/文件到 data/downloads/
+ * 5. 启动心跳定时器（每 15s 推送进度卡片）
+ * 6. 调用 runCli() spawn CLI 子进程
+ * 7. CLI 完成后：解析 [RESULT:done|blocked|failed] → validateSuccess 门禁校验
+ * 8. 根据结果写终态卡（绿色成功/橙色阻塞/红色失败）
+ * 9. 调用 onSuccess/onFailure/afterSuccess 回调
+ * 10. 释放会话（markSessionIdle）+ 从 activeRuns 删除
+ *
+ * 关键设计决策：
+ * - 先发卡再落盘：缩短孤儿卡窗口（发卡后立刻 persist，之后才下载资源）
+ * - CLI exit 0 ≠ 成功：还要通过语义校验（RESULT 标记 + 门禁校验）才显绿色
+ * - onSuccess 在终态卡之前执行：确保语义校验通过后才显示成功
+ * - afterSuccess 在会话释放之后执行：适合启动下一流水线步骤
+ * - finally 块检查所有权：避免旧任务覆盖新任务的 active 状态
+ */
 export async function startCliTask(
   ctx: AppContext,
   options: {
@@ -263,6 +286,12 @@ export async function startCliTask(
   }, ctx.progressHeartbeatMs);
   activeRun.heartbeat.unref?.();
 
+  /**
+   * CLI 流式事件回调。
+   *
+   * 每当 CLI 子进程输出一行 stream-json，runner.ts 解析成 CliEvent 后回调此函数。
+   * 根据事件类型更新进度追踪器和飞书卡片。
+   */
   const onCliEvent = (event: CliEvent) => {
     activeRun.lastEventAt = Date.now();
     switch (event.type) {
@@ -315,6 +344,14 @@ export async function startCliTask(
     }
   };
 
+  /**
+   * 封装 runCli 调用，统一设置 adapter/cwd/signal/事件回调/环境变量。
+   *
+   * 传入 prompt 和可选的 sessionId（用于 resume 已有会话）。
+   * 被两处调用：
+   * 1. 首次执行（初始 taskPrompt）
+   * 2. 格式纠偏（buildProtocolFormatRepairPrompt）
+   */
   const runCliOnce = (prompt: string, sessionId?: string) => runCli({
     adapter,
     prompt,
@@ -340,6 +377,13 @@ export async function startCliTask(
     },
   });
 
+  /**
+   * 持久化 CLI 会话 ID 和上下文窗口 token 数。
+   *
+   * CLI 返回的 sessionId 用于后续 resume（避免每次从头开始）。
+   * contextWindowTokens 用于进度显示（如「已用 50K/200K」）。
+   * input-only 模式不持久化（一次性会话）。
+   */
   const persistCliSession = async (result: CliRunResult) => {
     if (
       executionPolicy !== 'input-only'
@@ -358,6 +402,19 @@ export async function startCliTask(
     }
   };
 
+  /**
+   * 评估 CLI 输出，解析 [RESULT] 标记 + 执行门禁校验。
+   *
+   * 三种结果：
+   * - 'done'    → 成功（如果有 validateSuccess 则先执行校验）
+   * - 'blocked' → 阻塞（目录/环境问题，等人处理）
+   * - 'failed'  → 失败（代码缺陷、门禁不通过）
+   *
+   * 特殊处理：
+   * - treatFailedResultAsDone：评审未通过时按完成继续（回传开发）
+   * - acceptFailedResultIfValidated：架构师误标 failed 但门禁可通过时纠正为 done
+   * - 缺少 RESULT 标记 → 抛错（格式纠偏）
+   */
   const evaluateCliOutput = async (answer: string): Promise<StepResult> => {
     // 仅流水线非 PM 步骤解析 RESULT 标记（resultProtocol=true 时）；
     // PM 产出的是 Spec 正文，普通聊天/handoff/定时/巡检也不解析，
@@ -397,6 +454,8 @@ export async function startCliTask(
     return stepResult;
   };
 
+  // ── 启动 CLI 执行 ──
+  // runCliOnce 返回 Promise<CliRunResult>，用 then/catch/finally 管理生命周期。
   void runCliOnce(taskPrompt, session.cliSessionId)
     .then(async (firstResult) => {
       let result = firstResult;
@@ -522,6 +581,7 @@ export async function startCliTask(
         `[CLI:${bot.id}/${adapter.id}] 完成 session_id=${result.sessionId ?? '(无)'} result=${stepResult.kind}`,
       );
     })
+    // ── catch：CLI 执行失败（子进程崩溃/超时/被取消）──
     .catch(async (error) => {
       if (activeRun.heartbeat) clearInterval(activeRun.heartbeat);
       if (controller.signal.aborted) {
@@ -561,6 +621,7 @@ export async function startCliTask(
       });
       await reportFailure(callbackError);
     })
+    // ── finally：无论如何都执行的收尾 ──
     .finally(async () => {
       if (activeRun.heartbeat) clearInterval(activeRun.heartbeat);
       const stillOwnsSession = ctx.activeRuns.get(session.id) === activeRun;
