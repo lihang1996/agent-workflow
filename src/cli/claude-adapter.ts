@@ -1,4 +1,9 @@
-import type { CliAdapter, CliEvent, CliRunStats } from './types.js';
+import { promptInputForPlatform } from './types.js';
+import type { CliAdapter, CliPromptInput, CliEvent, CliRunStats } from './types.js';
+import {
+  CLAUDE_CLARIFICATION_TOOL_NAME,
+  claudeAppToolArgs,
+} from './app-tools.js';
 
 interface ClaudeEvent {
   type?: unknown;
@@ -115,14 +120,15 @@ function parseStats(event: ClaudeEvent): CliRunStats | undefined {
     : undefined;
 }
 
-function outputArgs(prompt: string): string[] {
+function outputArgs(prompt: string, promptInput: CliPromptInput): string[] {
   return [
     '--dangerously-skip-permissions',
     '-p',
-    prompt,
+    ...(promptInput === 'argument' ? [prompt] : []),
     '--output-format',
     'stream-json',
     '--verbose',
+    ...claudeAppToolArgs(),
   ];
 }
 
@@ -131,12 +137,12 @@ export class ClaudeAdapter implements CliAdapter {
   readonly command = 'claude';
   readonly displayName = 'Claude Code';
 
-  buildArgs(prompt: string): string[] {
-    return outputArgs(prompt);
+  buildArgs(prompt: string, promptInput: CliPromptInput): string[] {
+    return outputArgs(prompt, promptInput);
   }
 
-  buildResumeArgs(prompt: string, sessionId: string): string[] {
-    return ['--resume', sessionId, ...outputArgs(prompt)];
+  buildResumeArgs(prompt: string, sessionId: string, promptInput: CliPromptInput): string[] {
+    return ['--resume', sessionId, ...outputArgs(prompt, promptInput)];
   }
 
   buildCompactPlan(sessionId: string, instructions?: string) {
@@ -146,7 +152,9 @@ export class ClaudeAdapter implements CliAdapter {
     return {
       protocol: 'claude-stream-json' as const,
       command: this.command,
-      args: this.buildResumeArgs(command, sessionId),
+      // 现在 prompt 走 stdin（`-p -`），runClaudeCompact 需要这份文本写入子进程。
+      prompt: command,
+      args: this.buildResumeArgs(command, sessionId, promptInputForPlatform(process.platform)),
     };
   }
 
@@ -181,13 +189,22 @@ export class ClaudeAdapter implements CliAdapter {
           || typeof block.name !== 'string'
         ) return [];
         const detail = toolDetail(block.name, block.input);
-        return [{
+        const events: CliEvent[] = [{
           type: 'tool_start',
           toolUseId: block.id,
           toolName: block.name,
           label: TOOL_LABELS[block.name] ?? `调用 ${block.name}`,
           ...(detail ? { detail } : {}),
         }];
+        if (block.name === CLAUDE_CLARIFICATION_TOOL_NAME) {
+          events.push({
+            type: 'tool_call',
+            toolUseId: block.id,
+            toolName: 'request_clarification',
+            input: block.input,
+          });
+        }
+        return events;
       });
       return [...contextEvent, ...toolEvents];
     }
