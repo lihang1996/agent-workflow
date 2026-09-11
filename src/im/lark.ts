@@ -2,6 +2,7 @@
  * 飞书接入：WS 长连接收消息 + REST 回消息。
  */
 import * as Lark from '@larksuiteoapi/node-sdk';
+import { assertLarkSuccess, requireMessageId } from './api-response.js';
 import { mkdir } from 'node:fs/promises';
 import { extname, join } from 'node:path';
 import { parseMentions, type Mention } from './message-parser.js';
@@ -97,6 +98,7 @@ export interface Bot {
     messageId: string,
     text: string,
     replyInThread?: boolean,
+    uuid?: string,
   ) => Promise<string | undefined>;
   replyCard: (
     messageId: string,
@@ -243,12 +245,14 @@ export function startBot(opts: BotOptions): Bot {
       return fetchBotIdentity(client);
     },
 
-    async reply(messageId, text, replyInThread = false) {
+    async reply(messageId, text, replyInThread = false, uuid) {
       let lastMessageId: string | undefined;
+      let part = 0;
       for (const chunk of splitLongText(text)) {
         const res = await client.im.v1.message.reply({
           path: { message_id: messageId },
           data: {
+            ...(uuid ? { uuid: `${uuid}-${part++}` } : {}),
             msg_type: 'text',
             content: JSON.stringify({
               text: chunk,
@@ -256,8 +260,7 @@ export function startBot(opts: BotOptions): Bot {
             ...(replyInThread ? { reply_in_thread: true } : {}),
           },
         });
-        if (res.code) throw new Error(res.msg || '发送消息失败');
-        lastMessageId = res.data?.message_id;
+        lastMessageId = requireMessageId(res, '发送消息');
       }
       return lastMessageId;
     },
@@ -272,7 +275,7 @@ export function startBot(opts: BotOptions): Bot {
           ...(replyInThread ? { reply_in_thread: true } : {}),
         },
       });
-      return res.data?.message_id;
+      return requireMessageId(res, '发送卡片或提及');
     },
 
     async replyMention(messageId, target, text, replyInThread = false, uuid) {
@@ -285,14 +288,15 @@ export function startBot(opts: BotOptions): Bot {
           ...(replyInThread ? { reply_in_thread: true } : {}),
         },
       });
-      return res.data?.message_id;
+      return requireMessageId(res, '发送卡片或提及');
     },
 
     async updateCard(messageId, card) {
-      await client.im.v1.message.patch({
+      const response = await client.im.v1.message.patch({
         path: { message_id: messageId },
         data: { content: JSON.stringify(card) },
       });
+      assertLarkSuccess(response, '更新卡片');
     },
 
     async subscribeToDocumentComments() {

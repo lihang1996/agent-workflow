@@ -1,3 +1,5 @@
+import { beginTask } from './task-lifecycle.js';
+import { canManageSession, flowMatchesSession } from './session-guard.js';
 import type { CardAction, CardActionResponse } from '../im/lark.js';
 import {
   buildClarificationCard,
@@ -35,7 +37,7 @@ export function createCardActionHandler(options: {
       if (!flow || flow.botId !== config.id || !action.messageId) {
         return { toast: { type: 'error', content: '这份产品方案已经失效。' } };
       }
-      if (flow.status === 'expired') {
+      if (flow.status === 'expired' || (flow.status === 'pending' && !flowMatchesSession(flow, runtime.sessions.get(flow.sessionId)))) {
         return {
           toast: { type: 'warning', content: '这份产品方案已经失效。' },
           card: {
@@ -90,7 +92,7 @@ export function createCardActionHandler(options: {
       }
 
       const currentSession = runtime.sessions.get(flow.sessionId);
-      if (!currentSession || currentSession.status === 'closed') {
+      if (!currentSession || !flowMatchesSession(flow, currentSession)) {
         return { toast: { type: 'error', content: '对应的 CLI 会话已经失效。' } };
       }
       if (currentSession.status === 'active') {
@@ -163,14 +165,7 @@ export function createCardActionHandler(options: {
       }
 
       try {
-        await runtime.sessions.transition(session.id, 'active');
-        const run = new AbortController();
-        runtime.activeRuns.set(session.id, {
-          controller: run,
-          ownerOpenId: answered.flow.ownerOpenId,
-          ownerUnionId: answered.flow.ownerUnionId,
-          ownerBotId: answered.flow.ownerBotId,
-        });
+        const run = await beginTask(runtime, session.id, answered.flow, answered.flow.sessionVersion ?? 0);
         // Keep the answered flow durable until its continuation succeeds.
         queueMicrotask(() => {
           void (options.continueFlow ?? continueClarificationFlow)({
@@ -211,14 +206,20 @@ export function createCardActionHandler(options: {
       if (!session || session.botId !== config.id || !cliSessionId) {
         return { toast: { type: 'error', content: '这条会话记录已经失效。' } };
       }
+      if (!canManageSession(runtime, session.id, { ...action, operatorBotId: config.id })) {
+        return { toast: { type: 'warning', content: '只有任务发起人可以切换会话。' } };
+      }
       if (session.status === 'active') {
         return { toast: { type: 'warning', content: '当前任务结束后才能切换会话。' } };
       }
       if (session.status === 'closed') {
         return { toast: { type: 'warning', content: '当前话题的会话已经关闭。' } };
       }
+      const cliAdapter = getCliAdapter(session.cliId);
+      if (cliAdapter.id === 'cursor') {
+        return { toast: { type: 'error', content: `${cliAdapter.displayName} 暂不支持此操作` } };
+      }
       try {
-        const cliAdapter = getCliAdapter(session.cliId);
         const nativeSessions = await listNativeCliSessions({
           adapter: cliAdapter,
           cwd: session.workspaceDir,
@@ -228,7 +229,12 @@ export function createCardActionHandler(options: {
             toast: { type: 'error', content: '这个 CLI 会话已经不在当前工作目录中。' },
           };
         }
-        const updated = await runtime.sessions.setCliSessionId(
+        const current = runtime.sessions.get(session.id);
+        if (!current || (current.version ?? 0) !== (session.version ?? 0)
+          || !canManageSession(runtime, session.id, { ...action, operatorBotId: config.id })) {
+          throw new Error('会话已变化，请重新选择');
+        }
+        const updated = await runtime.sessions.selectCliSessionId(
           session.id,
           cliSessionId,
         );

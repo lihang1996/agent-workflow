@@ -1,7 +1,11 @@
 import { z } from 'zod';
 import { readJsonState, writeJsonState } from './json-state.js';
 
+export type CollaborationStatus = 'pending' | 'received' | 'running' | 'completed' | 'failed' | 'interrupted';
+
 export interface CollaborationMessage {
+  status?: CollaborationStatus;
+  executionSessionId?: string;
   dispatchId: string;
   taskId: string;
   ownerOpenId: string;
@@ -84,7 +88,7 @@ export function buildCollaborationPrompt(
     message.expectedOutput
       ? `期望产出：${message.expectedOutput}`
       : '',
-    `完成后，把结果交回 ${message.reportToBotId} 继续组织后续工作；已经可以交付时，明确给出最终结论。`,
+    '完成后直接向用户交付结果，不再回传给派发方。',
   ].filter(Boolean).join('\n\n');
 }
 
@@ -94,6 +98,8 @@ export function collaborationTurnKey(message: CollaborationMessage): string {
 }
 
 const PersistedCollaborationSchema = z.object({
+  status: z.enum(['pending', 'received', 'running', 'completed', 'failed', 'interrupted']).default('pending'),
+  executionSessionId: z.string().optional(),
   dispatchId: z.string().regex(/^[a-f0-9]{12}$/), taskId: z.string(),
   ownerOpenId: z.string(), ownerUnionId: z.string().optional(), ownerBotId: z.string().optional(),
   fromBotId: z.string(), toBotId: z.string(), reportToBotId: z.string(),
@@ -110,7 +116,9 @@ export class CollaborationInbox {
     const state = readJsonState(filePath);
     if (state === undefined) return;
     const parsed = z.object({ pending: z.array(PersistedCollaborationSchema), consumed: z.array(z.string()) }).parse(state);
-    for (const message of parsed.pending) this.messages.set(message.dispatchId, message);
+    for (const message of parsed.pending) this.messages.set(message.dispatchId, {
+      ...message, status: message.status === 'received' ? 'pending' : message.status === 'running' ? 'interrupted' : message.status,
+    });
     for (const id of parsed.consumed.slice(-10000)) this.consumed.add(id);
   }
   private mutate<T>(operation: () => T): T {
@@ -129,26 +137,54 @@ export class CollaborationInbox {
   }
   register(message: CollaborationMessage): void {
     if (this.consumed.has(message.dispatchId) || this.messages.has(message.dispatchId)) return;
-    if (this.messages.size >= 1000) throw new Error('待派发队列已满，请先恢复失败的协作任务');
-    this.mutate(() => this.messages.set(message.dispatchId, structuredClone(message)));
+    if ([...this.messages.values()].filter((m) => !['completed', 'failed'].includes(m.status ?? 'pending')).length >= 1000) throw new Error('待派发队列已满，请先恢复失败的协作任务');
+    this.mutate(() => this.messages.set(message.dispatchId, { ...structuredClone(message), status: 'pending' }));
   }
   update(message: CollaborationMessage): void {
-    if (this.messages.has(message.dispatchId)) this.mutate(() => this.messages.set(message.dispatchId, structuredClone(message)));
+    if (this.messages.get(message.dispatchId)?.status === 'pending') this.mutate(() => this.messages.set(message.dispatchId, { ...structuredClone(message), status: 'pending' }));
   }
   hasConsumed(dispatchId: string): boolean { return this.consumed.has(dispatchId); }
-  pending(): CollaborationMessage[] { return structuredClone([...this.messages.values()]); }
+  pending(): CollaborationMessage[] { return structuredClone([...this.messages.values()].filter((m) => m.status === 'pending')); }
+  interrupted(): CollaborationMessage[] { return structuredClone([...this.messages.values()].filter((m) => m.status === 'interrupted')); }
+  get(dispatchId: string): CollaborationMessage | undefined { return structuredClone(this.messages.get(dispatchId)); }
   peek(dispatchId: string, toBotId: string): CollaborationMessage | undefined {
     const message = this.messages.get(dispatchId);
-    return message?.toBotId === toBotId ? structuredClone(message) : undefined;
+    return message?.toBotId === toBotId && message.status === 'pending' ? structuredClone(message) : undefined;
   }
-  consume(dispatchId: string, toBotId: string): CollaborationMessage | undefined {
+  acquire(dispatchId: string, toBotId: string, sessionId?: string): CollaborationMessage | undefined {
     const message = this.peek(dispatchId, toBotId);
     if (!message) return undefined;
     return this.mutate(() => {
-      this.messages.delete(dispatchId);
-      this.consumed.add(dispatchId);
-      if (this.consumed.size > 10000) this.consumed.delete(this.consumed.values().next().value!);
+      this.messages.set(dispatchId, { ...message, status: 'received', executionSessionId: sessionId });
       return message;
     });
+  }
+  release(dispatchId: string): void {
+    const message = this.messages.get(dispatchId);
+    if (message?.status === 'received') this.mutate(() => this.messages.set(dispatchId, { ...message, status: 'pending' }));
+  }
+  beginExecution(dispatchId: string): void {
+    const message = this.messages.get(dispatchId);
+    if (message?.status !== 'received') throw new Error('协作任务未被当前执行流程接收');
+    this.mutate(() => {
+      this.messages.set(dispatchId, { ...message, status: 'running' });
+      this.consumed.add(dispatchId);
+      if (this.consumed.size > 10000) this.consumed.delete(this.consumed.values().next().value!);
+    });
+  }
+  finish(dispatchId: string, success: boolean): void {
+    const message = this.messages.get(dispatchId);
+    if (message?.status !== 'running') return;
+    this.mutate(() => {
+      this.messages.set(dispatchId, { ...message, status: success ? 'completed' : 'failed' });
+      const terminal = [...this.messages.values()].filter((m) => m.status === 'completed' || m.status === 'failed');
+      for (const old of terminal.slice(0, Math.max(0, terminal.length - 1000))) this.messages.delete(old.dispatchId);
+    });
+  }
+  /** Compatibility for callers that have already reached the execution boundary. */
+  consume(dispatchId: string, toBotId: string): CollaborationMessage | undefined {
+    const message = this.acquire(dispatchId, toBotId);
+    if (message) this.beginExecution(dispatchId);
+    return message;
   }
 }

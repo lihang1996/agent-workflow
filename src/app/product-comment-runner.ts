@@ -1,8 +1,11 @@
+import { beginTask, releaseTask, executeTask } from './task-lifecycle.js';
+import { flowMatchesSession } from './session-guard.js';
+import { deliveryOutbox } from './result-delivery.js';
 import { getCliAdapter } from '../cli/registry.js';
 import { isProductSpecOwner, type ProductSpecFlow } from '../core/product-spec.js';
 import type { Bot, IncomingDocumentComment } from '../im/lark.js';
 import { executeCli } from './cli-execution.js';
-import { markSessionIdle } from './session-view.js';
+
 import type { AppRuntime } from './runtime.js';
 
 export async function runProductDocumentComment(options: {
@@ -16,7 +19,7 @@ export async function runProductDocumentComment(options: {
   if (runtime.productSpecFlows.get(flow.token)?.status !== 'pending') throw new Error('产品方案已确认或失效，不能再修改');
   if (!isProductSpecOwner(flow, { operatorOpenId: comment.senderOpenId, operatorUnionId: comment.senderUnionId, operatorBotId: flow.botId })) throw new Error('只有任务发起人可以请求修改');
   const session = runtime.sessions.get(flow.sessionId);
-  if (!session || session.status === 'closed') {
+  if (!session || !flowMatchesSession(flow, session)) {
     throw new Error('评论对应的产品会话已经失效');
   }
   if (session.status !== 'idle') {
@@ -26,41 +29,30 @@ export async function runProductDocumentComment(options: {
     throw new Error('评论对应的产品 CLI 会话不存在');
   }
 
-  const run = new AbortController();
-  await runtime.sessions.transition(session.id, 'active');
-  runtime.activeRuns.set(session.id, {
-    controller: run,
-    ownerOpenId: flow.ownerOpenId,
-    ownerUnionId: flow.ownerUnionId,
-    ownerBotId: flow.ownerBotId,
-  });
+  const run = await beginTask(runtime, session.id, flow, flow.sessionVersion ?? 0);
 
   try {
     const adapter = getCliAdapter(session.cliId);
-    const result = await (options.execute ?? executeCli)(
+    const result = await executeTask({ runtime, id: commentExecutionId(flow.botId, comment), sessionId: session.id, botId: flow.botId,
+      execute: () => (options.execute ?? executeCli)(
       adapter,
       documentCommentPrompt(flow, comment),
       session.workspaceDir,
       session.cliSessionId,
       run.signal,
       () => undefined,
-    );
-    if (result.sessionId) {
-      await runtime.sessions.setCliSessionId(session.id, result.sessionId);
-    }
-    if (result.stats?.contextWindowTokens) {
-      runtime.contextWindows.set(session.id, result.stats.contextWindowTokens);
-    }
-    await bot.replyToDocumentComment(
-      comment,
-      result.answer || '已按评论更新原文档，请复查。',
-    );
+     ) });
+    await deliveryOutbox(runtime, flow.botId, bot).submit({
+      id: `reply:${commentExecutionId(flow.botId, comment)}`, botId: flow.botId, sessionId: session.id,
+      operations: [{ type: 'comment', comment, text: result.answer || '已按评论更新原文档，请复查。' }],
+    });
   } finally {
-    if (runtime.activeRuns.get(session.id)?.controller === run) {
-      runtime.activeRuns.delete(session.id);
-      await markSessionIdle(runtime.sessions, session.id);
-    }
+    await releaseTask(runtime, session.id, run);
   }
+}
+
+export function commentExecutionId(botId: string, comment: IncomingDocumentComment): string {
+  return `comment:${botId}:${comment.fileToken}:${comment.commentId}:${comment.replyId}:${comment.eventId}`;
 }
 
 function documentCommentPrompt(

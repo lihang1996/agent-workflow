@@ -1,3 +1,4 @@
+import { flowMatchesSession } from './session-guard.js';
 import type { BotConfig } from '../core/bot-registry.js';
 import { isProductSpecOwner } from '../core/product-spec.js';
 import type { Bot, IncomingDocumentComment } from '../im/lark.js';
@@ -12,7 +13,7 @@ export class ProductCommentScheduler {
   schedule(config: BotConfig, bot: Bot, comment: IncomingDocumentComment): void {
     if (!comment.mentionedBot) return;
     const flow = this.runtime.productSpecFlows.findPendingByDocument(config.id, comment.fileToken);
-    if (!flow || !isProductSpecOwner(flow, {
+    if (!flow || !flowMatchesSession(flow, this.runtime.sessions.get(flow.sessionId)) || !isProductSpecOwner(flow, {
       operatorOpenId: comment.senderOpenId, operatorUnionId: comment.senderUnionId, operatorBotId: config.id,
     })) return;
     const key = `${config.id}:${comment.eventId || [comment.fileToken, comment.commentId, comment.replyId].join(':')}`;

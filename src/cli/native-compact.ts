@@ -250,6 +250,9 @@ function runCodexCompact(
 export function compactCliSession(
   options: CompactCliSessionOptions,
 ): Promise<CompactCliSessionResult> {
+  if (!options.adapter.buildCompactPlan) {
+    return Promise.reject(new Error(`${options.adapter.displayName} 暂不支持此操作`));
+  }
   const plan = options.adapter.buildCompactPlan(
     options.sessionId,
     options.instructions,

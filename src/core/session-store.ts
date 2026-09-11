@@ -1,6 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { z } from 'zod';
+import { CLI_IDS } from '../cli/types.js';
 import type { Session } from './session-manager.js';
 
 export interface SessionStore {
@@ -9,11 +10,13 @@ export interface SessionStore {
 }
 
 const SessionSchema = z.object({
+  version: z.number().int().nonnegative().default(0),
+  owner: z.object({ ownerOpenId: z.string(), ownerUnionId: z.string().optional(), ownerBotId: z.string().optional() }).optional(),
   id: z.string().min(1),
   botId: z.string().min(1),
   threadId: z.string().min(1),
   chatId: z.string().min(1),
-  cliId: z.enum(['claude', 'codex']),
+  cliId: z.enum(CLI_IDS),
   cliSessionId: z.string().min(1).optional(),
   workspaceDir: z.string().min(1),
   status: z.enum(['creating', 'active', 'idle', 'closed']),

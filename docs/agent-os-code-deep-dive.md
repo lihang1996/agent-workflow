@@ -1,5 +1,7 @@
 # Agent OS 源码导读（初学者版）：跟着一条飞书消息看懂整个项目
 
+> 历史资料：本文保留当时的代码快照用于学习，不作为当前配置或运行指南。当前版本已将消息用例移至 `src/app/message-handler.ts`，统一执行生命周期与结果补发；产品确认不再回传 Leader。最新行为、迁移和验证请阅读 [可靠性与迁移](reliability-and-migration.md) 与 [回归报告](workflow-regression-report.md)。
+
 > 基线说明：本文按 2026-08-27 的工作区快照撰写，对应 Git commit `150e49e1e0a63aa98130221953f78439a3207284` 及当时未提交改动。这个快照不是干净、可编译的发布基线：`src/index.ts` 创建澄清 flow 时传入了 `collaboration`，而 `CreateClarificationFlowOptions` 没有该字段，`pnpm exec tsc --noEmit` 与 `pnpm build` 均失败。本文解释的是当前代码表达的设计和能够静态确认的控制流，不把该错误包装成已通过；完整命令与影响见独立验证报告。
 
 > 阅读前只需要会 TypeScript 的接口、联合类型、`Map`、ESM import、`async/await`、事件回调和 JSON。第一次遇到 NDJSON、MCP、飞书话题与 `AbortSignal` 时，正文会就地解释。示例中的身份、会话、文档地址和工作目录均为占位内容。

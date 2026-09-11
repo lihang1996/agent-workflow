@@ -53,6 +53,7 @@ export interface ProductSpecFlow {
   taskId: string;
   botId: string;
   sessionId: string;
+  sessionVersion?: number;
   ownerOpenId: string;
   ownerUnionId?: string;
   ownerBotId?: string;
@@ -67,6 +68,7 @@ export interface CreateProductSpecFlowOptions {
   taskId: string;
   botId: string;
   sessionId: string;
+  sessionVersion?: number;
   ownerOpenId: string;
   ownerUnionId?: string;
   ownerBotId?: string;
@@ -149,6 +151,10 @@ export class ProductSpecFlowStore {
 
   get(token: string): ProductSpecFlow | undefined {
     return this.flows.get(token);
+  }
+
+  forSession(sessionId: string): ProductSpecFlow[] {
+    return [...this.flows.values()].filter((flow) => flow.sessionId === sessionId && flow.status === 'pending');
   }
 
   findPendingByDocument(

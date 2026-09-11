@@ -3,6 +3,7 @@ import { promptInputForPlatform } from './types.js';
 import { createInterface } from 'node:readline';
 import type { CliAdapter, CliAttachment, CliEvent, CliRunResult } from './types.js';
 import { assertAppToolAllowed, validateAppToolCalls } from '../core/app-tool-policy.js';
+import { ensureCursorAppToolsConfig } from './app-tools.js';
 
 const DEFAULT_TIMEOUT_MS = 50 * 60 * 1000;
 
@@ -18,6 +19,13 @@ export interface RunCliOptions {
 }
 
 export function runCli(options: RunCliOptions): Promise<CliRunResult> {
+  if (options.adapter.id === 'cursor') {
+    return ensureCursorAppToolsConfig().then(() => executeRun(options));
+  }
+  return executeRun(options);
+}
+
+function executeRun(options: RunCliOptions): Promise<CliRunResult> {
   const {
     adapter,
     prompt,
@@ -37,10 +45,12 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
 
   return new Promise((resolve, reject) => {
     // 固定用 `['pipe','pipe','pipe']`，让 stdin 始终可写（spawnCli 返回类型按字面量收窄）。
+    const env = adapter.buildEnv?.();
     const child = spawnCli(adapter.command, args, {
       cwd,
       signal,
       stdio: ['pipe', 'pipe', 'pipe'],
+      ...(env ? { env: { ...process.env, ...env } } : {}),
     });
     // stdin 模式下把 prompt 写入子进程；否则 prompt 已在命令行参数里，stdin 直接收口。
     if (child.stdin) {

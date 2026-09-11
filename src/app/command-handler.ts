@@ -1,3 +1,4 @@
+import { canManageSession } from './session-guard.js';
 import type { Bot, IncomingMessage } from "../im/lark.js";
 import {
   buildResumeCard,
@@ -44,6 +45,13 @@ export async function handleSessionCommand(options: {
     hasThread,
   } = options;
 
+  const operator = { operatorOpenId: msg.senderOpenId, operatorUnionId: msg.senderUnionId, operatorBotId: config.id };
+  const mutatesSession = command && (['new', 'resume', 'compact', 'close'].includes(command.name) || (command.name === 'cd' && !!command.path));
+  if (mutatesSession && !canManageSession(runtime, session.id, operator)) {
+    await bot.reply(msg.messageId, '只有任务发起人可以修改或关闭当前会话。', hasThread);
+    return 'handled';
+  }
+
   if (!isNew && cliRequest && cliRequest.cliId !== session.cliId) {
     await bot.reply(
       msg.messageId,
@@ -68,6 +76,7 @@ export async function handleSessionCommand(options: {
         "/help 查看命令",
         "/claude <任务> 新话题使用 Claude Code",
         "/codex <任务> 新话题使用 Codex",
+        "/cursor <任务> 新话题使用 Cursor",
       ].join("\n"),
       hasThread,
     );
@@ -127,6 +136,14 @@ export async function handleSessionCommand(options: {
       await bot.reply(msg.messageId, "当前话题的会话已经关闭。", hasThread);
       return "handled";
     }
+    if (cliAdapter.id === 'cursor') {
+      await bot.reply(
+        msg.messageId,
+        `${cliAdapter.displayName} 暂不支持此操作`,
+        hasThread,
+      );
+      return "handled";
+    }
     try {
       const nativeSessions = await listNativeCliSessions({
         adapter: cliAdapter,
@@ -173,13 +190,24 @@ export async function handleSessionCommand(options: {
       );
       return "handled";
     }
+    if (!cliAdapter.buildCompactPlan) {
+      await bot.reply(
+        msg.messageId,
+        `${cliAdapter.displayName} 暂不支持此操作`,
+        hasThread,
+      );
+      return "handled";
+    }
     return "continue";
   }
 
   if (command?.name === "status") {
     await bot.reply(
       msg.messageId,
-      formatSessionStatus(session, config.id),
+      [formatSessionStatus(session, config.id),
+        `最近执行：${runtime.taskExecutions?.forSession(session.id)?.status ?? '(无记录)'}`,
+        `待补发结果：${runtime.deliveries?.pending(session.id) ?? 0}`,
+      ].join('\n'),
       hasThread,
     );
     return "handled";
@@ -209,6 +237,8 @@ export async function handleSessionCommand(options: {
       );
       await ensureWorkspaceDirectory(workspaceDir);
       const changed = workspaceDir !== session.workspaceDir;
+      if (!canManageSession(runtime, session.id, operator)) throw new Error('任务归属已变化，请重新操作');
+      if ((runtime.sessions.get(session.id)?.version ?? 0) !== (session.version ?? 0)) throw new Error('工作目录已变化，请重新操作');
       await runtime.sessions.setWorkspaceDir(session.id, workspaceDir);
       await bot.reply(
         msg.messageId,

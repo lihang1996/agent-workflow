@@ -47,7 +47,7 @@ function receiver() {
   };
 }
 
-test('a new dispatch in the same topic executes and reports back after an earlier task', () => {
+test('a new dispatch in the same topic executes after an earlier task', () => {
   const nextTaskId = topicTaskId({
     chatId: 'chat-same-topic',
     threadId: 'thread-same-topic',
@@ -73,7 +73,7 @@ test('a new dispatch in the same topic executes and reports back after an earlie
     runtime.inbox.register(message);
     runtime.receive(message.dispatchId, message.toBotId);
   }
-  assert.deepEqual(runtime.accepted, messages);
+  assert.deepEqual(runtime.accepted, messages.map((message) => ({ ...message, status: 'pending' })));
 });
 
 test('duplicate delivery of one dispatch is accepted only once, including re-registration', () => {
@@ -84,5 +84,5 @@ test('duplicate delivery of one dispatch is accepted only once, including re-reg
   // Even if the same dispatch is registered again, the processed guard holds.
   runtime.inbox.register({ ...initial });
   runtime.receive(initial.dispatchId, initial.toBotId);
-  assert.deepEqual(runtime.accepted, [initial]);
+  assert.deepEqual(runtime.accepted, [{ ...initial, status: 'pending' }]);
 });

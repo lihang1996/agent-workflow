@@ -1,24 +1,15 @@
+import { releaseTask, executeTask, executionStore } from './task-lifecycle.js';
+import { createTaskCardUpdater, deliveryOutbox } from './result-delivery.js';
+import { flowMatchesSession } from './session-guard.js';
 import type { Bot } from '../im/lark.js';
-import {
-  answerContinuation,
-  answerNeedsContinuation,
-  buildClarificationCard,
-  buildProductSpecApprovalCard,
-  buildTaskCard,
-  splitLongText,
-  ThrottledCardUpdater,
-} from '../im/card.js';
+import { answerContinuation, answerNeedsContinuation, buildClarificationCard, buildProductSpecApprovalCard, buildTaskCard, splitLongText } from '../im/card.js';
 import { buildBotPrompt, type BotConfig } from '../core/bot-registry.js';
-import {
-  findClarificationRequest,
-  formatClarificationAnswers,
-  type ClarificationFlow,
-} from '../core/clarification.js';
+import { findClarificationRequest, formatClarificationAnswers, type ClarificationFlow } from '../core/clarification.js';
 import { TaskProgressTracker } from '../core/task-progress.js';
 import { getCliAdapter } from '../cli/registry.js';
 import { executeCli } from './cli-execution.js';
 import { sendResultNotification } from './notification-service.js';
-import { markSessionIdle } from './session-view.js';
+
 import type { AppRuntime } from './runtime.js';
 import { assertProductSpecDocuments } from './product-spec-documents.js';
 import { findProductSpecRequest } from '../core/product-spec.js';
@@ -38,17 +29,14 @@ export async function continueClarificationFlow(options: {
   try {
     await executeClarification(options);
   } finally {
-    if (runtime.activeRuns.get(flow.sessionId)?.controller === run) {
-      runtime.activeRuns.delete(flow.sessionId);
-      await markSessionIdle(runtime.sessions, flow.sessionId);
-    }
+    await releaseTask(runtime, flow.sessionId, run);
   }
 }
 
 async function executeClarification(options: Parameters<typeof continueClarificationFlow>[0]): Promise<void> {
   const { bot, config, flow, run, runtime, defaultDeliveryMode } = options;
   const session = runtime.sessions.get(flow.sessionId);
-  if (!session) throw new Error('需求澄清对应的会话已经失效');
+  if (!session || !flowMatchesSession(flow, session)) throw new Error('需求澄清对应的会话已经失效');
 
   const adapter = getCliAdapter(session.cliId, runtime.teamRegistry.appToolsFor(config.id));
   const progress = new TaskProgressTracker(
@@ -71,9 +59,8 @@ async function executeClarification(options: Parameters<typeof continueClarifica
     throw new Error('飞书没有返回需求整理进度卡片的 message_id');
   }
 
-  const cardUpdater = new ThrottledCardUpdater((card) =>
-    bot.updateCard(progressCardMessageId, card)
-  );
+  const cardUpdater = createTaskCardUpdater({ runtime, bot, botId: config.id, sessionId: session.id,
+    cardId: progressCardMessageId, replyToMessageId: flow.originalMessageId, replyInThread: flow.replyInThread });
   const renderProgress = () => {
     const snapshot = progress.snapshot();
     cardUpdater.push(buildTaskCard({
@@ -88,7 +75,8 @@ async function executeClarification(options: Parameters<typeof continueClarifica
   heartbeat.unref();
 
   try {
-    const result = await (options.execute ?? executeCli)(
+    const result = await executeTask({ runtime, id: `clarification:${flow.token}`, sessionId: session.id, botId: config.id,
+      execute: () => (options.execute ?? executeCli)(
       adapter,
       buildBotPrompt(config, formatClarificationAnswers(flow), runtime.teamRegistry.contextFor(config.id), defaultDeliveryMode),
       session.workspaceDir,
@@ -103,15 +91,8 @@ async function executeClarification(options: Parameters<typeof continueClarifica
         progress.accept(event);
         renderProgress();
       },
-    );
+     ) });
     clearInterval(heartbeat);
-    if (result.sessionId) {
-      await runtime.sessions.setCliSessionId(session.id, result.sessionId);
-    }
-    if (result.stats?.contextWindowTokens) {
-      runtime.contextWindows.set(session.id, result.stats.contextWindowTokens);
-    }
-
     const nextRequest = adapter.appTools.includes('request_clarification')
       ? findClarificationRequest(result.toolCalls)
       : undefined;
@@ -120,6 +101,7 @@ async function executeClarification(options: Parameters<typeof continueClarifica
         taskId: flow.taskId,
         botId: config.id,
         sessionId: session.id,
+        sessionVersion: session.version ?? 0,
         ownerOpenId: flow.ownerOpenId,
         ownerUnionId: flow.ownerUnionId,
         ownerBotId: flow.ownerBotId,
@@ -129,8 +111,9 @@ async function executeClarification(options: Parameters<typeof continueClarifica
         replyInThread: flow.replyInThread,
         request: nextRequest,
       });
-      await cardUpdater.finish(buildClarificationCard({ flow: nextFlow }));
+      await cardUpdater.finish(buildClarificationCard({ flow: nextFlow }), { kind: 'clarification', token: nextFlow.token });
       await sendResultNotification({
+        runtime, botId: config.id, sessionId: session.id, afterCardId: progressCardMessageId,
         bot,
         replyToMessageId: flow.originalMessageId,
         target: { openId: flow.ownerOpenId, name: '' },
@@ -144,18 +127,6 @@ async function executeClarification(options: Parameters<typeof continueClarifica
     if (managesProductSpec) {
       const submission = await ensureProductSpecSubmission({ result });
       const productSpecRequest = await normalizeProductDocument(bot, submission.request!);
-      if (submission.result.sessionId) {
-        await runtime.sessions.setCliSessionId(
-          session.id,
-          submission.result.sessionId,
-        );
-      }
-      if (submission.result.stats?.contextWindowTokens) {
-        runtime.contextWindows.set(
-          session.id,
-          submission.result.stats.contextWindowTokens,
-        );
-      }
       if (productSpecRequest.deliveryMode === 'local') {
         await assertProductSpecDocuments(session.workspaceDir, productSpecRequest);
       }
@@ -163,15 +134,17 @@ async function executeClarification(options: Parameters<typeof continueClarifica
         taskId: flow.taskId,
         botId: config.id,
         sessionId: session.id,
+        sessionVersion: session.version ?? 0,
         ownerOpenId: flow.ownerOpenId,
         ownerUnionId: flow.ownerUnionId,
         ownerBotId: flow.ownerBotId,
         collaboration: flow.collaboration,
         request: productSpecRequest,
       });
-      await cardUpdater.finish(buildProductSpecApprovalCard(productSpecFlow));
+      await cardUpdater.finish(buildProductSpecApprovalCard(productSpecFlow), { kind: 'product', token: productSpecFlow.token });
       runtime.clarificationFlows.delete(flow.token);
       await sendResultNotification({
+        runtime, botId: config.id, sessionId: session.id, afterCardId: progressCardMessageId,
         bot,
         replyToMessageId: flow.originalMessageId,
         target: { openId: flow.ownerOpenId, name: '' },
@@ -191,11 +164,15 @@ async function executeClarification(options: Parameters<typeof continueClarifica
     }));
     runtime.clarificationFlows.delete(flow.token);
     if (answerNeedsContinuation(result.answer)) {
-      for (const chunk of splitLongText(answerContinuation(result.answer))) {
-        await bot.reply(flow.originalMessageId, chunk, flow.replyInThread);
-      }
+      await deliveryOutbox(runtime, config.id, bot).submit({
+        id: `clarification:${flow.token}:text`, botId: config.id, sessionId: session.id,
+        operations: splitLongText(answerContinuation(result.answer)).map((text) => ({
+          type: 'text', messageId: flow.originalMessageId, text, replyInThread: flow.replyInThread,
+        })),
+      });
     }
     await sendResultNotification({
+        runtime, botId: config.id, sessionId: session.id, afterCardId: progressCardMessageId,
       bot,
       replyToMessageId: flow.originalMessageId,
       target: { openId: flow.ownerOpenId, name: '' },
@@ -204,6 +181,10 @@ async function executeClarification(options: Parameters<typeof continueClarifica
     });
   } catch (error) {
     clearInterval(heartbeat);
+    if (executionStore(runtime).get(`clarification:${flow.token}`)?.status === 'completed') {
+      await cardUpdater.cancel();
+      throw error;
+    }
     const aborted = run.signal.aborted;
     await cardUpdater.finish(buildTaskCard({
       title: adapter.displayName,

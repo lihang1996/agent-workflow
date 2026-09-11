@@ -15,6 +15,7 @@ import {
 } from './product-spec.js';
 
 const ProductSpecFlowSchema = z.object({
+  sessionVersion: z.number().int().nonnegative().default(0),
   token: z.string().min(1),
   taskId: z.string().min(1),
   botId: z.string().min(1),

@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
-import type { CliId } from '../cli/types.js';
+import { CLI_IDS, type CliId } from '../cli/types.js';
 import { resolveWorkspacePath } from './workspace.js';
 
 const ProductDeliveryModeSchema = z.enum(['local', 'lark-doc']);
@@ -36,7 +36,7 @@ const BotSchema = z.object({
     ),
   appIdEnv: z.string().regex(/^[A-Z_][A-Z0-9_]*$/),
   appSecretEnv: z.string().regex(/^[A-Z_][A-Z0-9_]*$/),
-  defaultCli: z.enum(['claude', 'codex']),
+  defaultCli: z.enum(CLI_IDS),
   role: z.string().trim().min(1),
   skills: z
     .array(z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/))

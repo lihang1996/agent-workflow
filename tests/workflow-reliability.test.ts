@@ -22,7 +22,7 @@ import { assertProductSpecDocuments } from '../src/app/product-spec-documents.js
 import { splitLongText, buildProductSpecApprovalCard, buildProductSpecApprovedCard } from '../src/im/card.js';
 import { fitFeishuText, FEISHU_TEXT_LIMIT, type Bot, type CardAction, type IncomingDocumentComment } from '../src/im/lark.js';
 import { resolveWindowsInvocation } from '../src/cli/spawn-cli.js';
-import { parseAgentOsConfig, type BotConfig } from '../src/core/bot-registry.js';
+import { type BotConfig } from '../src/core/bot-registry.js';
 import type { AppRuntime } from '../src/app/runtime.js';
 
 const request = { title: '方案', summary: '说明', deliveryMode: 'lark-doc' as const, documentUrl: 'https://team.feishu.cn/docx/abc' };
@@ -254,15 +254,19 @@ test('full clarification callback failure offers a working retry and releases th
   assert.equal(f.runtime.activeRuns.size, 0); assert.equal(f.runtime.clarificationFlows.get(flow.token), undefined);
 });
 
-test('CLI failure and result-card failure also release clarification active run', async () => {
+test('CLI failure retains answers; result-card failure queues delivery without rerunning clarification', async () => {
   for (const failCard of [false, true]) {
     const f = await fixture(); const flow = f.runtime.clarificationFlows.create({ taskId: 'task', botId: 'product', sessionId: f.session.id, ownerOpenId: 'owner', request: questions, originalMessageId: 'msg', replyInThread: true });
     await f.runtime.sessions.transition(f.session.id, 'active'); const run = new AbortController();
     f.runtime.activeRuns.set(f.session.id, { controller: run, ownerOpenId: 'owner' });
     if (failCard) f.bot.updateCard = async () => { throw new Error('result card failed'); };
-    await assert.rejects(continueClarificationFlow({ runtime: f.runtime, bot: f.bot, config: f.config, flow, run, defaultDeliveryMode: 'lark-doc', execute: async () => { if (!failCard) throw new Error('CLI failed'); return { answer: 'ordinary' }; } }));
+    const execution = continueClarificationFlow({ runtime: f.runtime, bot: f.bot, config: f.config, flow, run, defaultDeliveryMode: 'lark-doc', execute: async () => { if (!failCard) throw new Error('CLI failed'); return { answer: 'ordinary' }; } });
+    if (failCard) await execution; else await assert.rejects(execution);
     assert.equal(f.runtime.sessions.get(f.session.id)?.status, 'idle'); assert.equal(f.runtime.activeRuns.size, 0);
-    assert.ok(f.runtime.clarificationFlows.get(flow.token));
+    if (failCard) {
+      assert.equal(f.runtime.clarificationFlows.get(flow.token), undefined);
+      assert.equal(f.runtime.deliveries?.pending(), 2);
+    } else assert.ok(f.runtime.clarificationFlows.get(flow.token));
   }
 });
 
@@ -291,4 +295,3 @@ test('finished proposal history is bounded without dropping proposals still awai
   assert.equal(store.get(first.token), undefined);
   assert.equal(store.get(awaiting.token)?.status, 'pending');
 });
-

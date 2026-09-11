@@ -1,10 +1,13 @@
 import { randomUUID } from 'node:crypto';
+import type { TaskOwner } from './identity.js';
 import type { CliId } from '../cli/types.js';
 import type { SessionStore } from './session-store.js';
 
 export type SessionStatus = 'creating' | 'active' | 'idle' | 'closed';
 
 export interface Session {
+  version?: number;
+  owner?: TaskOwner;
   id: string;
   botId: string;
   threadId: string;
@@ -106,6 +109,7 @@ export class SessionManager {
       cliId,
       workspaceDir,
       status: 'creating',
+      version: 0,
       createdAt: now,
       updatedAt: now,
     };
@@ -122,6 +126,7 @@ export class SessionManager {
   async transition(
     sessionId: string,
     nextStatus: SessionStatus,
+    owner?: TaskOwner,
   ): Promise<Session> {
     const current = this.get(sessionId);
     if (!current) throw new Error(`会话不存在: ${sessionId}`);
@@ -132,6 +137,8 @@ export class SessionManager {
     const updated: Session = {
       ...current,
       status: nextStatus,
+      ...(owner ? { owner } : {}),
+      ...(nextStatus === 'closed' ? { version: (current.version ?? 0) + 1 } : {}),
       updatedAt: this.now().toISOString(),
     };
     const key = sessionKey(updated.botId, updated.chatId, updated.threadId);
@@ -154,18 +161,25 @@ export class SessionManager {
   }
 
   async clearCliSessionId(sessionId: string): Promise<Session> {
-    return this.updateCliSelection(sessionId, undefined);
+    return this.selectCliSessionId(sessionId, undefined);
+  }
+
+  async selectCliSessionId(sessionId: string, cliSessionId: string | undefined): Promise<Session> {
+    return this.updateCliSelection(sessionId, cliSessionId, true);
   }
 
   private async updateCliSelection(
     sessionId: string,
     cliSessionId: string | undefined,
+    switchContext = false,
   ): Promise<Session> {
     const current = this.get(sessionId);
     if (!current) throw new Error(`会话不存在: ${sessionId}`);
+    if (switchContext && !['idle', 'creating'].includes(current.status)) throw new Error('当前会话不能切换上下文');
     const updated: Session = {
       ...current,
       cliSessionId,
+      ...(switchContext ? { version: (current.version ?? 0) + 1 } : {}),
       updatedAt: this.now().toISOString(),
     };
     const key = sessionKey(updated.botId, updated.chatId, updated.threadId);
@@ -185,6 +199,7 @@ export class SessionManager {
   ): Promise<Session> {
     const current = this.get(sessionId);
     if (!current) throw new Error(`会话不存在: ${sessionId}`);
+    if (!['idle', 'creating'].includes(current.status)) throw new Error('当前会话不能切换工作目录');
     if (!workspaceDir) throw new Error('工作目录不能为空');
     if (current.workspaceDir === workspaceDir) return current;
 
@@ -192,6 +207,7 @@ export class SessionManager {
     const updated: Session = {
       ...rest,
       workspaceDir,
+      version: (current.version ?? 0) + 1,
       updatedAt: this.now().toISOString(),
     };
     const key = sessionKey(updated.botId, updated.chatId, updated.threadId);

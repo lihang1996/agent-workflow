@@ -1,6 +1,7 @@
 import type { AppToolName } from '../core/app-tool-policy.js';
 
-export type CliId = 'claude' | 'codex';
+export const CLI_IDS = ['claude', 'codex', 'cursor'] as const;
+export type CliId = typeof CLI_IDS[number];
 
 export type CliPromptInput = 'argument' | 'stdin';
 
@@ -88,7 +89,8 @@ export interface CliAdapter {
     promptInput: CliPromptInput,
     attachments?: readonly CliAttachment[],
   ): string[];
-  buildCompactPlan(sessionId: string, instructions?: string): CliCompactPlan;
+  buildCompactPlan?(sessionId: string, instructions?: string): CliCompactPlan;
+  buildEnv?(): Record<string, string>;
   parseEvents(line: string): CliEvent[];
 }
 

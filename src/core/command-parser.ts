@@ -1,4 +1,4 @@
-import type { CliId } from '../cli/types.js';
+import { CLI_IDS, type CliId } from '../cli/types.js';
 
 export type SlashCommand =
   | { name: 'close' | 'status' | 'help' | 'new' | 'resume' | 'team' }
@@ -8,7 +8,9 @@ export type SlashCommand =
 const COMMAND_RE = /^(?:@.+?\s+)?\/(close|status|help|new|resume|team)\s*$/;
 const CD_RE = /^(?:@.+?\s+)?\/cd(?:\s+([\s\S]+?))?\s*$/;
 const COMPACT_RE = /^(?:@.+?\s+)?\/compact(?:\s+([\s\S]+?))?\s*$/;
-const CLI_REQUEST_RE = /^(?:@.+?\s+)?\/(claude|codex)(?:\s+([\s\S]*))?$/;
+const CLI_REQUEST_RE = new RegExp(
+  `^(?:@.+?\\s+)?\\/(${CLI_IDS.join('|')})(?:\\s+([\\s\\S]*))?$`,
+);
 
 export function parseCommand(text: string): SlashCommand | undefined {
   const value = text.trim();

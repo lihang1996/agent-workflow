@@ -121,7 +121,12 @@ async function replayClaude(allowed: AppToolName[], toolName: string, input: unk
     const adapter: CliAdapter = {
       id: 'claude', command: process.execPath, displayName: 'replay', appTools: allowed,
       buildArgs: () => [script], buildResumeArgs: () => [script],
-      buildCompactPlan: (sessionId) => parser.buildCompactPlan(sessionId),
+      buildCompactPlan: (id) => {
+        if (!parser.buildCompactPlan) {
+          throw new Error('测试所用 Adapter 必须支持 compact');
+        }
+        return parser.buildCompactPlan(id);
+      },
       parseEvents: (line) => parser.parseEvents(line),
     };
     return await runCli({ adapter, cwd: directory, prompt: 'test' });

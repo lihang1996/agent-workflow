@@ -49,6 +49,7 @@ export interface ClarificationFlow {
   taskId: string;
   botId: string;
   sessionId: string;
+  sessionVersion?: number;
   ownerOpenId: string;
   ownerUnionId?: string;
   ownerBotId?: string;
@@ -65,6 +66,7 @@ export interface CreateClarificationFlowOptions {
   taskId: string;
   botId: string;
   sessionId: string;
+  sessionVersion?: number;
   ownerOpenId: string;
   ownerUnionId?: string;
   ownerBotId?: string;
@@ -131,6 +133,7 @@ export class ClarificationFlowStore {
     const rows = readJsonState(filePath);
     if (rows === undefined) return;
     const schema = z.array(z.object({
+      sessionVersion: z.number().int().nonnegative().default(0),
       token: z.string(), taskId: z.string(), botId: z.string(), sessionId: z.string(),
       ownerOpenId: z.string(), ownerUnionId: z.string().optional(), ownerBotId: z.string().optional(),
       originalMessageId: z.string(), cardMessageId: z.string().optional(), replyInThread: z.boolean(),
@@ -176,6 +179,10 @@ export class ClarificationFlowStore {
 
   get(token: string): ClarificationFlow | undefined {
     return this.flows.get(token);
+  }
+
+  forSession(sessionId: string): ClarificationFlow[] {
+    return [...this.flows.values()].filter((flow) => flow.sessionId === sessionId);
   }
 
   findForTask(taskId: string, botId: string): ClarificationFlow | undefined {

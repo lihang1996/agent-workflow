@@ -6,6 +6,8 @@ import type { ClarificationFlowStore } from '../core/clarification.js';
 import type { ProductSpecFlowStore } from '../core/product-spec.js';
 import type { SessionManager } from '../core/session-manager.js';
 import type { TeamRegistry } from '../core/team-registry.js';
+import type { TaskExecutionStore } from '../core/task-execution.js';
+import type { DeliveryOutbox } from './delivery-outbox.js';
 
 export interface BotRuntime {
   config: BotConfig;
@@ -14,6 +16,8 @@ export interface BotRuntime {
 }
 
 export interface AppRuntime {
+  taskExecutions?: TaskExecutionStore;
+  deliveries?: DeliveryOutbox;
   sessions: SessionManager;
   teamRegistry: TeamRegistry;
   activeRuns: Map<string, ActiveRun>;

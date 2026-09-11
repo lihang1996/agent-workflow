@@ -34,11 +34,13 @@ test('codex forwards images with -i on fresh and resumed runs; files stay prompt
   assert.deepEqual(codex.buildArgs('task', 'argument', []), codex.buildArgs('task', 'argument'));
 });
 
-test('claude relies on the prompt paths and ignores attachments in its arguments', () => {
-  const claude = getCliAdapter('claude');
-  assert.deepEqual(claude.buildArgs('task', 'argument', attachments), claude.buildArgs('task', 'argument'));
-  assert.deepEqual(
-    claude.buildResumeArgs('task', 'session', 'argument', attachments),
-    claude.buildResumeArgs('task', 'session', 'argument'),
-  );
+test('claude and cursor rely on the prompt paths and ignore attachments in their arguments', () => {
+  for (const id of ['claude', 'cursor'] as const) {
+    const adapter = getCliAdapter(id);
+    assert.deepEqual(adapter.buildArgs('task', 'argument', attachments), adapter.buildArgs('task', 'argument'));
+    assert.deepEqual(
+      adapter.buildResumeArgs('task', 'session', 'argument', attachments),
+      adapter.buildResumeArgs('task', 'session', 'argument'),
+    );
+  }
 });

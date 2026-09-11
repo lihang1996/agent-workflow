@@ -993,6 +993,7 @@ export class ThrottledCardUpdater {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private updateChain: Promise<void> = Promise.resolve();
   private closed = false;
+  private finalUpdate: Promise<void> | undefined;
 
   constructor(
     private readonly updateCard: UpdateCard,
@@ -1006,13 +1007,17 @@ export class ThrottledCardUpdater {
   }
 
   async finish(finalCard: CardJson): Promise<void> {
-    if (this.closed) return;
     this.closed = true;
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     this.pendingCard = undefined;
-    await this.updateChain.catch(() => undefined);
-    await this.updateCard(finalCard);
+    if (this.finalUpdate) return this.finalUpdate;
+    this.finalUpdate = (async () => {
+      await this.updateChain;
+      await this.updateCard(finalCard);
+    })();
+    try { await this.finalUpdate; }
+    catch (error) { this.finalUpdate = undefined; throw error; }
   }
 
   async cancel(): Promise<void> {
@@ -1039,6 +1044,9 @@ export class ThrottledCardUpdater {
 
     this.updateChain = this.updateChain
       .then(() => this.updateCard(card))
+      .catch((error) => {
+        console.warn('[卡片] 进度更新失败，后续更新继续:', (error as Error).message);
+      })
       .finally(() => {
         if (this.pendingCard && !this.closed) this.schedule();
       });

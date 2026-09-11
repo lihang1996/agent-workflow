@@ -227,7 +227,7 @@ function listCodexSessions(
 export function listNativeCliSessions(
   options: ListNativeCliSessionsOptions,
 ): Promise<CliSessionSummary[]> {
-  return options.adapter.id === 'claude'
-    ? listClaudeSessions(options)
-    : listCodexSessions(options);
+  if (options.adapter.id === 'claude') return listClaudeSessions(options);
+  if (options.adapter.id === 'codex') return listCodexSessions(options);
+  return Promise.reject(new Error(`${options.adapter.displayName} 暂不支持此操作`));
 }

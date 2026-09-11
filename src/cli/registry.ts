@@ -1,26 +1,34 @@
 import { ClaudeAdapter } from './claude-adapter.js';
 import { CodexAdapter } from './codex-adapter.js';
-import type { CliAdapter, CliId } from './types.js';
+import { CursorAdapter } from './cursor-adapter.js';
+import { CLI_IDS, type CliAdapter, type CliId } from './types.js';
 import type { AppToolName } from '../core/app-tool-policy.js';
 
-const adapters: Record<CliId, CliAdapter> = {
-  claude: new ClaudeAdapter(),
-  codex: new CodexAdapter(),
-};
+const factories = {
+  claude: (tools: readonly AppToolName[]) => new ClaudeAdapter(tools),
+  codex: (tools: readonly AppToolName[]) => new CodexAdapter(tools),
+  cursor: (tools: readonly AppToolName[]) => new CursorAdapter(tools),
+} satisfies Record<CliId, (tools: readonly AppToolName[]) => CliAdapter>;
 
-export function getCliAdapter(id: CliId, appTools?: readonly AppToolName[]): CliAdapter {
-  if (appTools) return id === 'claude'
-    ? new ClaudeAdapter(appTools)
-    : new CodexAdapter(appTools);
-  return adapters[id];
+const emptyToolAdapters = {
+  claude: factories.claude([]),
+  codex: factories.codex([]),
+  cursor: factories.cursor([]),
+} satisfies Record<CliId, CliAdapter>;
+
+export function getCliAdapter(
+  id: CliId,
+  tools?: readonly AppToolName[],
+): CliAdapter {
+  return tools ? factories[id](tools) : emptyToolAdapters[id];
 }
 
 export function listCliAdapters(): CliAdapter[] {
-  return Object.values(adapters);
+  return CLI_IDS.map((id) => emptyToolAdapters[id]);
 }
 
 export function parseCliId(value: string | undefined): CliId {
   if (!value) return 'claude';
-  if (value === 'claude' || value === 'codex') return value;
-  throw new Error(`不支持的 DEFAULT_CLI: ${value}，请填写 claude 或 codex`);
+  if ((CLI_IDS as readonly string[]).includes(value)) return value as CliId;
+  throw new Error(`不支持的 DEFAULT_CLI: ${value}，请填写 ${CLI_IDS.join(' 或 ')}`);
 }

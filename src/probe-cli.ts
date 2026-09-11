@@ -2,7 +2,7 @@
  * AI CLI 事件流解析器：从 stdin 读 headless 模式的 JSON 行，打印事件时间线。
  * 用法：
  *   claude -p "..." --output-format stream-json --verbose | pnpm probe:cli
- *   codex exec --json "..." | pnpm probe:cli
+ *   agent -p --force --output-format stream-json "..." | pnpm probe:cli
  */
 import { createInterface } from 'node:readline';
 
@@ -33,6 +33,10 @@ rl.on('line', (line) => {
     case 'result':
       console.log(`${stamp()} 完成 turns=${ev.num_turns} 耗时=${ev.duration_ms}ms 成本=$${ev.total_cost_usd}`);
       console.log(`${stamp()} 最终回答: ${ev.result}`);
+      break;
+    case 'tool_call':
+      if (ev.subtype === 'started') console.log(`${stamp()} 开始工具: ${ev.call_id}`);
+      if (ev.subtype === 'completed') console.log(`${stamp()} 完成工具: ${ev.call_id}`);
       break;
 
     // ── Codex ──

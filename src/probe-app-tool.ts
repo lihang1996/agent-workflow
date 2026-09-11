@@ -1,12 +1,12 @@
 import { resolve } from 'node:path';
 import { getCliAdapter } from './cli/registry.js';
 import { runCli } from './cli/runner.js';
-import type { CliId } from './cli/types.js';
+import { CLI_IDS, type CliId } from './cli/types.js';
 
 const cliId = process.argv[2] as CliId | undefined;
 const workspace = process.argv[3] ?? process.cwd();
-if (cliId !== 'claude' && cliId !== 'codex') {
-  console.error('用法：pnpm probe:tool <claude|codex>');
+if (!cliId || !(CLI_IDS as readonly string[]).includes(cliId)) {
+  console.error(`用法：pnpm probe:tool <${CLI_IDS.join('|')}>`);
   process.exit(1);
 }
 

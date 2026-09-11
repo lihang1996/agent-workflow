@@ -5,6 +5,7 @@ import { buildCollaborationCard } from '../im/card.js';
 import type { BotConfig } from '../core/bot-registry.js';
 import type { CollaborationMessage } from '../core/collaboration.js';
 import type { AppRuntime } from './runtime.js';
+import { deliveryOutbox } from './result-delivery.js';
 
 export interface CollaborationDispatch {
   dispatchId?: string;
@@ -51,6 +52,16 @@ export class CollaborationService {
       try { await this.deliver(message.dispatchId); }
       catch (error) { console.warn(`[协作 ${message.dispatchId}] 待重试:`, (error as Error).message); }
     }
+    for (const message of this.runtime.collaborationInbox.interrupted()) {
+      const sender = this.runtime.botRuntimes.get(message.fromBotId);
+      if (!sender || !message.replyToMessageId) continue;
+      await deliveryOutbox(this.runtime, message.fromBotId, sender.bot).submit({
+        id: `interrupted:${message.dispatchId}`, botId: message.fromBotId,
+        sessionId: message.executionSessionId ?? message.taskId,
+        operations: [{ type: 'text', messageId: message.replyToMessageId, replyInThread: true,
+          text: `协作任务“${message.objective}”执行中断，结果不确定。请检查产物后发送新的指令；系统不会自动重复执行。` }],
+      });
+    }
   }
 
   private deliver(dispatchId: string): Promise<void> {
@@ -65,7 +76,8 @@ export class CollaborationService {
     const inbox = this.runtime.collaborationInbox;
     if (inbox.hasConsumed(dispatchId)) return;
     const message = inbox.pending().find((item) => item.dispatchId === dispatchId);
-    if (!message?.replyToMessageId) throw new Error('缺少协作原始消息，无法恢复派发');
+    if (!message) return;
+    if (!message.replyToMessageId) throw new Error('缺少协作原始消息，无法恢复派发');
     const sender = this.runtime.botRuntimes.get(message.fromBotId);
     const target = this.runtime.botRuntimes.get(message.toBotId);
     const reportTo = this.runtime.botRuntimes.get(message.reportToBotId);
