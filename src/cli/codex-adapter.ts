@@ -1,6 +1,9 @@
-import type { CliAdapter, CliPromptInput, CliEvent, CliRunStats } from './types.js';
+import type { CliAdapter, CliAttachment, CliPromptInput, CliEvent, CliRunStats } from './types.js';
+import type { AppToolName } from '../core/app-tool-policy.js';
 import {
   CLARIFICATION_TOOL_NAME,
+  PRODUCT_SPEC_TOOL_NAME,
+  DISPATCH_TASK_TOOL_NAME,
   codexAppToolArgs,
 } from './app-tools.js';
 
@@ -88,17 +91,30 @@ function errorMessage(event: CodexEvent): string {
   return 'Codex 执行失败';
 }
 
+/** `codex exec` / `codex exec resume` 都支持 `-i <FILE>` 把图片直接送入多模态输入。 */
+function codexImageArgs(attachments: readonly CliAttachment[] = []): string[] {
+  return attachments
+    .filter((attachment) => attachment.type === 'image')
+    .flatMap((attachment) => ['-i', attachment.path]);
+}
+
 export class CodexAdapter implements CliAdapter {
+  constructor(readonly appTools: readonly AppToolName[] = []) {}
   readonly id = 'codex' as const;
   readonly command = 'codex';
   readonly displayName = 'Codex';
 
-  buildArgs(prompt: string, promptInput: CliPromptInput): string[] {
+  buildArgs(
+    prompt: string,
+    promptInput: CliPromptInput,
+    attachments?: readonly CliAttachment[],
+  ): string[] {
     const args = [
-      ...codexAppToolArgs(),
+      ...codexAppToolArgs(this.appTools),
       'exec',
       '--json',
       '--skip-git-repo-check',
+      ...codexImageArgs(attachments),
     ];
     // Windows 上沙箱功能不支持，必须完全禁用；approvals 也一并绕过。
     if (process.platform === 'win32') {
@@ -111,13 +127,19 @@ export class CodexAdapter implements CliAdapter {
     return args;
   }
 
-  buildResumeArgs(prompt: string, sessionId: string, promptInput: CliPromptInput): string[] {
+  buildResumeArgs(
+    prompt: string,
+    sessionId: string,
+    promptInput: CliPromptInput,
+    attachments?: readonly CliAttachment[],
+  ): string[] {
     const args = [
-      ...codexAppToolArgs(),
+      ...codexAppToolArgs(this.appTools),
       'exec',
       'resume',
       '--json',
       '--skip-git-repo-check',
+      ...codexImageArgs(attachments),
       sessionId,
     ];
     // Windows 上沙箱功能不支持，必须完全禁用；approvals 也一并绕过。
@@ -180,12 +202,16 @@ export class CodexAdapter implements CliAdapter {
       if (
         item.type === 'mcp_tool_call'
         && item.server === 'agent_os'
-        && item.tool === CLARIFICATION_TOOL_NAME
+        && (
+          item.tool === CLARIFICATION_TOOL_NAME
+          || item.tool === PRODUCT_SPEC_TOOL_NAME
+          || item.tool === DISPATCH_TASK_TOOL_NAME
+        )
       ) {
         events.push({
           type: 'tool_call',
           toolUseId: item.id,
-          toolName: CLARIFICATION_TOOL_NAME,
+          toolName: item.tool,
           input: item.arguments ?? item.input,
         });
       }

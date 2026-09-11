@@ -1,3 +1,5 @@
+import type { AppToolName } from '../core/app-tool-policy.js';
+
 export type CliId = 'claude' | 'codex';
 
 export type CliPromptInput = 'argument' | 'stdin';
@@ -59,15 +61,32 @@ export type CliEvent =
   | { type: 'result'; answer: string; sessionId?: string; stats?: CliRunStats }
   | { type: 'error'; message: string; sessionId?: string };
 
+/** 随飞书消息一起到达、已保存到本机的图片或文件。path 为绝对路径。 */
+export interface CliAttachment {
+  path: string;
+  type: 'image' | 'file';
+  fileName?: string;
+}
+
 export interface CliAdapter {
+  readonly appTools: readonly AppToolName[];
   readonly id: CliId;
   readonly command: string;
   readonly displayName: string;
-  buildArgs(prompt: string, promptInput: CliPromptInput): string[];
+  /**
+   * 附件路径已经写进 prompt，任何能读本地文件的 CLI 都能处理；
+   * 适配器可以额外把图片交给原生多模态入口（如 Codex 的 `-i`）。
+   */
+  buildArgs(
+    prompt: string,
+    promptInput: CliPromptInput,
+    attachments?: readonly CliAttachment[],
+  ): string[];
   buildResumeArgs(
     prompt: string,
     sessionId: string,
     promptInput: CliPromptInput,
+    attachments?: readonly CliAttachment[],
   ): string[];
   buildCompactPlan(sessionId: string, instructions?: string): CliCompactPlan;
   parseEvents(line: string): CliEvent[];

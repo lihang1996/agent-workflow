@@ -4,3 +4,15 @@ dist/
 config/bots.json
 data/
 *.log
+work.txt
+
+# Local IDE/cache and one-off editorial outputs
+.idea/
+__pycache__/
+*.pyc
+.scratch/
+updated_doc.xml
+agent_os_doc_update.md
+apply_block_updates.py
+update_blocks.py
+update_story_intro.py

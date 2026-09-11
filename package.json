@@ -9,8 +9,12 @@
     "start:once": "tsx src/index.ts",
     "probe": "tsx src/probe-lark.ts",
     "build": "tsc",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "test:collaboration": "node --import tsx --test tests/collaboration-*.test.ts",
+    "test:collaboration-origin": "tsx --test tests/collaboration-origin.test.ts",
     "probe:cli": "tsx src/probe-cli.ts",
-    "probe:tool": "tsx src/probe-app-tool.ts"
+    "probe:tool": "tsx src/probe-app-tool.ts",
+    "typecheck": "tsc -p tsconfig.tests.json"
   },
   "engines": {
     "node": ">=22"

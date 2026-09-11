@@ -1,7 +1,12 @@
 import { promptInputForPlatform } from './types.js';
+import type { AppToolName } from '../core/app-tool-policy.js';
 import type { CliAdapter, CliPromptInput, CliEvent, CliRunStats } from './types.js';
 import {
   CLAUDE_CLARIFICATION_TOOL_NAME,
+  CLAUDE_PRODUCT_SPEC_TOOL_NAME,
+  CLAUDE_DISPATCH_TASK_TOOL_NAME,
+  PRODUCT_SPEC_TOOL_NAME,
+  DISPATCH_TASK_TOOL_NAME,
   claudeAppToolArgs,
 } from './app-tools.js';
 
@@ -120,7 +125,7 @@ function parseStats(event: ClaudeEvent): CliRunStats | undefined {
     : undefined;
 }
 
-function outputArgs(prompt: string, promptInput: CliPromptInput): string[] {
+function outputArgs(prompt: string, promptInput: CliPromptInput, appTools: readonly AppToolName[]): string[] {
   return [
     '--dangerously-skip-permissions',
     '-p',
@@ -128,21 +133,22 @@ function outputArgs(prompt: string, promptInput: CliPromptInput): string[] {
     '--output-format',
     'stream-json',
     '--verbose',
-    ...claudeAppToolArgs(),
+    ...claudeAppToolArgs(appTools),
   ];
 }
 
 export class ClaudeAdapter implements CliAdapter {
+  constructor(readonly appTools: readonly AppToolName[] = []) {}
   readonly id = 'claude' as const;
   readonly command = 'claude';
   readonly displayName = 'Claude Code';
 
   buildArgs(prompt: string, promptInput: CliPromptInput): string[] {
-    return outputArgs(prompt, promptInput);
+    return outputArgs(prompt, promptInput, this.appTools);
   }
 
   buildResumeArgs(prompt: string, sessionId: string, promptInput: CliPromptInput): string[] {
-    return ['--resume', sessionId, ...outputArgs(prompt, promptInput)];
+    return ['--resume', sessionId, ...outputArgs(prompt, promptInput, this.appTools)];
   }
 
   buildCompactPlan(sessionId: string, instructions?: string) {
@@ -201,6 +207,22 @@ export class ClaudeAdapter implements CliAdapter {
             type: 'tool_call',
             toolUseId: block.id,
             toolName: 'request_clarification',
+            input: block.input,
+          });
+        }
+        if (block.name === CLAUDE_PRODUCT_SPEC_TOOL_NAME) {
+          events.push({
+            type: 'tool_call',
+            toolUseId: block.id,
+            toolName: PRODUCT_SPEC_TOOL_NAME,
+            input: block.input,
+          });
+        }
+        if (block.name === CLAUDE_DISPATCH_TASK_TOOL_NAME) {
+          events.push({
+            type: 'tool_call',
+            toolUseId: block.id,
+            toolName: DISPATCH_TASK_TOOL_NAME,
             input: block.input,
           });
         }

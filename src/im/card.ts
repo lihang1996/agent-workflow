@@ -1,7 +1,10 @@
 /**
  * 飞书任务卡片：把 CLI 事件整理成稳定、低噪音的任务进度。
  */
+import { FEISHU_TEXT_LIMIT } from './text-limits.js';
 import type { CliRunStats, CliSessionSummary } from '../cli/types.js';
+import type { ClarificationFlow } from '../core/clarification.js';
+import type { ProductSpecFlow } from '../core/product-spec.js';
 import type { TaskActivity, TaskProgressSnapshot } from '../core/task-progress.js';
 
 export type CardJson = Record<string, unknown>;
@@ -48,10 +51,17 @@ export interface TeamCardOptions {
 export interface CollaborationCardOptions {
   senderName: string;
   targetName: string;
+  reportToName: string;
   workspaceName: string;
-  prompt: string;
+  objective: string;
+  instruction: string;
+  expectedOutput?: string;
   round: number;
   maxRounds: number;
+}
+
+export interface ClarificationCardOptions {
+  flow: ClarificationFlow;
 }
 
 const STATUS_STYLE = {
@@ -358,6 +368,237 @@ export function buildTaskCard(options: TaskCardOptions): CardJson {
   };
 }
 
+function clarificationButton(
+  flow: ClarificationFlow,
+  option: { id: string; label: string },
+): Record<string, unknown> {
+  const question = flow.request.questions[flow.currentIndex];
+  const recommendedOptionId = question.recommendedOptionId
+    ?? question.options[0]?.id;
+  return {
+    tag: 'button',
+    text: {
+      tag: 'plain_text',
+      content: option.id === recommendedOptionId
+        ? option.label.includes('推荐') ? option.label : `${option.label}（推荐）`
+        : option.label,
+    },
+    type: 'default',
+    width: 'fill',
+    size: 'medium',
+    behaviors: [{
+      type: 'callback',
+      value: {
+        action: 'answer_clarification',
+        flowToken: flow.token,
+        questionId: question.id,
+        optionId: option.id,
+      },
+    }],
+  };
+}
+
+function clarificationAnswerSummary(flow: ClarificationFlow): string {
+  return flow.answers.map((answer, index) => [
+    `${index + 1}. **${escapeFeishuMarkdown(answer.prompt)}**`,
+    `${answer.source === 'agent' ? 'Agent 推荐' : '你的选择'}：${escapeFeishuMarkdown(answer.answer)}`,
+  ].join('\n')).join('\n\n');
+}
+
+function clarificationDecisionButton(
+  flow: ClarificationFlow,
+  decisionMode: 'current' | 'remaining',
+): Record<string, unknown> {
+  const question = flow.request.questions[flow.currentIndex];
+  return {
+    tag: 'button',
+    text: {
+      tag: 'plain_text',
+      content: decisionMode === 'current'
+        ? '这一题交给 Agent 决定'
+        : '按推荐方案继续',
+    },
+    type: decisionMode === 'remaining' ? 'primary' : 'default',
+    width: 'fill',
+    size: 'medium',
+    behaviors: [{
+      type: 'callback',
+      value: {
+        action: 'answer_clarification',
+        flowToken: flow.token,
+        questionId: question.id,
+        decisionMode,
+      },
+    }],
+  };
+}
+
+export function buildClarificationCard(
+  options: ClarificationCardOptions,
+): CardJson {
+  const { flow } = options;
+  const question = flow.request.questions[flow.currentIndex];
+  const current = flow.currentIndex + 1;
+  const total = flow.request.questions.length;
+
+  return {
+    schema: '2.0',
+    config: {
+      update_multi: true,
+      summary: { content: `${flow.request.title}（${current}/${total}）` },
+    },
+    header: {
+      template: 'blue',
+      title: { tag: 'plain_text', content: flow.request.title },
+      subtitle: { tag: 'plain_text', content: `${current} / ${total}` },
+    },
+    body: {
+      direction: 'vertical',
+      vertical_spacing: '12px',
+      elements: [
+        ...(flow.request.intro && flow.currentIndex === 0
+          ? [{
+            tag: 'markdown',
+            content: escapeFeishuMarkdown(flow.request.intro),
+          }]
+          : []),
+        ...(flow.answers.length
+          ? [
+            {
+              tag: 'markdown',
+              content: `**已确认 ${flow.answers.length} 项**\n\n${clarificationAnswerSummary(flow)}`,
+            },
+            { tag: 'hr' },
+          ]
+          : []),
+        {
+          tag: 'markdown',
+          content: `**${escapeFeishuMarkdown(question.prompt)}**\n\n选择最符合预期的一项：`,
+        },
+        ...question.options.map((option) => clarificationButton(flow, option)),
+        clarificationDecisionButton(flow, 'current'),
+        { tag: 'hr' },
+        {
+          tag: 'form',
+          name: `clarify_${flow.token.slice(0, 8)}`,
+          vertical_spacing: '8px',
+          elements: [
+            {
+              tag: 'input',
+              name: 'custom_answer',
+              placeholder: {
+                tag: 'plain_text',
+                content: '都不合适？在这里写下你的答案',
+              },
+              max_length: 500,
+            },
+            {
+              tag: 'button',
+              name: 'submit_custom',
+              action_type: 'form_submit',
+              text: { tag: 'plain_text', content: '提交自定义答案' },
+              type: 'primary',
+              width: 'default',
+              size: 'medium',
+              value: {
+                action: 'answer_clarification',
+                flowToken: flow.token,
+                questionId: question.id,
+                custom: true,
+              },
+            },
+          ],
+        },
+        { tag: 'hr' },
+        {
+          tag: 'markdown',
+          content: '不想逐项选择？Agent 会保留你已经确认的答案，并为剩余问题采用推荐方案。',
+        },
+        clarificationDecisionButton(flow, 'remaining'),
+      ],
+    },
+  };
+}
+
+export function buildClarificationContinuingCard(
+  flow: ClarificationFlow,
+): CardJson {
+  return {
+    schema: '2.0',
+    config: {
+      update_multi: true,
+      summary: { content: `${flow.request.title}：正在整理` },
+    },
+    header: {
+      template: 'blue',
+      title: {
+        tag: 'plain_text',
+        content: `${flow.request.title} · 正在整理`,
+      },
+    },
+    body: {
+      direction: 'vertical',
+      vertical_spacing: '12px',
+      elements: [{
+        tag: 'markdown',
+        content: [
+          '**答案已收到**',
+          '正在基于这些选择继续处理，无需重复点击。',
+          `**已确认 ${flow.answers.length} 项**\n\n${clarificationAnswerSummary(flow)}`,
+        ].join('\n\n'),
+      }],
+    },
+  };
+}
+
+export function buildClarificationRetryCard(flow: ClarificationFlow): CardJson {
+  return {
+    schema: '2.0', config: { update_multi: true },
+    header: { template: 'orange', title: { tag: 'plain_text', content: '答案已保存，整理可重试' } },
+    body: { elements: [
+      { tag: 'markdown', content: '上次整理未完成。已确认的答案会继续保留，也可以在话题中补充信息。' },
+      { tag: 'button', type: 'primary', text: { tag: 'plain_text', content: '重新整理' }, behaviors: [{ type: 'callback', value: {
+        action: 'answer_clarification', flowToken: flow.token,
+        questionId: flow.request.questions[flow.request.questions.length - 1].id,
+        decisionMode: 'remaining',
+      } }] },
+    ] },
+  };
+}
+
+export function buildClarificationSupersededCard(
+  flow: ClarificationFlow,
+): CardJson {
+  return {
+    schema: '2.0',
+    config: {
+      update_multi: true,
+      summary: { content: `${flow.request.title}：已收到新的补充` },
+    },
+    header: {
+      template: 'grey',
+      title: {
+        tag: 'plain_text',
+        content: `${flow.request.title} · 已更新`,
+      },
+    },
+    body: {
+      direction: 'vertical',
+      vertical_spacing: '12px',
+      elements: [{
+        tag: 'markdown',
+        content: [
+          '**已收到你在话题里的新消息**',
+          '这张卡片已经失效，Agent OS 正在沿用同一个任务上下文处理新的补充。',
+          flow.answers.length
+            ? `此前已确认 ${flow.answers.length} 项，相关答案会一并带入。`
+            : '',
+        ].filter(Boolean).join('\n\n'),
+      }],
+    },
+  };
+}
+
 function formatSessionTime(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
@@ -461,22 +702,17 @@ export function buildSessionNoticeCard(
 export function buildCollaborationCard(
   options: CollaborationCardOptions,
 ): CardJson {
-  const isReviewRequest = options.round === 1;
   const isLastRound = options.round >= options.maxRounds;
-  const title = isReviewRequest ? '代码审查已发起' : '审查意见已返回';
-  const action = isReviewRequest ? '请接手检查' : '请确认并处理反馈';
-  const description = isReviewRequest
-    ? '开发任务已经完成，现在进入独立审查。'
-    : '审查已经完成，反馈已交回开发侧。';
+  const title = '协作任务已派发';
   const footer = isLastRound
-    ? '这是本次协作的最后一轮，处理完成后流程结束。'
-    : `完成后，结果会自动交回 ${options.senderName}。`;
+    ? `这是当前任务允许的最后一次交接；结果会通知 ${options.reportToName}，由他决定下一步。`
+    : `完成后，结果会自动交回 ${options.reportToName} 继续组织后续工作。`;
 
   return {
     schema: '2.0',
     config: {
       update_multi: true,
-      summary: { content: `${title}：${options.senderName} → ${options.targetName}` },
+      summary: { content: `${title}：${options.objective}` },
     },
     header: {
       template: 'blue',
@@ -492,7 +728,7 @@ export function buildCollaborationCard(
       elements: [
         {
           tag: 'markdown',
-          content: `**${options.targetName}，${action}**\n\n${description}`,
+          content: `**${options.targetName}，请接手：${escapeFeishuMarkdown(options.objective)}**`,
         },
         {
           tag: 'column_set',
@@ -514,7 +750,7 @@ export function buildCollaborationCard(
               weight: 2,
               elements: [{
                 tag: 'markdown',
-                content: `**当前环节**\n${isReviewRequest ? '独立审查' : '处理反馈'}`,
+                content: `**结果交给**\n${escapeFeishuMarkdown(options.reportToName)}`,
               }],
             },
           ],
@@ -522,16 +758,25 @@ export function buildCollaborationCard(
         {
           tag: 'collapsible_panel',
           expanded: false,
-          header: collapsibleHeader(isReviewRequest ? '查看审查说明' : '查看审查反馈'),
+          header: collapsibleHeader('查看任务说明'),
           vertical_spacing: '8px',
           padding: '8px 8px 8px 8px',
           elements: [{
             tag: 'markdown',
             content: escapeFeishuMarkdown(
-              markdownPreview(options.prompt, MAX_CARD_ANSWER_LENGTH),
+              markdownPreview(options.instruction, MAX_CARD_ANSWER_LENGTH),
             ),
           }],
         },
+        ...(options.expectedOutput
+          ? [
+              { tag: 'hr' },
+              {
+                tag: 'markdown',
+                content: `**期望产出**\n${escapeFeishuMarkdown(options.expectedOutput)}`,
+              },
+            ]
+          : []),
         { tag: 'hr' },
         { tag: 'markdown', content: `_${footer}_` },
       ],
@@ -590,6 +835,138 @@ export function buildTeamCard(options: TeamCardOptions): CardJson {
 }
 
 
+function productDocumentList(flow: ProductSpecFlow): string {
+  if (flow.request.deliveryMode === 'lark-doc') {
+    return `☁️ **飞书云文档** · [打开文档](${flow.request.documentUrl})`;
+  }
+  return [
+    `📘 **Spec** · \`${escapeFeishuMarkdown(flow.request.specPath)}\``,
+    `🎫 **Tickets** · \`${escapeFeishuMarkdown(flow.request.ticketsPath)}\``,
+  ].join('\n');
+}
+
+export function buildProductSpecApprovalCard(
+  flow: ProductSpecFlow,
+): CardJson {
+  const elements: Record<string, unknown>[] = [
+    {
+      tag: 'markdown',
+      content: [
+        `**${escapeFeishuMarkdown(flow.request.title)}**`,
+        escapeFeishuMarkdown(flow.request.summary),
+      ].join('\n\n'),
+    },
+    { tag: 'hr' },
+    {
+      tag: 'markdown',
+      content: `**共享产物**\n${productDocumentList(flow)}`,
+    },
+  ];
+
+  elements.push({
+    tag: 'button',
+    text: { tag: 'plain_text', content: '确认产品方案' },
+    type: 'primary_filled',
+    width: 'fill',
+    size: 'medium',
+    behaviors: [{
+      type: 'callback',
+      value: {
+        action: 'approve_product_spec',
+        flowToken: flow.token,
+      },
+    }],
+  });
+
+  elements.push({
+    tag: 'markdown',
+    content: '_确认后本轮流程结束，不会自动派发。需要实现时，请 @ 开发并附上这份文档。_',
+  });
+
+  return {
+    schema: '2.0',
+    config: {
+      update_multi: true,
+      summary: { content: `${flow.request.title}：待确认` },
+    },
+    header: {
+      template: 'blue',
+      title: { tag: 'plain_text', content: '产品文档已生成' },
+      subtitle: {
+        tag: 'plain_text',
+        content: flow.request.deliveryMode === 'lark-doc'
+          ? '飞书云文档待确认'
+          : '本地 Spec · Tickets 待确认',
+      },
+    },
+    body: {
+      direction: 'vertical',
+      vertical_spacing: '12px',
+      elements,
+    },
+  };
+}
+
+export function buildProductSpecApprovedCard(
+  flow: ProductSpecFlow,
+): CardJson {
+  return {
+    schema: '2.0',
+    config: {
+      update_multi: true,
+      summary: { content: `${flow.request.title}：已确认` },
+    },
+    header: {
+      template: 'green',
+      title: { tag: 'plain_text', content: '产品方案已确认' },
+      subtitle: { tag: 'plain_text', content: '产品阶段已就绪' },
+    },
+    body: {
+      direction: 'vertical',
+      vertical_spacing: '12px',
+      elements: [{
+        tag: 'markdown',
+        content: [
+          `**${escapeFeishuMarkdown(flow.request.title)}**`,
+          escapeFeishuMarkdown(flow.request.summary),
+          `**已确认文档**\n${productDocumentList(flow)}`,
+          flow.approvedAt
+            ? `确认时间：${escapeFeishuMarkdown(flow.approvedAt)}`
+            : '',
+          '_确认记录已保存，本轮流程到此结束，没有自动派发后续任务。需要实现时，请 @ 开发并附上上方文档。_',
+        ].filter(Boolean).join('\n\n'),
+      }],
+    },
+  };
+}
+
+export function buildProductSpecExpiredCard(
+  flow: ProductSpecFlow,
+): CardJson {
+  return {
+    schema: '2.0',
+    config: {
+      update_multi: true,
+      summary: { content: `${flow.request.title}：已失效` },
+    },
+    header: {
+      template: 'grey',
+      title: { tag: 'plain_text', content: '产品方案确认已失效' },
+    },
+    body: {
+      direction: 'vertical',
+      vertical_spacing: '12px',
+      elements: [{
+        tag: 'markdown',
+        content: [
+          `**${escapeFeishuMarkdown(flow.request.title)}**`,
+          '同一任务已经提交了更新的产品方案，请查看话题中最新的确认卡。',
+        ].join('\n\n'),
+      }],
+    },
+  };
+}
+
 export function answerNeedsContinuation(answer: string): boolean {
   return answer.length > MAX_CARD_ANSWER_LENGTH;
 }
@@ -598,16 +975,13 @@ export function answerContinuation(answer: string): string {
   return answer.slice(markdownSplitIndex(answer, MAX_CARD_ANSWER_LENGTH));
 }
 
-export function splitLongText(text: string, maxLength = 4_000): string[] {
+export function splitLongText(text: string, maxLength = FEISHU_TEXT_LIMIT): string[] {
+  if (!Number.isInteger(maxLength) || maxLength < 1) throw new Error('分段长度必须为正整数');
+  const characters = Array.from(text);
   const chunks: string[] = [];
-  let remaining = text;
-  while (remaining.length > maxLength) {
-    const newline = remaining.lastIndexOf('\n', maxLength);
-    const splitAt = newline > maxLength / 2 ? newline : maxLength;
-    chunks.push(remaining.slice(0, splitAt).trim());
-    remaining = remaining.slice(splitAt).trim();
+  for (let offset = 0; offset < characters.length; offset += maxLength) {
+    chunks.push(characters.slice(offset, offset + maxLength).join(''));
   }
-  if (remaining) chunks.push(remaining);
   return chunks;
 }
 

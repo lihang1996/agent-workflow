@@ -3,6 +3,10 @@ import { z } from 'zod';
 import type { CliId } from '../cli/types.js';
 import { resolveWorkspacePath } from './workspace.js';
 
+const ProductDeliveryModeSchema = z.enum(['local', 'lark-doc']);
+
+export type ProductDeliveryMode = z.infer<typeof ProductDeliveryModeSchema>;
+
 export interface BotConfig {
   id: string;
   appId: string;
@@ -12,12 +16,12 @@ export interface BotConfig {
   skills: string[];
   systemPrompt: string;
   workspaceDir: string;
-  reviewBy?: string;
   collaborationMaxRounds: number;
 }
 
 export interface AgentOsConfig {
   teamLeaderId: string;
+  defaultProductDeliveryMode: ProductDeliveryMode;
   bots: BotConfig[];
 }
 
@@ -40,10 +44,6 @@ const BotSchema = z.object({
     .default([]),
   workspace: z.string().trim().min(1).optional(),
   systemPrompt: z.string().trim().optional().default(''),
-  reviewBy: z
-    .string()
-    .regex(/^[a-z0-9][a-z0-9_-]{0,31}$/)
-    .optional(),
   collaborationMaxRounds: z.number().int().min(1).max(32).optional().default(16),
   enabled: z.boolean().optional().default(true),
 });
@@ -52,6 +52,8 @@ const BotConfigFileSchema = z.object({
   teamLeader: z
     .string()
     .regex(/^[a-z0-9][a-z0-9_-]{0,31}$/),
+  defaultProductDeliveryMode: ProductDeliveryModeSchema.optional()
+    .default('lark-doc'),
   bots: z.array(BotSchema).min(1),
 });
 
@@ -86,7 +88,6 @@ export function parseAgentOsConfig(
         role: bot.role,
         skills: [...new Set(bot.skills)],
         systemPrompt: bot.systemPrompt,
-        reviewBy: bot.reviewBy,
         collaborationMaxRounds: bot.collaborationMaxRounds,
         workspaceDir: resolveWorkspacePath(
           bot.workspace ?? env.CLI_WORKDIR ?? env.CLAUDE_WORKDIR ?? '.',
@@ -99,17 +100,11 @@ export function parseAgentOsConfig(
   if (!enabledIds.has(parsed.teamLeader)) {
     throw new Error(`teamLeader 指向未启用的 bot: ${parsed.teamLeader}`);
   }
-  for (const config of configs) {
-    if (config.reviewBy && !enabledIds.has(config.reviewBy)) {
-      throw new Error(
-        `bot ${config.id} 的 reviewBy 指向未启用的 bot: ${config.reviewBy}`,
-      );
-    }
-    if (config.reviewBy === config.id) {
-      throw new Error(`bot ${config.id} 不能把自己配置为 reviewBy`);
-    }
-  }
-  return { teamLeaderId: parsed.teamLeader, bots: configs };
+  return {
+    teamLeaderId: parsed.teamLeader,
+    defaultProductDeliveryMode: parsed.defaultProductDeliveryMode,
+    bots: configs,
+  };
 }
 
 export function parseBotConfigs(
@@ -156,14 +151,45 @@ export function buildBotPrompt(
   config: Pick<BotConfig, 'role' | 'skills' | 'systemPrompt'>,
   prompt: string,
   teamContext = '',
+  defaultProductDeliveryMode: ProductDeliveryMode = 'lark-doc',
 ): string {
-  return [
+  const managesProductDocuments = config.skills.some((skill) =>
+    ['to-spec', 'to-tickets', 'lark-doc'].includes(skill));
+  const productDeliveryPolicy = managesProductDocuments
+    ? [
+        '产品方案交付规则（必须遵守）：',
+        `- 当前默认交付方式：${defaultProductDeliveryMode}。`,
+        '- 用户明确指定本地 Markdown 或飞书云文档时，以用户本次选择覆盖默认值。',
+        '- 不要为了选择交付格式单独发起澄清。',
+        '- 只有实际完成了可确认的方案产物时，才调用 request_spec_approval，提交 deliveryMode 与对应字段。普通问答、状态查询和未形成新方案的讨论直接回复，不要创建确认卡。',
+        '- 不能只在普通回复中罗列 deliveryMode、documentUrl、specPath 或 ticketsPath。工具调用成功后停止本轮。',
+      ].join('\n')
+    : '';
+  const feishuOutputPolicy = [
+    '飞书输出规则（必须遵守）：',
+    '- 最终回复控制在 1200 个中文字符以内，先给结论，再给必要依据和下一步。',
+    '- 不在回复中粘贴完整代码、长日志或整份产品文档，也不要输出 Markdown 表格。',
+    '- 详细产物写入当前工作区文件。回复只提供简短摘要和文件路径。',
+    '- 需要用户决策时，只有被授予 request_clarification 的成员可以发起选择卡片；老板助理不发卡，而是把问题派给对应成员。',
+    '- 只在选择会实质改变结果、且任务描述或既有文档没有给出答案时才提问；一次把问题问完（最多 5 题），不要把它当成聊天，也不要重复确认用户已经明确的内容。',
+    '- 发起澄清必须实际调用 request_clarification，不能只在文字中说已发送卡片。调用后停止推断，等待用户回答；工具失败时不能宣称发送成功。',
+  ].join('\n');
+  const sections = [
     `你的角色：${config.role}`,
     config.systemPrompt.trim(),
     teamContext.trim(),
+    productDeliveryPolicy,
     config.skills.length > 0
-      ? `本次任务必须按项目 Skill 执行：${config.skills.map((skill) => `$${skill}`).join('、')}`
+      ? [
+          '项目 Skill 加载规则（优先级不可颠倒）：',
+          '- 对配置中声明的每个 Skill，先读取当前工作区 `.agents/skills/<skill>/SKILL.md`。',
+          '- 上述路径不存在时，再读取当前工作区 `.claude/skills/<skill>/SKILL.md`。',
+          '- 只有两个工作区路径都不存在时，才允许回退到用户级或全局同名 Skill；不得因全局 Skill 同名而跳过工作区版本。',
+          `本次任务必须执行的项目 Skill：${config.skills.map((skill) => `$${skill}`).join('、')}`,
+        ].join('\n')
       : '',
+    feishuOutputPolicy,
     `当前任务：${prompt}`,
-  ].filter(Boolean).join('\n\n');
+  ];
+  return sections.filter(Boolean).join('\n\n');
 }

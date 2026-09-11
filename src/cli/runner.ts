@@ -1,9 +1,10 @@
 import { killCli, spawnCli } from './spawn-cli.js';
 import { promptInputForPlatform } from './types.js';
 import { createInterface } from 'node:readline';
-import type { CliAdapter, CliEvent, CliRunResult } from './types.js';
+import type { CliAdapter, CliAttachment, CliEvent, CliRunResult } from './types.js';
+import { assertAppToolAllowed, validateAppToolCalls } from '../core/app-tool-policy.js';
 
-const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_TIMEOUT_MS = 50 * 60 * 1000;
 
 export interface RunCliOptions {
   adapter: CliAdapter;
@@ -13,6 +14,7 @@ export interface RunCliOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
   onEvent?: (event: CliEvent) => void;
+  attachments?: readonly CliAttachment[];
 }
 
 export function runCli(options: RunCliOptions): Promise<CliRunResult> {
@@ -24,13 +26,14 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
     signal,
     timeoutMs = DEFAULT_TIMEOUT_MS,
     onEvent,
+    attachments,
   } = options;
   // Windows 下 prompt 走 stdin（规避 cmd 转义/乱码），其他平台直接作为命令行参数。
   const promptInput = promptInputForPlatform(process.platform);
   const useStdin = promptInput === 'stdin';
   const args = sessionId
-    ? adapter.buildResumeArgs(prompt, sessionId, promptInput)
-    : adapter.buildArgs(prompt, promptInput);
+    ? adapter.buildResumeArgs(prompt, sessionId, promptInput, attachments)
+    : adapter.buildArgs(prompt, promptInput, attachments);
 
   return new Promise((resolve, reject) => {
     // 固定用 `['pipe','pipe','pipe']`，让 stdin 始终可写（spawnCli 返回类型按字面量收窄）。
@@ -57,6 +60,7 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
     >();
     let finalResult: CliRunResult | undefined;
     let resultError: Error | undefined;
+    let appToolError: Error | undefined;
     let stderr = '';
     let settled = false;
     let timedOut = false;
@@ -85,6 +89,12 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
           continue;
         }
         if (event.type === 'tool_call') {
+          try {
+            assertAppToolAllowed(adapter.appTools, event.toolName);
+          } catch (error) {
+            // Keep role violations even if the CLI later emits a failed tool result.
+            appToolError = error as Error;
+          }
           observedToolCalls.set(event.toolUseId, event);
           continue;
         }
@@ -128,6 +138,7 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
         return fail(new Error(`${adapter.displayName} 执行已取消`));
       }
       if (resultError) return fail(resultError);
+      if (appToolError) return fail(appToolError);
       if (code !== 0) {
         return fail(new Error(
           stderr.trim() || `${adapter.displayName} 退出，状态码 ${code}`,
@@ -142,6 +153,11 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
           toolName: call.toolName,
           input: call.input,
         }));
+      }
+      try {
+        validateAppToolCalls(adapter.appTools, finalResult.toolCalls);
+      } catch (error) {
+        return fail(error as Error);
       }
       settled = true;
       finish();

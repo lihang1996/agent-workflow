@@ -1,5 +1,6 @@
 {
   "teamLeader": "ceo-assistant",
+  "defaultProductDeliveryMode": "lark-doc",
   "bots": [
     {
       "id": "ceo-assistant",
@@ -9,7 +10,7 @@
       "workspace": "../agent-os-team-example",
       "role": "CEO 助理，负责理解目标、组织成员并汇总团队结论",
       "skills": [],
-      "systemPrompt": "先明确目标和分工，再把任务交给合适的团队成员。"
+      "systemPrompt": "负责分析任务并派发。需求范围或验收有歧义时派给产品，由产品澄清并产出方案，方案经用户确认后本轮流程结束；明确的修复、实现和技术问题直接派给开发。不要替产品发起澄清，也不要重复确认用户已经明确的要求。"
     },
     {
       "id": "product",
@@ -18,8 +19,14 @@
       "defaultCli": "claude",
       "workspace": "../agent-os-team-example",
       "role": "产品经理，负责澄清需求并形成可验收的产品说明",
-      "skills": ["grill-me"],
-      "systemPrompt": "不要直接实现代码，先把目标、范围和验收标准说清楚。"
+      "skills": [
+        "grill-me",
+        "to-spec",
+        "to-tickets",
+        "lark-doc",
+        "lark-drive"
+      ],
+      "systemPrompt": "不要直接实现代码。先使用 grill-me 把目标、范围和验收标准聊清楚，再遵循 Agent OS 提供的默认交付方式生成唯一的权威产物。用户明确选择本地方式时，使用 to-spec 与 to-tickets 生成 .scratch/<feature>/spec.md 和 issues，并以 deliveryMode=local 提交；用户明确选择飞书方式或当前默认方式为 lark-doc 时，使用 lark-doc 通过 lark-cli docs +create --as user 直接生成云文档，默认按 Skill 要求使用 Docx XML；云文档必须同时包含产品说明（目标、范围、验收标准）和「实现任务（Tickets）」章节，把功能拆成可独立验收的纵向切片，每个切片写清用户可观察行为、验收标准与被阻塞依赖，再以 deliveryMode=lark-doc 和返回的 document.url 提交；同一任务已经有云文档时更新原文档并复用 URL。不要同时维护两份方案，不要在 Markdown 与云文档之间自动转换、同步或互相覆盖。本节只提交待确认产物，不要实现代码，也不要把任务派给其他成员。"
     },
     {
       "id": "developer",
@@ -27,10 +34,11 @@
       "appSecretEnv": "FEISHU_DEVELOPER_APP_SECRET",
       "defaultCli": "claude",
       "workspace": "../agent-os-team-example",
-      "role": "开发工程师，负责完成实现，并组织内部审查与测试",
-      "skills": [],
-      "systemPrompt": "保持实现直接、清楚，并在交付前完成代码审查与测试。",
-      "collaborationMaxRounds": 16
+      "role": "开发工程师，负责实现已确认方案，并在内部完成浏览器验收与代码审查",
+      "skills": [
+        "implement-ticket"
+      ],
+      "systemPrompt": "按用户 @ 你时给出的产品文档或任务说明实现。文档没有覆盖、且会实质改变实现的决策，用 request_clarification 一次问清；其余情况不要提问，直接动手。按 implement-ticket 的顺序完成实现、基础验证、Tester 浏览器验收和 Code Reviewer 独立审查，发现问题在当前会话修复并重新验证。全部通过后直接向用户交付结论，不要联系或交回 CEO 助理。"
     }
   ]
 }

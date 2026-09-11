@@ -2,51 +2,73 @@
  * Agent OS 入口。
  * 当前阶段：飞书消息驱动 Claude Code / Codex 完成任务。
  */
-import "dotenv/config";
-import { randomUUID } from "node:crypto";
-import { basename, join, resolve } from "node:path";
-import { startBot, type Bot } from "./im/lark.js";
+import 'dotenv/config';
+import type { CliAttachment } from './cli/types.js';
+import { subscribeDocumentComments } from './app/document-subscription.js';
+import { join, resolve } from 'node:path';
+import {
+  startBot,
+  type Bot,
+} from './im/lark.js';
 import {
   answerContinuation,
   answerNeedsContinuation,
-  buildCollaborationCard,
+  buildClarificationCard,
+  buildProductSpecApprovalCard,
+  buildClarificationSupersededCard,
   buildSessionNoticeCard,
   buildTaskCard,
   splitLongText,
   ThrottledCardUpdater,
-} from "./im/card.js";
-import { resolveMentions, extractResourceKeys } from "./im/message-parser.js";
-import { parseCliRequest, parseCommand } from "./core/command-parser.js";
-import { SessionManager } from "./core/session-manager.js";
-import { JsonSessionStore } from "./core/session-store.js";
-import { TaskProgressTracker } from "./core/task-progress.js";
-import type { ActiveRun } from "./core/task-abort.js";
+} from './im/card.js';
+import { resolveMentions, extractResourceKeys } from './im/message-parser.js';
+import { parseCliRequest, parseCommand } from './core/command-parser.js';
+import { SessionManager } from './core/session-manager.js';
+import { JsonSessionStore } from './core/session-store.js';
+import { TaskProgressTracker } from './core/task-progress.js';
+import type { ActiveRun } from './core/task-abort.js';
+import {
+  ClarificationFlowStore,
+  isClarificationOwner,
+  findClarificationRequest,
+  formatClarificationMessage,
+} from './core/clarification.js';
+import { JsonProductSpecFlowStore } from './core/product-spec-store.js';
+import { topicTaskId } from './core/topic-task.js';
 import {
   CollaborationInbox,
+  buildCollaborationPrompt,
+  collaborationOrigin,
   collaborationTurnKey,
+  findDispatchTaskRequest,
   type CollaborationMessage,
-} from "./core/collaboration.js";
+} from './core/collaboration.js';
 import {
   ensureWorkspaceDirectory,
   resolveWorkspacePath,
-} from "./core/workspace.js";
+} from './core/workspace.js';
 import {
   buildBotPrompt,
   loadAgentOsConfig,
   type BotConfig,
-} from "./core/bot-registry.js";
-import { TeamRegistry } from "./core/team-registry.js";
-import { getCliAdapter, listCliAdapters } from "./cli/registry.js";
-import { compactCliSession } from "./cli/native-compact.js";
-import { createCardActionHandler } from "./app/card-action-handler.js";
-import { executeCli } from "./app/cli-execution.js";
-import { handleSessionCommand } from "./app/command-handler.js";
-import { sendResultNotification } from "./app/notification-service.js";
-import { markSessionIdle } from "./app/session-view.js";
-import type { AppRuntime, BotRuntime } from "./app/runtime.js";
+} from './core/bot-registry.js';
+import { TeamRegistry } from './core/team-registry.js';
+import { getCliAdapter, listCliAdapters } from './cli/registry.js';
+import { compactCliSession } from './cli/native-compact.js';
+import { createCardActionHandler } from './app/card-action-handler.js';
+import { assertProductSpecDocuments } from './app/product-spec-documents.js';
+import { attachmentPromptSection, executeCli } from './app/cli-execution.js';
+import { handleSessionCommand } from './app/command-handler.js';
+import { sendResultNotification } from './app/notification-service.js';
+import { markSessionIdle } from './app/session-view.js';
+import { ProductCommentScheduler } from './app/product-comment-scheduler.js';
+import { normalizeProductDocument } from './app/product-document-url.js';
+import { ensureProductSpecSubmission } from './app/product-spec-submission.js';
+import { CollaborationService } from './app/collaboration-service.js';
+import type { AppRuntime, BotRuntime } from './app/runtime.js';
 
 const botConfigPath = resolve(
-  process.env.BOTS_CONFIG ?? join("config", "bots.json"),
+  process.env.BOTS_CONFIG ?? join('config', 'bots.json'),
 );
 const agentOsConfig = await loadAgentOsConfig(botConfigPath);
 const botConfigs = agentOsConfig.bots;
@@ -56,7 +78,7 @@ await Promise.all(
 );
 for (const missing of await teamRegistry.findMissingSkills()) {
   console.warn(
-    `[Skill] bot=${missing.botId} 找不到 $${missing.skill}，请安装到当前工作目录的 .agents/skills 或 .claude/skills`,
+    `[Skill] bot=${missing.botId} 找不到 ${missing.skill}，请安装到工作区或用户级 Skills 目录`,
   );
 }
 const defaultWorkspaces = Object.fromEntries(
@@ -64,7 +86,7 @@ const defaultWorkspaces = Object.fromEntries(
 );
 const sessions = await SessionManager.open({
   store: new JsonSessionStore(
-    join("data", "sessions.json"),
+    join('data', 'sessions.json'),
     botConfigs[0]?.id,
     defaultWorkspaces,
   ),
@@ -73,7 +95,11 @@ const activeRuns = new Map<string, ActiveRun>();
 const contextWindows = new Map<string, number>();
 const botRuntimes = new Map<string, BotRuntime>();
 const processedCollaborationTurns = new Set<string>();
-const collaborationInbox = new CollaborationInbox();
+const collaborationInbox = new CollaborationInbox(join('data', 'collaboration-inbox.json'));
+const clarificationFlows = new ClarificationFlowStore(join('data', 'clarification-flows.json'));
+const productSpecFlows = new JsonProductSpecFlowStore(
+  join('data', 'product-spec-flows.json'),
+);
 const runtime: AppRuntime = {
   sessions,
   teamRegistry,
@@ -82,9 +108,13 @@ const runtime: AppRuntime = {
   botRuntimes,
   processedCollaborationTurns,
   collaborationInbox,
+  clarificationFlows,
+  productSpecFlows,
 };
+const collaborationService = new CollaborationService(runtime);
+const productComments = new ProductCommentScheduler(runtime);
 
-console.log("Agent OS 启动，正在建立飞书长连接…");
+console.log('Agent OS 启动，正在建立飞书长连接…');
 console.log(
   `[配置] 已注册 ${botConfigs.length} 个 bot，Team Leader=${teamRegistry.leaderBotId}，已恢复 ${sessions.size} 个会话`,
 );
@@ -97,74 +127,31 @@ for (const config of botConfigs) {
   );
 }
 
-async function sendCollaborationMessage(options: {
-  senderConfig: BotConfig;
-  senderBot: Bot;
-  replyToMessageId: string;
-  targetBotId: string;
-  taskId: string;
-  round: number;
-  maxRounds: number;
-  workspaceDir: string;
-  prompt: string;
-}): Promise<void> {
-  const target = botRuntimes.get(options.targetBotId);
-  if (!target) throw new Error(`协作 bot 尚未就绪: ${options.targetBotId}`);
-  const collaboration: CollaborationMessage = {
-    dispatchId: randomUUID().replaceAll("-", "").slice(0, 12),
-    taskId: options.taskId,
-    fromBotId: options.senderConfig.id,
-    toBotId: options.targetBotId,
-    round: options.round,
-    maxRounds: options.maxRounds,
-    workspaceDir: options.workspaceDir,
-    prompt: options.prompt,
-  };
-  collaborationInbox.register(collaboration);
-  try {
-    const cardMessageId = await options.senderBot.replyCard(
-      options.replyToMessageId,
-      buildCollaborationCard({
-        senderName:
-          botRuntimes.get(options.senderConfig.id)?.identity.name ??
-          options.senderConfig.id,
-        targetName: target.identity.name,
-        workspaceName: basename(options.workspaceDir),
-        prompt: options.prompt,
-        round: options.round,
-        maxRounds: options.maxRounds,
-      }),
-      true,
-    );
-    if (!cardMessageId) throw new Error("飞书没有返回协作卡片 message_id");
-    const mentionMessageId = await options.senderBot.replyMention(
-      cardMessageId,
-      target.identity,
-      options.round === 1
-        ? `新的代码审查任务（任务编号：${collaboration.dispatchId}），请查看上方卡片。`
-        : `审查反馈已经返回（任务编号：${collaboration.dispatchId}），请查看上方卡片。`,
-      true,
-    );
-    if (!mentionMessageId) throw new Error("飞书没有返回协作通知 message_id");
-  } catch (error) {
-    collaborationInbox.consume(collaboration.dispatchId, collaboration.toBotId);
-    throw error;
-  }
-  console.log(
-    `[协作] task=${options.taskId} ${options.senderConfig.id} -> ${options.targetBotId} round=${options.round}/${options.maxRounds}`,
-  );
-}
-
-async function startConfiguredBot(config: BotConfig): Promise<void> {
+async function startConfiguredBot(
+  config: BotConfig,
+  collaborationService: CollaborationService,
+): Promise<void> {
   const startedBot = startBot({
     appId: config.appId,
     appSecret: config.appSecret,
-    onCardAction: createCardActionHandler({ runtime, config }),
+    onCardAction: createCardActionHandler({
+      runtime,
+      config,
+      defaultProductDeliveryMode: agentOsConfig.defaultProductDeliveryMode,
+    }),
+    onDocumentComment: config.skills.includes('lark-drive')
+      ? async (comment, bot) => productComments.schedule(
+          config,
+          bot,
+          comment,
+        )
+      : undefined,
     onMessage: async (msg, bot) => {
       const resolved = resolveMentions(msg.text, msg.mentions);
+      const taskId = topicTaskId(msg);
       let senderRuntime: BotRuntime | undefined;
       let collaboration: CollaborationMessage | undefined;
-      if (msg.senderType === "app" || msg.senderType === "bot") {
+      if (msg.senderType === 'app' || msg.senderType === 'bot') {
         const currentRuntime = botRuntimes.get(config.id);
         const mentionedCurrentBot = currentRuntime
           ? msg.mentions.some(
@@ -172,10 +159,11 @@ async function startConfiguredBot(config: BotConfig): Promise<void> {
             )
           : false;
         const dispatchId = msg.text.match(/任务编号：([a-f0-9]{12})/)?.[1];
-        const pending =
-          msg.messageType === "post" && mentionedCurrentBot && dispatchId
-            ? collaborationInbox.consume(dispatchId, config.id)
-            : undefined;
+        const pending = msg.messageType === 'post'
+          && mentionedCurrentBot
+          && dispatchId
+          ? collaborationInbox.peek(dispatchId, config.id)
+          : undefined;
         if (!pending) {
           console.log(
             `[协作] 忽略非目标 bot 消息 sender=${msg.senderOpenId} target=${config.id}`,
@@ -187,12 +175,13 @@ async function startConfiguredBot(config: BotConfig): Promise<void> {
           console.log(`[协作] 找不到来源 bot: ${pending.fromBotId}`);
           return;
         }
+        if (senderRuntime.identity.openId !== msg.senderOpenId) return;
         const turnKey = collaborationTurnKey(pending);
         if (processedCollaborationTurns.has(turnKey)) {
           console.log(`[协作] 忽略重复消息 ${turnKey}`);
           return;
         }
-        processedCollaborationTurns.add(turnKey);
+
         collaboration = pending;
       }
       const hasThread = !!msg.threadId || !!msg.rootId;
@@ -206,6 +195,18 @@ async function startConfiguredBot(config: BotConfig): Promise<void> {
         );
         return;
       }
+      const pendingClarification =
+        msg.senderType !== 'app'
+        && msg.senderType !== 'bot'
+        && !command
+          ? clarificationFlows.findForTask(taskId, config.id)
+          : undefined;
+      if (pendingClarification && !isClarificationOwner(pendingClarification, {
+        operatorOpenId: msg.senderOpenId, operatorUnionId: msg.senderUnionId, operatorBotId: config.id,
+      })) {
+        await bot.reply(msg.messageId, '只有原任务发起人可以补充这组澄清问题。', hasThread);
+        return;
+      }
       const resolvedSession = await sessions.resolve(
         msg,
         cliRequest?.cliId ?? config.defaultCliId,
@@ -214,19 +215,24 @@ async function startConfiguredBot(config: BotConfig): Promise<void> {
       );
       let { session } = resolvedSession;
       const { isNew } = resolvedSession;
-      if (command && isNew && session.status === "creating") {
-        session = await sessions.transition(session.id, "idle");
+      if (command && isNew && session.status === 'creating') {
+        session = await sessions.transition(session.id, 'idle');
       }
-      const cliAdapter = getCliAdapter(session.cliId);
-      const isCompacting = command?.name === "compact";
-      const taskText = collaboration?.prompt ?? cliRequest?.prompt ?? resolved;
-      const prompt = buildBotPrompt(
-        config,
-        taskText,
-        teamRegistry.contextFor(config.id),
-      );
+      const cliAdapter = getCliAdapter(session.cliId, teamRegistry.appToolsFor(config.id));
+      const isCompacting = command?.name === 'compact';
+      const taskText = pendingClarification
+        ? formatClarificationMessage(
+            pendingClarification,
+            cliRequest?.prompt ?? resolved,
+          )
+        : collaboration
+          ? buildCollaborationPrompt(collaboration)
+          : cliRequest?.prompt ?? resolved;
+      const collaborationContext = collaboration
+        ? collaborationOrigin(collaboration)
+        : pendingClarification?.collaboration;
       const taskCardTitle = isCompacting
-        ? "整理上下文"
+        ? '整理上下文'
         : cliAdapter.displayName;
       console.log(
         `[收到] chat=${msg.chatId} threadId=${msg.threadId} rootId=${msg.rootId} sender=${msg.senderOpenId}`,
@@ -234,10 +240,10 @@ async function startConfiguredBot(config: BotConfig): Promise<void> {
       console.log(`  原文: ${msg.text}`);
       console.log(`  还原: ${resolved}`);
       console.log(
-        `  mentions: ${msg.mentions.map((m) => `${m.key}=${m.name}(${m.openId})`).join(", ") || "(无)"}`,
+        `  mentions: ${msg.mentions.map((m) => `${m.key}=${m.name}(${m.openId})`).join(', ') || '(无)'}`,
       );
       console.log(
-        `  [会话] ${isNew ? "新建" : "复用"} id=${session.id} status=${session.status}`,
+        `  [会话] ${isNew ? '新建' : '复用'} id=${session.id} status=${session.status}`,
       );
 
       const commandOutcome = await handleSessionCommand({
@@ -252,31 +258,48 @@ async function startConfiguredBot(config: BotConfig): Promise<void> {
         isNew,
         hasThread,
       });
-      if (commandOutcome === "handled") return;
+      if (commandOutcome === 'handled') return;
 
-      if (session.status === "closed") {
+      if (session.status === 'closed') {
         await bot.reply(
           msg.messageId,
-          "这个话题的会话已经关闭，请新开一个话题继续。",
+          '这个话题的会话已经关闭，请新开一个话题继续。',
           hasThread,
         );
         return;
       }
-      if (!isNew && session.status === "creating") {
+      if (!isNew && session.status === 'creating') {
         await bot.reply(
           msg.messageId,
-          "当前会话正在准备，请稍后再追问。",
+          '当前会话正在准备，请稍后再追问。',
           hasThread,
         );
         return;
       }
-      if (session.status === "active") {
+      if (session.status === 'active') {
         await bot.reply(
           msg.messageId,
-          "当前会话还在执行，请等任务结束后再追问。",
+          '当前会话还在执行，请等任务结束后再追问。',
           hasThread,
         );
         return;
+      }
+
+      if (pendingClarification) {
+        clarificationFlows.delete(pendingClarification.token);
+        if (pendingClarification.cardMessageId) {
+          try {
+            await bot.updateCard(
+              pendingClarification.cardMessageId,
+              buildClarificationSupersededCard(pendingClarification),
+            );
+          } catch (error) {
+            console.warn(
+              '[澄清] 旧卡片更新失败，继续处理用户的新消息:',
+              (error as Error).message,
+            );
+          }
+        }
       }
 
       if (
@@ -290,30 +313,52 @@ async function startConfiguredBot(config: BotConfig): Promise<void> {
         );
       }
 
-      await sessions.transition(session.id, "active");
+      await sessions.transition(session.id, 'active');
+      if (collaboration) {
+        try {
+          if (!collaborationInbox.consume(collaboration.dispatchId, config.id)) {
+            await markSessionIdle(sessions, session.id);
+            return;
+          }
+          processedCollaborationTurns.add(collaborationTurnKey(collaboration));
+          if (processedCollaborationTurns.size > 1000) processedCollaborationTurns.delete(processedCollaborationTurns.values().next().value!);
+        } catch (error) {
+          await markSessionIdle(sessions, session.id);
+          throw error;
+        }
+      }
       const run = new AbortController();
       const activeRun: ActiveRun = {
         controller: run,
-        ownerOpenId: msg.senderOpenId,
+        ownerUnionId: collaboration?.ownerUnionId ?? pendingClarification?.ownerUnionId ?? msg.senderUnionId,
+        ownerOpenId: collaboration?.ownerOpenId ?? pendingClarification?.ownerOpenId ?? msg.senderOpenId,
+        ownerBotId: collaboration?.ownerBotId ?? (collaboration ? collaboration.fromBotId : pendingClarification?.ownerBotId ?? config.id),
       };
       activeRuns.set(session.id, activeRun);
 
-      // 图片/文件下载
-      const resources = extractResourceKeys(msg.messageType, msg.rawContent);
-      for (const res of resources) {
+      // 图片/文件先落盘，再把绝对路径写进 prompt，CLI 才知道有附件可读。
+      const attachments: CliAttachment[] = [];
+      for (const res of extractResourceKeys(msg.messageType, msg.rawContent)) {
         try {
           const savePath = await bot.downloadResource(
             msg.messageId,
             res.key,
             res.type,
-            join("data", "downloads"),
+            resolve('data', 'downloads'),
             res.fileName,
           );
+          attachments.push({ path: savePath, type: res.type, fileName: res.fileName });
           console.log(`  [下载] ${res.type} → ${savePath}`);
         } catch (e) {
           console.error(`  [下载失败] ${res.key}:`, (e as Error).message);
         }
       }
+      const prompt = buildBotPrompt(
+        config,
+        taskText + attachmentPromptSection(attachments),
+        teamRegistry.contextFor(config.id),
+        agentOsConfig.defaultProductDeliveryMode,
+      );
 
       // 先回复一张卡片，让用户知道任务已经进入执行队列。
       let cardId: string | undefined;
@@ -322,12 +367,12 @@ async function startConfiguredBot(config: BotConfig): Promise<void> {
           msg.messageId,
           buildTaskCard({
             title: taskCardTitle,
-            status: "running",
+            status: 'running',
             detail: isCompacting
-              ? cliAdapter.id === "codex" && command?.instructions
-                ? "Codex 正在使用原生默认策略整理上下文"
+              ? cliAdapter.id === 'codex' && command?.instructions
+                ? 'Codex 正在使用原生默认策略整理上下文'
                 : `正在调用 ${cliAdapter.displayName} 原生上下文整理`
-              : "正在理解任务",
+              : '正在理解任务',
             abortSessionId: session.id,
           }),
           hasThread,
@@ -340,7 +385,7 @@ async function startConfiguredBot(config: BotConfig): Promise<void> {
       }
 
       if (!cardId) {
-        console.error("[卡片] 响应里没有 message_id，无法继续更新");
+        console.error('[卡片] 响应里没有 message_id，无法继续更新');
         if (activeRuns.get(session.id)?.controller === run)
           activeRuns.delete(session.id);
         await markSessionIdle(sessions, session.id);
@@ -361,7 +406,7 @@ async function startConfiguredBot(config: BotConfig): Promise<void> {
         cardUpdater.push(
           buildTaskCard({
             title: taskCardTitle,
-            status: "running",
+            status: 'running',
             detail: isCompacting
               ? `正在调用 ${cliAdapter.displayName} 原生上下文整理`
               : snapshot.current,
@@ -382,9 +427,10 @@ async function startConfiguredBot(config: BotConfig): Promise<void> {
             instructions: command.instructions,
             signal: run.signal,
           }).then((result) => ({
-            answer: result.message ?? "",
+            answer: result.message ?? '',
             sessionId: result.sessionId,
             stats: undefined,
+            toolCalls: undefined,
           }))
         : executeCli(
             cliAdapter,
@@ -394,14 +440,15 @@ async function startConfiguredBot(config: BotConfig): Promise<void> {
             run.signal,
             (event) => {
               if (
-                event.type !== "tool_start" &&
-                event.type !== "tool_end" &&
-                event.type !== "context"
+                event.type !== 'tool_start' &&
+                event.type !== 'tool_end' &&
+                event.type !== 'context'
               )
                 return;
               progress.accept(event);
               renderProgress();
             },
+            attachments,
           );
 
       void execution
@@ -413,140 +460,227 @@ async function startConfiguredBot(config: BotConfig): Promise<void> {
           if (!isCompacting && result.stats?.contextWindowTokens) {
             contextWindows.set(session.id, result.stats.contextWindowTokens);
           }
+          const clarificationRequest = !isCompacting
+            && cliAdapter.appTools.includes('request_clarification')
+            ? findClarificationRequest(result.toolCalls)
+            : undefined;
+          if (clarificationRequest) {
+            const flow = clarificationFlows.create({
+              taskId,
+              botId: config.id,
+              sessionId: session.id,
+              ownerOpenId: collaboration?.ownerOpenId ?? pendingClarification?.ownerOpenId ?? msg.senderOpenId,
+              ownerBotId: collaboration?.ownerBotId ?? (collaboration ? collaboration.fromBotId : pendingClarification?.ownerBotId ?? config.id),
+              ownerUnionId: collaboration?.ownerUnionId ?? pendingClarification?.ownerUnionId ?? msg.senderUnionId,
+              collaboration: collaborationContext,
+              originalMessageId: msg.messageId,
+              cardMessageId: cardId,
+              replyInThread: hasThread,
+              request: clarificationRequest,
+            });
+            await cardUpdater.finish(buildClarificationCard({ flow }));
+            await sendResultNotification({
+              bot,
+              replyToMessageId: msg.messageId,
+              target: { openId: flow.ownerOpenId, name: '' },
+              text: `需要你确认 ${clarificationRequest.questions.length} 个问题，请在上方卡片中选择。`,
+              replyInThread: hasThread,
+            });
+            console.log(
+              `[澄清] 已发送交互卡片 questions=${clarificationRequest.questions.length}`,
+            );
+            return;
+          }
+          const finalResult = result;
+          let productSpecRequest = !isCompacting && cliAdapter.appTools.includes('request_spec_approval')
+            ? (await ensureProductSpecSubmission({ result })).request
+            : undefined;
+          const dispatchRequest = !isCompacting
+            ? findDispatchTaskRequest(finalResult.toolCalls)
+            : undefined;
+          if (dispatchRequest) {
+            if (config.id !== agentOsConfig.teamLeaderId) {
+              throw new Error('只有 CEO 助理可以调用 dispatch_task 派发团队任务');
+            }
+            const dispatchTarget = teamRegistry.get(dispatchRequest.targetBotId);
+            if (!dispatchTarget) {
+              throw new Error(
+                `团队成员未注册或未启用: ${dispatchRequest.targetBotId}`,
+              );
+            }
+            if (dispatchRequest.targetBotId === config.id) {
+              throw new Error(
+                `不能把团队任务派发给当前 bot: ${config.id}`,
+              );
+            }
+            if (
+              collaboration
+              && collaboration.round >= collaboration.maxRounds
+            ) {
+              throw new Error(
+                `协作任务已达到轮次上限 ${collaboration.maxRounds}，不能继续派发`,
+              );
+            }
+          }
+          if (productSpecRequest && dispatchRequest) {
+            throw new Error('不能同时提交产品方案和派发团队任务');
+          }
+          if (productSpecRequest) {
+            productSpecRequest = await normalizeProductDocument(bot, productSpecRequest);
+            if (productSpecRequest.deliveryMode === 'local') {
+              await assertProductSpecDocuments(
+                session.workspaceDir,
+                productSpecRequest,
+              );
+            }
+            const flow = productSpecFlows.create({
+              taskId,
+              botId: config.id,
+              sessionId: session.id,
+              ownerOpenId: collaboration?.ownerOpenId ?? pendingClarification?.ownerOpenId ?? msg.senderOpenId,
+              ownerBotId: collaboration?.ownerBotId ?? (collaboration ? collaboration.fromBotId : pendingClarification?.ownerBotId ?? config.id),
+              ownerUnionId: collaboration?.ownerUnionId ?? pendingClarification?.ownerUnionId ?? msg.senderUnionId,
+              collaboration: collaborationContext,
+              request: productSpecRequest,
+            });
+            await cardUpdater.finish(buildProductSpecApprovalCard(flow));
+            await sendResultNotification({
+              bot,
+              replyToMessageId: msg.messageId,
+              target: {
+                openId: collaboration?.ownerOpenId ?? pendingClarification?.ownerOpenId ?? msg.senderOpenId,
+                name: '',
+              },
+              text: '产品方案已生成，请查看上方确认卡。',
+              replyInThread: hasThread,
+            });
+            console.log('[产品文档] 已展示待确认产物');
+            return;
+          }
           const snapshot = progress.snapshot();
-          await cardUpdater.finish(
-            isCompacting
-              ? buildSessionNoticeCard({
-                  title: result.answer ? "暂时无需整理" : "上下文已整理",
-                  template: result.answer ? "grey" : "green",
-                  detail:
-                    result.answer ||
-                    [
-                      `${cliAdapter.displayName} 已在当前 CLI 会话内完成原生压缩。`,
-                      "CLI 会话 ID 保持不变，下一条任务会继续使用整理后的上下文。",
-                    ].join("\n\n"),
-                })
-              : buildTaskCard({
-                  title: taskCardTitle,
-                  status: "success",
-                  detail: "执行完成",
-                  progress: snapshot,
-                  answer: result.answer,
-                  stats: result.stats,
-                }),
-          );
-          if (!isCompacting && answerNeedsContinuation(result.answer)) {
+          await cardUpdater.finish(isCompacting
+            ? buildSessionNoticeCard({
+              title: finalResult.answer ? '暂时无需整理' : '上下文已整理',
+              template: finalResult.answer ? 'grey' : 'green',
+              detail: finalResult.answer || [
+                `${cliAdapter.displayName} 已在当前 CLI 会话内完成原生压缩。`,
+                'CLI 会话 ID 保持不变，下一条任务会继续使用整理后的上下文。',
+              ].join('\n\n'),
+            })
+            : buildTaskCard({
+              title: taskCardTitle,
+              status: 'success',
+              detail: '执行完成',
+              progress: snapshot,
+              answer: finalResult.answer,
+              stats: finalResult.stats,
+            }));
+          if (!isCompacting && answerNeedsContinuation(finalResult.answer)) {
             for (const chunk of splitLongText(
-              answerContinuation(result.answer),
+              answerContinuation(finalResult.answer),
             )) {
               await bot.reply(msg.messageId, chunk, hasThread);
             }
           }
           console.log(
-            `[CLI] ${cliAdapter.id} 完成 session_id=${result.sessionId ?? "(无)"}`,
+            `[CLI] ${cliAdapter.id} 完成 session_id=${result.sessionId ?? '(无)'}`,
           );
           if (!collaboration) {
             await sendResultNotification({
               bot,
               replyToMessageId: msg.messageId,
-              target: { openId: msg.senderOpenId, name: "" },
+              target: { openId: msg.senderOpenId, name: '' },
               text: isCompacting
-                ? "上下文整理已完成，请查看上方结果。"
-                : "任务已完成，请查看上方结果。",
+                ? '上下文整理已完成，请查看上方结果。'
+                : '任务已完成，请查看上方结果。',
               replyInThread: hasThread,
             });
           }
           if (!isCompacting) {
             try {
-              if (
-                collaboration &&
-                collaboration.round < collaboration.maxRounds
-              ) {
-                await sendCollaborationMessage({
+              if (dispatchRequest) {
+                await collaborationService.dispatch({
                   senderConfig: config,
                   senderBot: bot,
                   replyToMessageId: msg.messageId,
-                  targetBotId: collaboration.fromBotId,
-                  taskId: collaboration.taskId,
-                  round: collaboration.round + 1,
-                  maxRounds: collaboration.maxRounds,
+                  targetBotId: dispatchRequest.targetBotId,
+                  taskId,
+                  ownerOpenId: collaboration?.ownerOpenId ?? pendingClarification?.ownerOpenId ?? msg.senderOpenId,
+                  ownerBotId: collaboration?.ownerBotId ?? (collaboration ? collaboration.fromBotId : pendingClarification?.ownerBotId ?? config.id),
+                  ownerUnionId: collaboration?.ownerUnionId ?? pendingClarification?.ownerUnionId ?? msg.senderUnionId,
+                  reportToBotId: collaboration?.reportToBotId ?? config.id,
+                  objective: dispatchRequest.objective,
+                  instruction: dispatchRequest.instruction,
+                  expectedOutput: dispatchRequest.expectedOutput,
+                  round: collaboration ? collaboration.round + 1 : 1,
+                  maxRounds: collaboration?.maxRounds
+                    ?? config.collaborationMaxRounds,
                   workspaceDir: session.workspaceDir,
-                  prompt: result.answer || "任务已完成，请检查当前工作目录。",
                 });
-              } else if (!collaboration && config.reviewBy) {
-                await sendCollaborationMessage({
-                  senderConfig: config,
-                  senderBot: bot,
-                  replyToMessageId: msg.messageId,
-                  targetBotId: config.reviewBy,
-                  taskId: randomUUID(),
-                  round: 1,
-                  maxRounds: config.collaborationMaxRounds,
-                  workspaceDir: session.workspaceDir,
-                  prompt: [
-                    "请独立检查当前工作目录中刚完成的实现。",
-                    `原始任务：${taskText}`,
-                    "请直接读取代码和改动，指出明确问题；没有问题时说明检查通过。",
-                  ].join("\n\n"),
-                });
-              } else if (collaboration && senderRuntime) {
+                if (!collaboration) {
+                  const targetName = botRuntimes.get(dispatchRequest.targetBotId)
+                    ?.identity.name ?? dispatchRequest.targetBotId;
+                  await sendResultNotification({
+                    bot,
+                    replyToMessageId: msg.messageId,
+                    target: { openId: msg.senderOpenId, name: '' },
+                    text: `任务已交给 ${targetName}，请查看上方协作消息。`,
+                    replyInThread: hasThread,
+                  });
+                }
+              } else if (collaboration) {
+                // 协作结果直接交给用户，不再回传给派发方转述。
                 await sendResultNotification({
                   bot,
                   replyToMessageId: msg.messageId,
-                  target: senderRuntime.identity,
-                  text: "本轮协作已完成，请查看上方结果。",
+                  target: { openId: collaboration.ownerOpenId, name: '' },
+                  text: `协作任务“${collaboration.objective}”已经完成，请查看上方结果。`,
                   replyInThread: hasThread,
                 });
               }
             } catch (error) {
               const message = (error as Error).message;
-              console.error("[协作] 派发失败:", message);
-              await bot.reply(
-                msg.messageId,
-                `协作派发失败：${message}`,
-                hasThread,
-              );
+              console.error('[协作] 派发失败:', message);
+              await bot.reply(msg.messageId, `协作派发失败：${message}`, hasThread);
             }
           }
         })
         .catch(async (error) => {
           clearInterval(progressHeartbeat);
           if (run.signal.aborted) {
-            console.log("[CLI] 任务已取消");
+            console.log('[CLI] 任务已取消');
             await cardUpdater.finish(
               buildTaskCard({
                 title: taskCardTitle,
-                status: "cancelled",
+                status: 'cancelled',
                 detail:
-                  activeRun.cancelMode === "close"
-                    ? "本次任务已停止，当前会话已经关闭。"
+                  activeRun.cancelMode === 'close'
+                    ? '本次任务已停止，当前会话已经关闭。'
                     : isCompacting
-                      ? "整理已停止，当前 CLI 会话没有改变。"
-                      : "本次任务已停止。你可以继续在当前话题里提问。",
+                      ? '整理已停止，当前 CLI 会话没有改变。'
+                      : '本次任务已停止。你可以继续在当前话题里提问。',
                 progress: progress.snapshot(),
               }),
             );
             await sendResultNotification({
               bot,
               replyToMessageId: msg.messageId,
-              target: senderRuntime?.identity ?? {
-                openId: msg.senderOpenId,
-                name: "",
-              },
-              text: "任务已停止，请查看上方状态。",
+              target: senderRuntime?.identity
+                ?? { openId: msg.senderOpenId, name: '' },
+              text: '任务已停止，请查看上方状态。',
               replyInThread: hasThread,
             });
             return;
           }
           const message = (error as Error).message;
-          console.error("[CLI] 执行失败:", message);
+          console.error('[CLI] 执行失败:', message);
           await cardUpdater.finish(
             buildTaskCard({
               title: taskCardTitle,
-              status: "failed",
+              status: 'failed',
               detail: isCompacting
-                ? "上下文整理失败，当前 CLI 会话没有改变。"
-                : "执行没有完成。你可以调整指令后，在当前话题里重试。",
+                ? '上下文整理失败，当前 CLI 会话没有改变。'
+                : '执行没有完成。你可以调整指令后，在当前话题里重试。',
               technicalDetail: message,
               progress: progress.snapshot(),
             }),
@@ -554,11 +688,9 @@ async function startConfiguredBot(config: BotConfig): Promise<void> {
           await sendResultNotification({
             bot,
             replyToMessageId: msg.messageId,
-            target: senderRuntime?.identity ?? {
-              openId: msg.senderOpenId,
-              name: "",
-            },
-            text: "任务执行失败，请查看上方错误信息。",
+            target: senderRuntime?.identity
+              ?? { openId: msg.senderOpenId, name: '' },
+            text: '任务执行失败，请查看上方错误信息。',
             replyInThread: hasThread,
           });
         })
@@ -566,24 +698,39 @@ async function startConfiguredBot(config: BotConfig): Promise<void> {
           clearInterval(progressHeartbeat);
           if (activeRuns.get(session.id)?.controller === run) {
             activeRuns.delete(session.id);
-          }
-          try {
-            await markSessionIdle(sessions, session.id);
-          } catch (error) {
-            console.error("[会话] 保存空闲状态失败:", (error as Error).message);
+            try { await markSessionIdle(sessions, session.id); }
+            catch (error) { console.error('[会话] 保存空闲状态失败:', (error as Error).message); }
           }
         })
         .catch((error) => {
-          console.error("[任务] 回传或收尾失败:", (error as Error).message);
+          console.error('[任务] 回传或收尾失败:', (error as Error).message);
         });
     },
   });
   const identity = await startedBot.getIdentity();
   const botRuntime = { config, bot: startedBot, identity };
   botRuntimes.set(config.id, botRuntime);
+  if (config.skills.includes('lark-drive')) {
+    await subscribeDocumentComments(startedBot, config.id);
+  }
   console.log(
     `[Bot ${config.id.toUpperCase()}] 已连接 name=${identity.name} open_id=${identity.openId}`,
   );
 }
 
-await Promise.all(botConfigs.map(startConfiguredBot));
+
+await Promise.all(
+  botConfigs.map((config) => startConfiguredBot(config, collaborationService)),
+);
+
+// 尚未送达的协作派发（例如目标 Bot 当时离线）在启动后及每分钟补发一次。
+let recoveringDispatches = false;
+async function recoverDispatches(): Promise<void> {
+  if (recoveringDispatches) return;
+  recoveringDispatches = true;
+  try { await collaborationService.recover(); }
+  finally { recoveringDispatches = false; }
+}
+void recoverDispatches().catch(console.error);
+const dispatchRecoveryTimer = setInterval(() => { void recoverDispatches().catch(console.error); }, 60_000);
+dispatchRecoveryTimer.unref();
