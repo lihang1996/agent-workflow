@@ -1,6 +1,6 @@
 /**
  * Agent OS 入口。
- * 当前阶段：飞书消息驱动 Claude Code / Codex 完成任务。
+ * 当前阶段：飞书消息驱动 Claude Code / Codex / Cursor / ZCode 完成任务。
  */
 import 'dotenv/config';
 import { createMessageHandler } from './app/message-handler.js';

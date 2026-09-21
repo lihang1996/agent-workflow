@@ -22,12 +22,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
-function serverBase(): { command: string; args: string[] } {
+function mcpServerScript(scriptName: string): { command: string; args: string[] } {
   const runningFromTypeScript = import.meta.url.endsWith('.ts');
   const server = fileURLToPath(new URL(
     runningFromTypeScript
-      ? '../mcp/app-tools-server.ts'
-      : '../mcp/app-tools-server.js',
+      ? `../mcp/${scriptName}.ts`
+      : `../mcp/${scriptName}.js`,
     import.meta.url,
   ));
   if (!runningFromTypeScript) {
@@ -37,6 +37,10 @@ function serverBase(): { command: string; args: string[] } {
     new URL('../../node_modules/tsx/dist/cli.mjs', import.meta.url),
   );
   return { command: process.execPath, args: [tsxCli, server] };
+}
+
+function serverBase(): { command: string; args: string[] } {
+  return mcpServerScript('app-tools-server');
 }
 
 function serverInvocation(allowed: readonly AppToolName[]): { command: string; args: string[] } {
@@ -93,6 +97,67 @@ export function ensureCursorAppToolsConfig(
       throw error;
     });
     cursorMcpSetup.set(filePath, pending);
+  }
+  return pending;
+}
+
+const zcodeMcpSetup = new Map<string, Promise<void>>();
+
+export function mergeZcodeMcpConfig(existing: unknown): Record<string, unknown> {
+  const current = isRecord(existing) ? { ...existing } : {};
+  const mcp = isRecord(current.mcp) ? { ...current.mcp } : {};
+  const servers = isRecord(mcp.servers) ? { ...mcp.servers } : {};
+  // 共享配置不静态写死工具列表：入口读取每次 spawn 注入的环境变量。
+  const base = mcpServerScript('zcode-app-tools-server');
+  servers.agent_os = {
+    type: 'stdio',
+    command: base.command,
+    args: [...base.args],
+  };
+  mcp.servers = servers;
+  return { ...current, mcp };
+}
+
+function zcodeAgentOsEntryMatches(existing: unknown, desired: unknown): boolean {
+  if (!isRecord(existing) || !isRecord(existing.mcp) || !isRecord(existing.mcp.servers)) {
+    return false;
+  }
+  return JSON.stringify(existing.mcp.servers.agent_os) === JSON.stringify(desired);
+}
+
+async function setupZcodeAppToolsConfig(filePath: string): Promise<void> {
+  await mkdir(dirname(filePath), { recursive: true });
+  let existing: unknown = {};
+  try {
+    existing = JSON.parse(await readFile(filePath, 'utf8'));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      existing = {};
+    } else {
+      // 解析失败报错并保留原文件，不当作空配置覆盖。
+      throw new Error(`无法读取 ZCode MCP 配置: ${(error as Error).message}`);
+    }
+  }
+  const merged = mergeZcodeMcpConfig(existing);
+  const servers = isRecord(merged.mcp) && isRecord(merged.mcp.servers)
+    ? merged.mcp.servers
+    : {};
+  if (zcodeAgentOsEntryMatches(existing, servers.agent_os)) return;
+  const tempPath = `${filePath}.${process.pid}.tmp`;
+  await writeFile(tempPath, `${JSON.stringify(merged, null, 2)}\n`);
+  await rename(tempPath, filePath);
+}
+
+export function ensureZcodeAppToolsConfig(
+  filePath = join(homedir(), '.zcode', 'cli', 'config.json'),
+): Promise<void> {
+  let pending = zcodeMcpSetup.get(filePath);
+  if (!pending) {
+    pending = setupZcodeAppToolsConfig(filePath).catch((error) => {
+      zcodeMcpSetup.delete(filePath);
+      throw error;
+    });
+    zcodeMcpSetup.set(filePath, pending);
   }
   return pending;
 }

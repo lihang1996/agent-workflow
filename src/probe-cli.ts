@@ -3,6 +3,7 @@
  * 用法：
  *   claude -p "..." --output-format stream-json --verbose | pnpm probe:cli
  *   agent -p --force --output-format stream-json "..." | pnpm probe:cli
+ *   zcode --prompt "..." --mode yolo --output-format stream-json | pnpm probe:cli
  */
 import { createInterface } from 'node:readline';
 
@@ -31,12 +32,33 @@ rl.on('line', (line) => {
       }
       break;
     case 'result':
-      console.log(`${stamp()} 完成 turns=${ev.num_turns} 耗时=${ev.duration_ms}ms 成本=$${ev.total_cost_usd}`);
-      console.log(`${stamp()} 最终回答: ${ev.result}`);
+      // Claude 用 result 字段；ZCode 顶层汇总用 response 字段。
+      if (ev.result !== undefined || ev.num_turns !== undefined) {
+        console.log(`${stamp()} 完成 turns=${ev.num_turns} 耗时=${ev.duration_ms}ms 成本=$${ev.total_cost_usd}`);
+        console.log(`${stamp()} 最终回答: ${ev.result}`);
+      } else if (ev.response !== undefined) {
+        console.log(`${stamp()} 最终回答: ${ev.response}`);
+        if (ev.usage) console.log(`${stamp()} 本轮用量: ${JSON.stringify(ev.usage)}`);
+        if (ev.projection) {
+          console.log(`${stamp()} 上下文: used=${ev.projection.contextUsed ?? '-'} window=${ev.projection.contextWindow ?? '-'}`);
+        }
+      }
       break;
     case 'tool_call':
       if (ev.subtype === 'started') console.log(`${stamp()} 开始工具: ${ev.call_id}`);
       if (ev.subtype === 'completed') console.log(`${stamp()} 完成工具: ${ev.call_id}`);
+      break;
+
+    // ── ZCode ──
+    case 'session.created':
+    case 'session.resumed':
+      console.log(`${stamp()} 会话${ev.type === 'session.created' ? '开始' : '续接'} sessionId=${ev.sessionId}`);
+      break;
+    case 'tool.updated':
+      console.log(`${stamp()} 工具 ${ev.payload?.kind}: ${ev.payload?.toolName ?? ''} (${ev.payload?.toolCallId ?? ''})`);
+      break;
+    case 'turn.failed':
+      console.log(`${stamp()} 失败: ${ev.payload?.error?.message ?? '(无消息)'}`);
       break;
 
     // ── Codex ──

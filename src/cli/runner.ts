@@ -3,7 +3,7 @@ import { promptInputForPlatform } from './types.js';
 import { createInterface } from 'node:readline';
 import type { CliAdapter, CliAttachment, CliEvent, CliRunResult } from './types.js';
 import { assertAppToolAllowed, validateAppToolCalls } from '../core/app-tool-policy.js';
-import { ensureCursorAppToolsConfig } from './app-tools.js';
+import { ensureCursorAppToolsConfig, ensureZcodeAppToolsConfig } from './app-tools.js';
 
 const DEFAULT_TIMEOUT_MS = 50 * 60 * 1000;
 
@@ -21,6 +21,9 @@ export interface RunCliOptions {
 export function runCli(options: RunCliOptions): Promise<CliRunResult> {
   if (options.adapter.id === 'cursor') {
     return ensureCursorAppToolsConfig().then(() => executeRun(options));
+  }
+  if (options.adapter.id === 'zcode') {
+    return ensureZcodeAppToolsConfig().then(() => executeRun(options));
   }
   return executeRun(options);
 }

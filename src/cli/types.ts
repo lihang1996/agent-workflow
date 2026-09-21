@@ -1,6 +1,6 @@
 import type { AppToolName } from '../core/app-tool-policy.js';
 
-export const CLI_IDS = ['claude', 'codex', 'cursor'] as const;
+export const CLI_IDS = ['claude', 'codex', 'cursor', 'zcode'] as const;
 export type CliId = typeof CLI_IDS[number];
 
 export type CliPromptInput = 'argument' | 'stdin';

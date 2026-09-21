@@ -216,7 +216,7 @@ export function createCardActionHandler(options: {
         return { toast: { type: 'warning', content: '当前话题的会话已经关闭。' } };
       }
       const cliAdapter = getCliAdapter(session.cliId);
-      if (cliAdapter.id === 'cursor') {
+      if (cliAdapter.id === 'cursor' || cliAdapter.id === 'zcode') {
         return { toast: { type: 'error', content: `${cliAdapter.displayName} 暂不支持此操作` } };
       }
       try {
