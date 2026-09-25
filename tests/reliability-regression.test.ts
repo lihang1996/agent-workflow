@@ -40,7 +40,7 @@ const comment: IncomingDocumentComment = { eventId: 'event', fileToken: 'docToke
 async function fixture(t: { after: (callback: () => void) => void }) {
   const dir = mkdtempSync(join(tmpdir(), 'agent-os-lifecycle-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const config: BotConfig = { id: 'product', appId: 'fixture', appSecret: 'fixture', defaultCliId: 'claude', role: '产品', skills: ['lark-doc', 'lark-drive'], systemPrompt: '', workspaceDir: dir, collaborationMaxRounds: 16 };
+  const config: BotConfig = { id: 'product', appId: 'fixture', appSecret: 'fixture', defaultCliId: 'claude', modelOverrides: {}, role: '产品', skills: ['lark-doc', 'lark-drive'], systemPrompt: '', workspaceDir: dir, collaborationMaxRounds: 16 };
   const leader: BotConfig = { ...config, id: 'leader', skills: [] };
   const calls = { cards: 0, updates: 0, texts: [] as string[], comments: [] as string[] };
   const bot = {

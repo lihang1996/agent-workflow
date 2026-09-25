@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
 import { CLI_IDS, type CliId } from '../cli/types.js';
+import { ModelOverridesSchema, type ModelOverrides } from './model-selection.js';
 import { resolveWorkspacePath } from './workspace.js';
 
 const ProductDeliveryModeSchema = z.enum(['local', 'lark-doc']);
@@ -12,6 +13,7 @@ export interface BotConfig {
   appId: string;
   appSecret: string;
   defaultCliId: CliId;
+  modelOverrides: ModelOverrides;
   role: string;
   skills: string[];
   systemPrompt: string;
@@ -37,6 +39,7 @@ const BotSchema = z.object({
   appIdEnv: z.string().regex(/^[A-Z_][A-Z0-9_]*$/),
   appSecretEnv: z.string().regex(/^[A-Z_][A-Z0-9_]*$/),
   defaultCli: z.enum(CLI_IDS),
+  modelOverrides: ModelOverridesSchema,
   role: z.string().trim().min(1),
   skills: z
     .array(z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/))
@@ -85,6 +88,7 @@ export function parseAgentOsConfig(
         appId,
         appSecret,
         defaultCliId: bot.defaultCli,
+        modelOverrides: bot.modelOverrides,
         role: bot.role,
         skills: [...new Set(bot.skills)],
         systemPrompt: bot.systemPrompt,

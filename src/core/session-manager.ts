@@ -38,6 +38,12 @@ export interface SessionManagerOptions {
   store?: SessionStore;
 }
 
+export interface SessionCommitOptions {
+  sessionId: string;
+  expectedVersion?: number;
+  mutate: (current: Session) => Session | null;
+}
+
 const ALLOWED_TRANSITIONS: Record<SessionStatus, SessionStatus[]> = {
   creating: ['active', 'idle', 'closed'],
   active: ['idle', 'closed'],
@@ -53,11 +59,19 @@ function sessionKey(botId: string, chatId: string, threadId: string): string {
   return `${botId}:${chatId}:${threadId}`;
 }
 
+function cloneSession(session: Session): Session {
+  return {
+    ...session,
+    ...(session.owner ? { owner: { ...session.owner } } : {}),
+  };
+}
+
 export class SessionManager {
   private readonly sessions = new Map<string, Session>();
   private readonly now: () => Date;
   private readonly createId: () => string;
   private readonly store?: SessionStore;
+  private commitQueue: Promise<void> = Promise.resolve();
 
   constructor(options: SessionManagerOptions = {}) {
     this.now = options.now ?? (() => new Date());
@@ -73,7 +87,7 @@ export class SessionManager {
     for (const session of restored) {
       manager.sessions.set(
         sessionKey(session.botId, session.chatId, session.threadId),
-        session,
+        cloneSession(session),
       );
     }
     return manager;
@@ -84,9 +98,10 @@ export class SessionManager {
   }
 
   get(sessionId: string): Session | undefined {
-    return [...this.sessions.values()].find(
-      (session) => session.id === sessionId,
+    const session = [...this.sessions.values()].find(
+      (candidate) => candidate.id === sessionId,
     );
+    return session ? cloneSession(session) : undefined;
   }
 
   async resolve(
@@ -97,59 +112,50 @@ export class SessionManager {
   ): Promise<ResolvedSession> {
     const threadId = topicIdOf(message);
     const key = sessionKey(botId, message.chatId, threadId);
-    const existing = this.sessions.get(key);
-    if (existing) return { session: existing, isNew: false };
+    return this.enqueue(async () => {
+      const existing = this.sessions.get(key);
+      if (existing) return { session: cloneSession(existing), isNew: false };
 
-    const now = this.now().toISOString();
-    const session: Session = {
-      id: this.createId(),
-      botId,
-      threadId,
-      chatId: message.chatId,
-      cliId,
-      workspaceDir,
-      status: 'creating',
-      version: 0,
-      createdAt: now,
-      updatedAt: now,
-    };
-    this.sessions.set(key, session);
-    try {
-      await this.persist();
-    } catch (error) {
-      if (this.sessions.get(key) === session) this.sessions.delete(key);
-      throw error;
-    }
-    return { session, isNew: true };
+      const now = this.now().toISOString();
+      const session: Session = {
+        id: this.createId(),
+        botId,
+        threadId,
+        chatId: message.chatId,
+        cliId,
+        workspaceDir,
+        status: 'creating',
+        version: 0,
+        createdAt: now,
+        updatedAt: now,
+      };
+      await this.commitDraft(key, session);
+      return { session: cloneSession(session), isNew: true };
+    });
   }
 
   async transition(
     sessionId: string,
     nextStatus: SessionStatus,
     owner?: TaskOwner,
+    options: { expectedVersion?: number } = {},
   ): Promise<Session> {
-    const current = this.get(sessionId);
-    if (!current) throw new Error(`会话不存在: ${sessionId}`);
-    if (!ALLOWED_TRANSITIONS[current.status].includes(nextStatus)) {
-      throw new Error(`会话 ${current.status} 不能切换到 ${nextStatus}`);
-    }
-
-    const updated: Session = {
-      ...current,
-      status: nextStatus,
-      ...(owner ? { owner } : {}),
-      ...(nextStatus === 'closed' ? { version: (current.version ?? 0) + 1 } : {}),
-      updatedAt: this.now().toISOString(),
-    };
-    const key = sessionKey(updated.botId, updated.chatId, updated.threadId);
-    this.sessions.set(key, updated);
-    try {
-      await this.persist();
-    } catch (error) {
-      if (this.sessions.get(key) === updated) this.sessions.set(key, current);
-      throw error;
-    }
-    return updated;
+    return this.commitSessionChange({
+      sessionId,
+      expectedVersion: options.expectedVersion,
+      mutate: (current) => {
+        if (!ALLOWED_TRANSITIONS[current.status].includes(nextStatus)) {
+          throw new Error(`会话 ${current.status} 不能切换到 ${nextStatus}`);
+        }
+        return {
+          ...current,
+          status: nextStatus,
+          ...(owner ? { owner } : {}),
+          ...(nextStatus === 'closed' ? { version: (current.version ?? 0) + 1 } : {}),
+          updatedAt: this.now().toISOString(),
+        };
+      },
+    });
   }
 
   async setCliSessionId(
@@ -168,60 +174,92 @@ export class SessionManager {
     return this.updateCliSelection(sessionId, cliSessionId, true);
   }
 
+  async setWorkspaceDir(
+    sessionId: string,
+    workspaceDir: string,
+  ): Promise<Session> {
+    if (!workspaceDir) throw new Error('工作目录不能为空');
+    return this.commitSessionChange({
+      sessionId,
+      mutate: (current) => {
+        if (!['idle', 'creating'].includes(current.status)) throw new Error('当前会话不能切换工作目录');
+        if (current.workspaceDir === workspaceDir) return null;
+
+        const { cliSessionId: _previousCliSessionId, ...rest } = current;
+        return {
+          ...rest,
+          workspaceDir,
+          version: (current.version ?? 0) + 1,
+          updatedAt: this.now().toISOString(),
+        };
+      },
+    });
+  }
+
+  async commitSessionChange(options: SessionCommitOptions): Promise<Session> {
+    const { sessionId, expectedVersion, mutate } = options;
+    return this.enqueue(async () => {
+      const current = this.findSession(sessionId);
+      if (!current) throw new Error(`会话不存在: ${sessionId}`);
+      if (expectedVersion !== undefined && (current.version ?? 0) !== expectedVersion) {
+        throw new Error('会话上下文已经切换，本次修改已失效');
+      }
+
+      const mutated = mutate(cloneSession(current));
+      if (!mutated) return cloneSession(current);
+
+      const key = sessionKey(mutated.botId, mutated.chatId, mutated.threadId);
+      const draft: Session = {
+        ...cloneSession(mutated),
+        version: mutated.version ?? current.version ?? 0,
+      };
+      await this.commitDraft(key, draft);
+      return cloneSession(draft);
+    });
+  }
+
   private async updateCliSelection(
     sessionId: string,
     cliSessionId: string | undefined,
     switchContext = false,
   ): Promise<Session> {
-    const current = this.get(sessionId);
-    if (!current) throw new Error(`会话不存在: ${sessionId}`);
-    if (switchContext && !['idle', 'creating'].includes(current.status)) throw new Error('当前会话不能切换上下文');
-    const updated: Session = {
-      ...current,
-      cliSessionId,
-      ...(switchContext ? { version: (current.version ?? 0) + 1 } : {}),
-      updatedAt: this.now().toISOString(),
-    };
-    const key = sessionKey(updated.botId, updated.chatId, updated.threadId);
-    this.sessions.set(key, updated);
-    try {
-      await this.persist();
-    } catch (error) {
-      if (this.sessions.get(key) === updated) this.sessions.set(key, current);
-      throw error;
-    }
-    return updated;
+    return this.commitSessionChange({
+      sessionId,
+      mutate: (current) => {
+        if (switchContext && !['idle', 'creating'].includes(current.status)) throw new Error('当前会话不能切换上下文');
+        return {
+          ...current,
+          cliSessionId,
+          ...(switchContext ? { version: (current.version ?? 0) + 1 } : {}),
+          updatedAt: this.now().toISOString(),
+        };
+      },
+    });
   }
 
-  async setWorkspaceDir(
-    sessionId: string,
-    workspaceDir: string,
-  ): Promise<Session> {
-    const current = this.get(sessionId);
-    if (!current) throw new Error(`会话不存在: ${sessionId}`);
-    if (!['idle', 'creating'].includes(current.status)) throw new Error('当前会话不能切换工作目录');
-    if (!workspaceDir) throw new Error('工作目录不能为空');
-    if (current.workspaceDir === workspaceDir) return current;
-
-    const { cliSessionId: _previousCliSessionId, ...rest } = current;
-    const updated: Session = {
-      ...rest,
-      workspaceDir,
-      version: (current.version ?? 0) + 1,
-      updatedAt: this.now().toISOString(),
-    };
-    const key = sessionKey(updated.botId, updated.chatId, updated.threadId);
-    this.sessions.set(key, updated);
-    try {
-      await this.persist();
-    } catch (error) {
-      if (this.sessions.get(key) === updated) this.sessions.set(key, current);
-      throw error;
-    }
-    return updated;
+  private findSession(sessionId: string): Session | undefined {
+    return [...this.sessions.values()].find((session) => session.id === sessionId);
   }
 
-  private async persist(): Promise<void> {
-    await this.store?.save([...this.sessions.values()]);
+  private async commitDraft(
+    key: string,
+    draft: Session,
+  ): Promise<void> {
+    const snapshot = [...this.sessions.values()].map((session) => cloneSession(session));
+    const index = snapshot.findIndex((session) => sessionKey(session.botId, session.chatId, session.threadId) === key);
+    if (index >= 0) snapshot[index] = cloneSession(draft);
+    else snapshot.push(cloneSession(draft));
+
+    await this.store?.save(snapshot);
+    this.sessions.set(key, cloneSession(draft));
+  }
+
+  private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const queued = this.commitQueue.then(operation, operation);
+    this.commitQueue = queued.then(
+      () => undefined,
+      () => undefined,
+    );
+    return queued;
   }
 }

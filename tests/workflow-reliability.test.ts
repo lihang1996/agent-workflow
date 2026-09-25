@@ -38,7 +38,7 @@ function temp(t: { after: (fn: () => void) => void }): string {
   return dir;
 }
 async function fixture() {
-  const config: BotConfig = { id: 'product', appId: 'app', appSecret: 'test', defaultCliId: 'claude', workspaceDir: '/tmp', role: '产品', skills: ['grill-me', 'lark-doc'], systemPrompt: '', collaborationMaxRounds: 16 };
+  const config: BotConfig = { id: 'product', appId: 'app', appSecret: 'test', defaultCliId: 'claude', modelOverrides: {}, workspaceDir: '/tmp', role: '产品', skills: ['grill-me', 'lark-doc'], systemPrompt: '', collaborationMaxRounds: 16 };
   const leader: BotConfig = { ...config, id: 'leader', skills: [] };
   const bot = { reply: async () => 'text', replyCard: async () => 'card', replyMention: async () => 'notice', updateCard: async () => {}, replyToDocumentComment: async () => {}, setDocumentCommentWorking: async () => {}, subscribeToDocumentComments: async () => {} } as unknown as Bot;
   const sessions = new SessionManager();

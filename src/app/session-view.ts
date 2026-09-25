@@ -25,8 +25,9 @@ export function formatSessionStatus(session: Session, botId: string): string {
 export async function markSessionIdle(
   sessions: SessionManager,
   sessionId: string,
+  log: (message: string) => void = console.log,
 ): Promise<void> {
   if (sessions.get(sessionId)?.status !== "active") return;
   await sessions.transition(sessionId, "idle");
-  console.log(`[会话] id=${sessionId} status=idle`);
+  log(`[会话] id=${sessionId} status=idle`);
 }

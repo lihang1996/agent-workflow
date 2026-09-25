@@ -21,6 +21,7 @@ export interface AppRuntime {
   sessions: SessionManager;
   teamRegistry: TeamRegistry;
   activeRuns: Map<string, ActiveRun>;
+  sessionMutations?: Map<string, string>;
   contextWindows: Map<string, number>;
   botRuntimes: Map<string, BotRuntime>;
   processedCollaborationTurns: Set<string>;

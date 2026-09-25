@@ -6,7 +6,13 @@
       "id": "ceo-assistant",
       "appIdEnv": "FEISHU_CEO_ASSISTANT_APP_ID",
       "appSecretEnv": "FEISHU_CEO_ASSISTANT_APP_SECRET",
-      "defaultCli": "claude",
+      "defaultCli": "codex",
+      "modelOverrides": {
+        "codex": {
+          "model": "gpt-6-sol",
+          "reasoningEffort": "low"
+        }
+      },
       "workspace": "../agent-os-team-example",
       "role": "CEO 助理，负责理解目标并把任务派给对应成员",
       "skills": [],
@@ -16,7 +22,13 @@
       "id": "product",
       "appIdEnv": "FEISHU_PRODUCT_APP_ID",
       "appSecretEnv": "FEISHU_PRODUCT_APP_SECRET",
-      "defaultCli": "claude",
+      "defaultCli": "codex",
+      "modelOverrides": {
+        "codex": {
+          "model": "gpt-6-astra",
+          "reasoningEffort": "medium"
+        }
+      },
       "workspace": "../agent-os-team-example",
       "role": "产品经理，负责澄清需求并形成可验收的产品说明",
       "skills": [
@@ -32,7 +44,13 @@
       "id": "developer",
       "appIdEnv": "FEISHU_DEVELOPER_APP_ID",
       "appSecretEnv": "FEISHU_DEVELOPER_APP_SECRET",
-      "defaultCli": "cursor",
+      "defaultCli": "zcode",
+      "modelOverrides": {
+        "zcode": {
+          "model": "glm-5.3",
+          "reasoningEffort": "high"
+        }
+      },
       "workspace": "../agent-os-team-example",
       "role": "开发工程师，负责实现已确认方案，并在内部完成浏览器验收与代码审查",
       "skills": [

@@ -10,14 +10,13 @@ export function executionStore(runtime: AppRuntime): TaskExecutionStore {
 
 export async function beginTask(runtime: AppRuntime, sessionId: string, owner: TaskOwner, version?: number): Promise<AbortController> {
   const session = runtime.sessions.get(sessionId);
-  if (!session || runtime.activeRuns.has(sessionId) || (version !== undefined && (session.version ?? 0) !== version)) {
+  if (!session || runtime.activeRuns.has(sessionId) || runtime.sessionMutations?.has(sessionId) || (version !== undefined && (session.version ?? 0) !== version)) {
     throw new Error('会话正在执行或上下文已经切换');
   }
   owner = { ownerOpenId: owner.ownerOpenId, ownerUnionId: owner.ownerUnionId, ownerBotId: owner.ownerBotId };
   const controller = new AbortController();
-  // transition changes the in-memory status synchronously, before its first await.
-  const transition = runtime.sessions.transition(sessionId, 'active', owner);
   runtime.activeRuns.set(sessionId, { controller, ...owner });
+  const transition = runtime.sessions.transition(sessionId, 'active', owner, { expectedVersion: version });
   try { await transition; }
   catch (error) {
     if (runtime.activeRuns.get(sessionId)?.controller === controller) runtime.activeRuns.delete(sessionId);
@@ -26,9 +25,14 @@ export async function beginTask(runtime: AppRuntime, sessionId: string, owner: T
   return controller;
 }
 
-export async function releaseTask(runtime: AppRuntime, sessionId: string, controller: AbortController): Promise<void> {
+export async function releaseTask(
+  runtime: AppRuntime,
+  sessionId: string,
+  controller: AbortController,
+  log: (message: string) => void = console.log,
+): Promise<void> {
   if (runtime.activeRuns.get(sessionId)?.controller !== controller) return;
-  try { await markSessionIdle(runtime.sessions, sessionId); }
+  try { await markSessionIdle(runtime.sessions, sessionId, log); }
   finally { runtime.activeRuns.delete(sessionId); }
 }
 
