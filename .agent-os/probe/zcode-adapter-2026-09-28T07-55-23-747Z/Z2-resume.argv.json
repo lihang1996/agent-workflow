@@ -1,0 +1,13 @@
+{
+  "command": "zcode",
+  "args": [
+    "--prompt",
+    "上一轮我说的话是什么？只用英文双引号原样回答。",
+    "--resume",
+    "sess_8b86be85-877c-4805-9e6e-0ea35de8c64e",
+    "--mode",
+    "yolo",
+    "--output-format",
+    "stream-json"
+  ]
+}

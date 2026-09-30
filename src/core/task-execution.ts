@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { CliRunResult } from '../cli/types.js';
+import { ModelSelectionSchema, normalizeModelSelection, type ModelSelection } from './model-selection.js';
 import { readJsonState, writeJsonState } from './json-state.js';
 
 const RecordSchema = z.object({
@@ -10,6 +11,9 @@ const RecordSchema = z.object({
     stats: z.record(z.string(), z.number().optional()).optional(),
   }).optional(),
   error: z.string().optional(),
+  // 本次执行实际使用的模型选择（native-default 为显式 null 值）：与
+  // result.sessionId 一起构成可审计的 native session/model 证据。
+  modelSelection: ModelSelectionSchema.optional(),
 });
 export type TaskExecution = Omit<z.infer<typeof RecordSchema>, 'result'> & { result?: CliRunResult };
 
@@ -25,13 +29,36 @@ export class TaskExecutionStore {
   forSession(sessionId: string): TaskExecution | undefined {
     return [...this.rows.values()].filter((row) => row.sessionId === sessionId).at(-1);
   }
-  start(id: string, sessionId: string, botId: string): void {
-    this.save({ id, sessionId, botId, status: 'running' });
+  /**
+   * 最近执行记录（新→旧，只含已完成且有结果的）。
+   * 传入 nativeSessionId 时只保留绑定该原生会话的记录（C5）：同一 agent-os
+   * 话题切换过多个 native session（A→B→/resume 回 A）时，B 的记录不得
+   * 进入 A 的上下文；result 未留证 native id 的记录也不得入选。
+   */
+  recentForSession(sessionId: string, limit = 3, nativeSessionId?: string): TaskExecution[] {
+    return [...this.rows.values()]
+      .filter((row) => row.sessionId === sessionId
+        && row.status === 'completed'
+        && !!row.result?.answer
+        && (nativeSessionId === undefined
+          ? true
+          : row.result?.sessionId === nativeSessionId))
+      .slice(-limit)
+      .reverse();
   }
-  complete(id: string, result: CliRunResult): void {
+  start(id: string, sessionId: string, botId: string, modelSelection?: ModelSelection | null): void {
+    this.save({
+      id, sessionId, botId, status: 'running',
+      ...(modelSelection !== undefined ? { modelSelection: normalizeModelSelection(modelSelection) } : {}),
+    });
+  }
+  complete(id: string, result: CliRunResult, modelSelection?: ModelSelection | null): void {
     const row = this.rows.get(id);
     if (!row) throw new Error('任务执行记录不存在');
-    this.save({ ...row, status: 'completed', result });
+    this.save({
+      ...row, status: 'completed', result,
+      ...(modelSelection !== undefined ? { modelSelection: normalizeModelSelection(modelSelection) } : {}),
+    });
   }
   fail(id: string, error: unknown): void {
     const row = this.rows.get(id);

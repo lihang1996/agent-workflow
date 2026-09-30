@@ -1,4 +1,5 @@
 import type { AppToolName } from '../core/app-tool-policy.js';
+import type { ModelSelection } from '../core/model-selection.js';
 
 export const CLI_IDS = ['claude', 'codex', 'cursor', 'zcode'] as const;
 export type CliId = typeof CLI_IDS[number];
@@ -77,17 +78,23 @@ export interface CliAdapter {
   /**
    * 附件路径已经写进 prompt，任何能读本地文件的 CLI 都能处理；
    * 适配器可以额外把图片交给原生多模态入口（如 Codex 的 `-i`）。
+   *
+   * modelSelection 来自 resolveModel 的执行选择（模型/推理强度声明）；
+   * 矩阵外组合由 assertModelSelectionSupported 在入口先拒绝，adapter 侧
+   * 也会防御性拒绝，保证任何直接使用方都拿不到静默的原生默认。
    */
   buildArgs(
     prompt: string,
     promptInput: CliPromptInput,
     attachments?: readonly CliAttachment[],
+    modelSelection?: ModelSelection | null,
   ): string[];
   buildResumeArgs(
     prompt: string,
     sessionId: string,
     promptInput: CliPromptInput,
     attachments?: readonly CliAttachment[],
+    modelSelection?: ModelSelection | null,
   ): string[];
   buildCompactPlan?(sessionId: string, instructions?: string): CliCompactPlan;
   buildEnv?(): Record<string, string>;

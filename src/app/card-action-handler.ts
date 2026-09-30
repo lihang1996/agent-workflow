@@ -2,11 +2,16 @@ import { beginTask } from './task-lifecycle.js';
 import { canManageSession, flowMatchesSession } from './session-guard.js';
 import type { CardAction, CardActionResponse } from '../im/lark.js';
 import {
+  buildArchitectureHandoffCard,
   buildClarificationCard,
   buildClarificationContinuingCard,
   buildClarificationRetryCard,
+  buildCodingAuthorizationActiveCard,
+  buildCodingAuthorizationDraftCard,
+  buildCodingAuthorizationInactiveCard,
   buildProductSpecApprovedCard,
   buildProductSpecExpiredCard,
+  buildProductSpecUnusableApprovalCard,
   buildResumeCard,
 } from '../im/card.js';
 import type {
@@ -15,9 +20,20 @@ import type {
 } from '../core/bot-registry.js';
 import { isClarificationOwner } from '../core/clarification.js';
 import { isProductSpecOwner } from '../core/product-spec.js';
+import { verifyApprovableArtifact } from '../core/artifact-digest.js';
+import { verifyArtifactCitations } from '../core/kb-prefetch.js';
+import { openArchitectureHandoff } from '../core/architecture-handoff.js';
+import { verifyArchitectureCitations, verifyArchitectureUpstreamAtApproval } from './architecture-flow.js';
+import {
+  confirmCodingAuthorization,
+  createCodingAuthorizationDraft,
+  effectiveStatus,
+  revokeCodingAuthorization,
+} from '../core/coding-authorization.js';
 import { requestTaskAbort } from '../core/task-abort.js';
 import { getCliAdapter } from '../cli/registry.js';
 import { listNativeCliSessions } from '../cli/native-sessions.js';
+import { createProductionIsolationPreparer } from '../core/isolation.js';
 import { continueClarificationFlow } from './clarification-runner.js';
 import type { AppRuntime } from './runtime.js';
 
@@ -46,10 +62,27 @@ export function createCardActionHandler(options: {
           },
         };
       }
+      if (flow.status === 'invalidated') {
+        // W5 返修：失效 flow 的展示与处理都标不可用，不给「重新确认」的错觉。
+        return {
+          toast: { type: 'warning', content: '这份产品方案已失效，不能确认。' },
+          card: {
+            type: 'raw',
+            data: buildProductSpecUnusableApprovalCard(flow),
+          },
+        };
+      }
       if (!isProductSpecOwner(flow, { ...action, operatorBotId: config.id })) {
         return { toast: { type: 'warning', content: '只有任务发起人可以确认。' } };
       }
       if (flow.status === 'approved') {
+        // 旧 approved 未绑定摘要：确认记录不可用，不得当作有效版本展示。
+        if (flow.content_digest == null) {
+          return {
+            toast: { type: 'warning', content: '这份确认记录没有绑定内容摘要，不能作为有效版本使用。' },
+            card: { type: 'raw', data: buildProductSpecUnusableApprovalCard(flow) },
+          };
+        }
         return { toast: { type: 'info', content: '产品方案已经确认。' }, card: { type: 'raw', data: buildProductSpecApprovedCard(flow) } };
       }
       if (runtime.sessions.get(flow.sessionId)?.status === 'active') {
@@ -59,6 +92,24 @@ export function createCardActionHandler(options: {
         return { toast: { type: 'warning', content: '评论修改仍在处理中，请稍后确认。' } };
       }
       try {
+        // G1：批准动作前回读完整制品重算摘要；无摘要、无法回读、漂移、知识引用
+        // 不可核验（含从固定制品正文提取的实际引用与任务/会话/作用域绑定）、
+        // 飞书完整回读能力未核验（U-3）一律拒绝确认（失败关闭）。
+        const gate = await verifyApprovableArtifact({
+          flow,
+          workspaceDir: runtime.sessions.get(flow.sessionId)?.workspaceDir,
+          verifyKnowledgeCitations: runtime.knowledgePrefetch
+            ? ({ artifactTexts, declaredRefs }) => verifyArtifactCitations({
+                artifactTexts,
+                declaredRefs,
+                ledger: runtime.knowledgePrefetch!,
+                binding: { taskId: flow.taskId, sessionId: flow.sessionId },
+              })
+            : undefined,
+        });
+        if (!gate.ok) {
+          return { toast: { type: gate.level, content: gate.message } };
+        }
         // 确认即终点：只记录状态，后续实现由用户自行 @ 开发。
         const approved = runtime.productSpecFlows.approve(flowToken, action.messageId);
         if (!approved) {
@@ -73,6 +124,221 @@ export function createCardActionHandler(options: {
         };
       } finally {
         runtime.productSpecFlows.endApproval(flowToken);
+      }
+    }
+
+    if (action.value.action === 'handoff_architecture') {
+      const flowToken = typeof action.value.flowToken === 'string'
+        ? action.value.flowToken
+        : '';
+      const flow = runtime.productSpecFlows.get(flowToken);
+      if (!flow || flow.botId !== config.id || !action.messageId) {
+        return { toast: { type: 'error', content: '这份产品方案已经失效。' } };
+      }
+      if ((flow.artifact_kind ?? 'prd') !== 'prd') {
+        return { toast: { type: 'warning', content: '只有产品方案（PRD）可以转架构设计。' } };
+      }
+      if (!isProductSpecOwner(flow, { ...action, operatorBotId: config.id })) {
+        return { toast: { type: 'warning', content: '只有任务发起人可以发起架构交接。' } };
+      }
+      const handoffs = runtime.architectureHandoffs;
+      if (!handoffs) {
+        return { toast: { type: 'error', content: '架构交接服务不可用，本次交接没有创建。' } };
+      }
+      try {
+        // 交接只由已批准 PRD 卡片发起（卡片回调携带服务端 flowToken，不可伪造）；
+        // pending/失效/无摘要（旧记录）一律拒绝，零候选失败关闭。
+        const handoff = openArchitectureHandoff({
+          flows: runtime.productSpecFlows,
+          handoffs,
+          prdToken: flowToken,
+          operator: { ...action, operatorBotId: config.id },
+        });
+        return {
+          toast: { type: 'success', content: '架构交接已创建，请把交接码带给开发成员。' },
+          card: {
+            type: 'raw',
+            data: buildArchitectureHandoffCard({ handoffToken: handoff.token, flow: runtime.productSpecFlows.get(flowToken) ?? flow }),
+          },
+        };
+      } catch (error) {
+        return { toast: { type: 'error', content: (error as Error).message } };
+      }
+    }
+
+    if (action.value.action === 'approve_architecture') {
+      const flowToken = typeof action.value.flowToken === 'string'
+        ? action.value.flowToken
+        : '';
+      const flow = runtime.productSpecFlows.get(flowToken);
+      if (!flow || flow.botId !== config.id || !action.messageId) {
+        return { toast: { type: 'error', content: '这份架构设计已经失效。' } };
+      }
+      if ((flow.artifact_kind ?? 'prd') !== 'architecture') {
+        return { toast: { type: 'warning', content: '这个确认动作只适用于架构设计。' } };
+      }
+      if (flow.status === 'expired' || (flow.status === 'pending' && !flowMatchesSession(flow, runtime.sessions.get(flow.sessionId)))) {
+        return {
+          toast: { type: 'warning', content: '这份架构设计已经失效。' },
+          card: { type: 'raw', data: buildProductSpecExpiredCard(flow) },
+        };
+      }
+      if (flow.status === 'invalidated') {
+        return {
+          toast: { type: 'warning', content: '这份架构设计已失效，不能确认。' },
+          card: { type: 'raw', data: buildProductSpecUnusableApprovalCard(flow) },
+        };
+      }
+      if (!isProductSpecOwner(flow, { ...action, operatorBotId: config.id })) {
+        return { toast: { type: 'warning', content: '只有任务发起人可以确认。' } };
+      }
+      if (flow.status === 'approved') {
+        if (flow.content_digest == null) {
+          return {
+            toast: { type: 'warning', content: '这份确认记录没有绑定内容摘要，不能作为有效版本使用。' },
+            card: { type: 'raw', data: buildProductSpecUnusableApprovalCard(flow) },
+          };
+        }
+        return { toast: { type: 'info', content: '架构设计已经确认。' }, card: { type: 'raw', data: buildProductSpecApprovedCard(flow) } };
+      }
+      if (runtime.sessions.get(flow.sessionId)?.status === 'active') {
+        return { toast: { type: 'warning', content: '会话仍在修改架构设计，请完成后再确认。' } };
+      }
+      if (!runtime.productSpecFlows.beginApproval(flowToken)) {
+        return { toast: { type: 'warning', content: '评论修改仍在处理中，请稍后确认。' } };
+      }
+      try {
+        // 上游门禁：PRD 仍唯一、已批准、版本一致且文件未漂移——PRD 确认绝不
+        // 自动解释成架构批准；上游失效即拦下架构确认。
+        const upstreamGate = await verifyArchitectureUpstreamAtApproval({
+          flow,
+          flows: runtime.productSpecFlows,
+          prdWorkspaceDir: flow.upstream
+            ? runtime.sessions.get(flow.upstream.prdSessionId)?.workspaceDir
+            : undefined,
+        });
+        if (!upstreamGate.ok) {
+          return { toast: { type: 'warning', content: upstreamGate.reason } };
+        }
+        // G1（架构分支）：完整回读重算摘要 + 继承知识引用核验（绑定沿用上游
+        // PRD 的台账任务/会话；引用存在而台账缺失时失败关闭）。
+        const gate = await verifyApprovableArtifact({
+          flow,
+          workspaceDir: runtime.sessions.get(flow.sessionId)?.workspaceDir,
+          verifyKnowledgeCitations: runtime.knowledgePrefetch && flow.upstream
+            ? ({ artifactTexts, declaredRefs }) => verifyArchitectureCitations({
+                artifactTexts,
+                declaredRefs,
+                ledger: runtime.knowledgePrefetch!,
+                upstream: flow.upstream!,
+              })
+            : undefined,
+        });
+        if (!gate.ok) {
+          return { toast: { type: gate.level, content: gate.message } };
+        }
+        // 确认即终点：架构确认不派发实现，也不构成编码授权（授权通道未开放）。
+        const approved = runtime.productSpecFlows.approve(flowToken, action.messageId);
+        if (!approved) {
+          return { toast: { type: 'warning', content: '架构设计状态已经更新。' } };
+        }
+        return {
+          toast: { type: 'success', content: '架构设计已确认。' },
+          card: {
+            type: 'raw',
+            data: buildProductSpecApprovedCard(approved),
+          },
+        };
+      } finally {
+        runtime.productSpecFlows.endApproval(flowToken);
+      }
+    }
+
+    if (action.value.action === 'authorize_coding') {
+      // T-021：显式授权入口——只接受携带可信 flowToken 的卡片动作（普通文本
+      // 无可靠制品定位，不能授权）。第一步创建草稿，二次确认后才 active。
+      const flowToken = typeof action.value.flowToken === 'string'
+        ? action.value.flowToken
+        : '';
+      const authorizations = runtime.codingAuthorizations;
+      if (!authorizations) {
+        return { toast: { type: 'error', content: '编码授权服务不可用，本次操作没有创建任何授权。' } };
+      }
+      const allowedPaths = Array.isArray(action.value.allowedPaths)
+        && action.value.allowedPaths.every((path) => typeof path === 'string')
+        ? action.value.allowedPaths as string[]
+        : undefined;
+      try {
+        const draft = await createCodingAuthorizationDraft({
+          store: authorizations,
+          flows: runtime.productSpecFlows,
+          operator: { ...action, operatorBotId: config.id },
+          input: {
+            flowToken,
+            ...(allowedPaths ? { allowedPaths } : {}),
+          },
+          resolveWorkspaceDir: (sessionId) => runtime.sessions.get(sessionId)?.workspaceDir,
+        });
+        return {
+          toast: { type: 'success', content: '授权草稿已创建，请在卡片上核对后进行第二次确认。' },
+          card: { type: 'raw', data: buildCodingAuthorizationDraftCard(draft) },
+        };
+      } catch (error) {
+        return { toast: { type: 'error', content: (error as Error).message } };
+      }
+    }
+
+    if (action.value.action === 'confirm_coding_authorization') {
+      const authorizationId = typeof action.value.authorizationId === 'string'
+        ? action.value.authorizationId
+        : '';
+      const authorizations = runtime.codingAuthorizations;
+      if (!authorizations) {
+        return { toast: { type: 'error', content: '编码授权服务不可用。' } };
+      }
+      try {
+        const confirmed = await confirmCodingAuthorization({
+          store: authorizations,
+          flows: runtime.productSpecFlows,
+          operator: { ...action, operatorBotId: config.id },
+          authorizationId,
+          resolveWorkspaceDir: (sessionId) => runtime.sessions.get(sessionId)?.workspaceDir,
+        });
+        return {
+          toast: { type: 'success', content: '授权记录已确认（执行层隔离未接线前编码保持阻断）。' },
+          card: { type: 'raw', data: buildCodingAuthorizationActiveCard(confirmed) },
+        };
+      } catch (error) {
+        const record = authorizations.get(authorizationId);
+        return {
+          toast: { type: 'error', content: (error as Error).message },
+          ...(record && effectiveStatus(record) !== 'draft'
+            ? { card: { type: 'raw', data: buildCodingAuthorizationInactiveCard(record) } }
+            : {}),
+        };
+      }
+    }
+
+    if (action.value.action === 'revoke_coding_authorization') {
+      const authorizationId = typeof action.value.authorizationId === 'string'
+        ? action.value.authorizationId
+        : '';
+      const authorizations = runtime.codingAuthorizations;
+      if (!authorizations) {
+        return { toast: { type: 'error', content: '编码授权服务不可用。' } };
+      }
+      try {
+        const revoked = revokeCodingAuthorization({
+          store: authorizations,
+          operator: { ...action, operatorBotId: config.id },
+          authorizationId,
+        });
+        return {
+          toast: { type: 'success', content: '编码授权已撤销。' },
+          card: { type: 'raw', data: buildCodingAuthorizationInactiveCard(revoked) },
+        };
+      } catch (error) {
+        return { toast: { type: 'error', content: (error as Error).message } };
       }
     }
 
@@ -223,6 +489,7 @@ export function createCardActionHandler(options: {
         const nativeSessions = await listNativeCliSessions({
           adapter: cliAdapter,
           cwd: session.workspaceDir,
+          isolation: runtime.isolationPreparer ?? createProductionIsolationPreparer(),
         });
         if (!nativeSessions.some((item) => item.id === cliSessionId)) {
           return {

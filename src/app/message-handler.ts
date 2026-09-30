@@ -1,7 +1,7 @@
 import type { CliAttachment } from '../cli/types.js';
 import { resolve } from 'node:path';
 import { type Bot } from '../im/lark.js';
-import { answerContinuation, answerNeedsContinuation, buildClarificationCard, buildProductSpecApprovalCard, buildClarificationSupersededCard, buildSessionNoticeCard, buildTaskCard, splitLongText } from '../im/card.js';
+import { answerContinuation, answerNeedsContinuation, buildArchitectureApprovalCard, buildClarificationCard, buildProductSpecApprovalCard, buildClarificationSupersededCard, buildSessionNoticeCard, buildTaskCard, splitLongText } from '../im/card.js';
 import { resolveMentions, extractResourceKeys } from '../im/message-parser.js';
 import { parseCliRequest, parseCommand } from '../core/command-parser.js';
 import { TaskProgressTracker } from '../core/task-progress.js';
@@ -12,12 +12,22 @@ import { ensureWorkspaceDirectory } from '../core/workspace.js';
 import { buildBotPrompt, type BotConfig } from '../core/bot-registry.js';
 import { getCliAdapter } from '../cli/registry.js';
 import { compactCliSession } from '../cli/native-compact.js';
-import { assertProductSpecDocuments } from './product-spec-documents.js';
+import { createProductionIsolationPreparer } from '../core/isolation.js';
+import { createSessionIsolationSupplier, requireScratchRootForSubmission } from './cli-execution.js';
+import { createBoundProductSpecFlow } from './product-spec-creation.js';
+import { createBoundArchitectureFlow } from './architecture-flow.js';
+import { findArchitectureRequest } from '../core/product-spec.js';
 import { attachmentPromptSection, executeCli } from './cli-execution.js';
+import {
+  applyModelDecision,
+  assertRecreateWithoutHistoryDependency,
+  planExecutionModel,
+} from './execution-model.js';
 import { handleSessionCommand } from './command-handler.js';
 import { sendResultNotification } from './notification-service.js';
 import { normalizeProductDocument } from './product-document-url.js';
 import { ensureProductSpecSubmission } from './product-spec-submission.js';
+import { CODING_AUTHORIZATION_TEXT_HINT, looksLikeCodingAuthorizationText } from './authorization-text.js';
 import { CollaborationService } from './collaboration-service.js';
 import type { AppRuntime, BotRuntime } from './runtime.js';
 import type { IncomingMessage } from '../im/lark.js';
@@ -28,6 +38,7 @@ import { canManageSession, flowMatchesSession } from './session-guard.js';
 export function createMessageHandler(options: {
   runtime: AppRuntime; config: BotConfig; defaultProductDeliveryMode: 'local' | 'lark-doc';
   collaborationService: CollaborationService; execute?: typeof executeCli;
+  planModel?: typeof planExecutionModel;
 }): (msg: IncomingMessage, bot: Bot) => Promise<void> {
   const { runtime, config, defaultProductDeliveryMode, collaborationService } = options;
   const { sessions, teamRegistry, activeRuns, contextWindows, botRuntimes,
@@ -181,6 +192,21 @@ export function createMessageHandler(options: {
       return;
     }
 
+    // T-021：普通文本授权口令没有可靠的制品定位（IncomingMessage 不含被回复
+    // 卡片 ID），不能猜测制品或自动授权——只提示走显式卡片入口，且不执行任务。
+    if (
+      !collaboration
+      && !pendingClarification
+      && !command
+      && msg.senderType !== 'app'
+      && msg.senderType !== 'bot'
+      && (config.specStages ?? []).includes('architecture')
+      && looksLikeCodingAuthorizationText(resolved)
+    ) {
+      await bot.reply(msg.messageId, CODING_AUTHORIZATION_TEXT_HINT, hasThread);
+      return;
+    }
+
     if (
       collaboration &&
       session.workspaceDir !== collaboration.workspaceDir
@@ -289,50 +315,87 @@ export function createMessageHandler(options: {
 
       // 让事件回调尽快返回，CLI 在后台继续执行。
       const executionId = collaboration ? `dispatch:${collaboration.dispatchId}` : `${config.id}:${msg.messageId}`;
-      const execution = executeTask({ runtime, id: executionId, sessionId: session.id, botId: config.id, execute: () => {
+      // executeTask 持久化时才读取（getter）：模型决策在执行闭包内完成，
+      // blocked/recreate 都表现为本次任务的结果，而不是悬空卡片。
+      let plannedModelSelection: import('../core/model-selection.js').ModelSelection | null | undefined;
+      let plannedFreshNativeSession = false;
+      const execution = executeTask({ runtime, id: executionId, sessionId: session.id, botId: config.id,
+        get modelSelection() { return plannedModelSelection; },
+        get freshNativeSession() { return plannedFreshNativeSession; },
+        execute: async () => {
         if (collaboration) {
           collaborationInbox.beginExecution(collaboration.dispatchId);
           processedCollaborationTurns.add(collaborationTurnKey(collaboration));
           if (processedCollaborationTurns.size > 1000) processedCollaborationTurns.delete(processedCollaborationTurns.values().next().value!);
         }
-        return isCompacting
-        ? compactCliSession({
+        if (isCompacting) {
+          return compactCliSession({
             adapter: cliAdapter,
             sessionId: session.cliSessionId!,
             cwd: session.workspaceDir,
             instructions: command.instructions,
             signal: run.signal,
+            isolation: createSessionIsolationSupplier(
+              runtime,
+              session.id,
+              runtime.isolationPreparer ?? createProductionIsolationPreparer(),
+            ),
           }).then((result) => ({
             answer: result.message ?? '',
             sessionId: result.sessionId,
             stats: undefined,
             toolCalls: undefined,
-          }))
-        : (options.execute ?? executeCli)(
-            cliAdapter,
-            prompt,
-            session.workspaceDir,
-            session.cliSessionId,
-            run.signal,
-            (event) => {
-              if (
-                event.type !== 'tool_start' &&
-                event.type !== 'tool_end' &&
-                event.type !== 'context'
-              )
-                return;
-              progress.accept(event);
-              renderProgress();
-            },
-            attachments,
-          );
-
+          }));
+        }
+        const modelPlan = await (options.planModel ?? planExecutionModel)(
+          config.modelOverrides,
+          session,
+          { command: cliAdapter.command },
+        );
+        // native-default 也显式记录为 null：下次续接才能区分「已核验一致」与「不可核验」。
+        plannedModelSelection = modelPlan.modelSelection;
+        // 返修 3（二轮 P1-3）：依赖历史上下文的 recreate 一律阻断——历史 CLI
+        // 回答可能转述项目文件/网页/工具输出中的第三方指令，注入新会话构成
+        // 指令洗白；请新话题提供明确上下文，或恢复原模型配置。
+        if (modelPlan.decision.action === 'recreate') {
+          assertRecreateWithoutHistoryDependency({ hadNativeSession: !!session.cliSessionId });
+        }
+        const resumeCliSessionId = applyModelDecision(modelPlan);
+        plannedFreshNativeSession = resumeCliSessionId === undefined;
+        // 138 号 P0-1：不再从授权列表按 owner+workspace 猜测编码授权——当前
+        // 没有任何生产入口能创建「一次性编码交接」，因此普通任务一律零代码写
+        //（隔离 profile 只放行 scratch）。未来显式编码入口须经
+        // resolveCodingAuthorizationById（唯一 authorizationId + 交接绑定 + await G3）。
+        return (options.execute ?? executeCli)(
+          cliAdapter,
+          prompt,
+          session.workspaceDir,
+          resumeCliSessionId,
+          run.signal,
+          (event) => {
+            if (
+              event.type !== 'tool_start' &&
+              event.type !== 'tool_end' &&
+              event.type !== 'context'
+            )
+              return;
+            progress.accept(event);
+            renderProgress();
+          },
+          attachments,
+          modelPlan.modelSelection,
+          createSessionIsolationSupplier(
+            runtime,
+            session.id,
+            runtime.isolationPreparer ?? createProductionIsolationPreparer(),
+          ),
+          taskId,
+        );
       } });
 
       void execution
         .then(async (result) => {
           clearInterval(progressHeartbeat);
-          if (collaboration) collaborationInbox.finish(collaboration.dispatchId, true);
           const clarificationRequest = !isCompacting
             && cliAdapter.appTools.includes('request_clarification')
             ? findClarificationRequest(result.toolCalls)
@@ -364,11 +427,19 @@ export function createMessageHandler(options: {
             console.log(
               `[澄清] 已发送交互卡片 questions=${clarificationRequest.questions.length}`,
             );
+            // 澄清卡也是一次完整交付（用户作答后走澄清续跑的新执行）：
+            // 协作终态在此收口，其余失败路径由 catch 统一记 failed。
+            if (collaboration) collaborationInbox.finish(collaboration.dispatchId, true);
             return;
           }
           const finalResult = result;
           let productSpecRequest = !isCompacting && cliAdapter.appTools.includes('request_spec_approval')
             ? (await ensureProductSpecSubmission({ result })).request
+            : undefined;
+          // T-020：架构提交是独立工具与独立阶段；上游交接码由服务端核验，
+          // CLI 自报的 artifact kind / 上游 token 不进入任何输入。
+          let architectureSubmission = !isCompacting && cliAdapter.appTools.includes('request_architecture_review')
+            ? findArchitectureRequest(finalResult.toolCalls)
             : undefined;
           const dispatchRequest = !isCompacting
             ? findDispatchTaskRequest(finalResult.toolCalls)
@@ -400,23 +471,35 @@ export function createMessageHandler(options: {
           if (productSpecRequest && dispatchRequest) {
             throw new Error('不能同时提交产品方案和派发团队任务');
           }
+          if (architectureSubmission && (dispatchRequest || productSpecRequest)) {
+            throw new Error('不能同时提交架构设计和派发团队任务或产品方案');
+          }
+          if (architectureSubmission && !runtime.architectureHandoffs) {
+            throw new Error('架构交接服务不可用：本次架构提交失败关闭，未创建任何确认卡。');
+          }
           if (productSpecRequest) {
             productSpecRequest = await normalizeProductDocument(bot, productSpecRequest);
-            if (productSpecRequest.deliveryMode === 'local') {
-              await assertProductSpecDocuments(
-                session.workspaceDir,
-                productSpecRequest,
-              );
-            }
-            const flow = productSpecFlows.create({
-              taskId,
-              botId: config.id,
-              sessionId: session.id,
-              sessionVersion: session.version ?? 0,
-              ownerOpenId: collaboration?.ownerOpenId ?? pendingClarification?.ownerOpenId ?? msg.senderOpenId,
-              ownerBotId: collaboration?.ownerBotId ?? (collaboration ? collaboration.fromBotId : pendingClarification?.ownerBotId ?? config.id),
-              ownerUnionId: collaboration?.ownerUnionId ?? pendingClarification?.ownerUnionId ?? msg.senderUnionId,
-              collaboration: collaborationContext,
+            // T-018：flow 创建即绑定完整制品摘要与来源清单（与澄清后提交共用同一
+            // 服务端路径）。本地模式摘要计算失败（缺失/符号链接/读取失败）直接
+            // 失败关闭，不进入审批；飞书模式完整回读能力未核验（U-3），
+            // content_digest 保持 null，G1 拒绝确认。
+            const flow = await createBoundProductSpecFlow({
+              store: productSpecFlows,
+              workspaceDir: session.workspaceDir,
+              // 119 号 P1-4：本地交付必须持有当前任务的 scratch 绑定（缺/跨任务/过期失败关闭）。
+              ...(productSpecRequest.deliveryMode === 'local'
+                ? { scratchRoot: requireScratchRootForSubmission(runtime, session.id, taskId) }
+                : {}),
+              identity: {
+                taskId,
+                botId: config.id,
+                sessionId: session.id,
+                sessionVersion: session.version ?? 0,
+                ownerOpenId: collaboration?.ownerOpenId ?? pendingClarification?.ownerOpenId ?? msg.senderOpenId,
+                ownerBotId: collaboration?.ownerBotId ?? (collaboration ? collaboration.fromBotId : pendingClarification?.ownerBotId ?? config.id),
+                ownerUnionId: collaboration?.ownerUnionId ?? pendingClarification?.ownerUnionId ?? msg.senderUnionId,
+                collaboration: collaborationContext,
+              },
               request: productSpecRequest,
             });
             await cardUpdater.finish(buildProductSpecApprovalCard(flow), { kind: 'product', token: flow.token });
@@ -428,10 +511,53 @@ export function createMessageHandler(options: {
                 openId: collaboration?.ownerOpenId ?? pendingClarification?.ownerOpenId ?? msg.senderOpenId,
                 name: '',
               },
-              text: '产品方案已生成，请查看上方确认卡。',
+              text: '产品方案已生成，请查看上方卡片了解确认状态。',
               replyInThread: hasThread,
             });
             console.log('[产品文档] 已展示待确认产物');
+            if (collaboration) collaborationInbox.finish(collaboration.dispatchId, true);
+            return;
+          }
+          if (architectureSubmission) {
+            const { request: architectureRequest, handoffToken } = architectureSubmission;
+            const normalizedRequest = await normalizeProductDocument(bot, architectureRequest);
+            // 服务端交接核验 + 上游漂移检查 + 架构摘要绑定；任何失败都不生成
+            // 确认卡（失败关闭），且不消费交接码。
+            const archFlow = await createBoundArchitectureFlow({
+              flows: productSpecFlows,
+              handoffs: runtime.architectureHandoffs!,
+              workspaceDir: session.workspaceDir,
+              ...(normalizedRequest.deliveryMode === 'local'
+                ? { scratchRoot: requireScratchRootForSubmission(runtime, session.id, taskId) }
+                : {}),
+              resolvePrdWorkspaceDir: ({ prdSessionId }) => sessions.get(prdSessionId)?.workspaceDir,
+              identity: {
+                taskId,
+                botId: config.id,
+                sessionId: session.id,
+                sessionVersion: session.version ?? 0,
+                ownerOpenId: collaboration?.ownerOpenId ?? pendingClarification?.ownerOpenId ?? msg.senderOpenId,
+                ownerBotId: collaboration?.ownerBotId ?? (collaboration ? collaboration.fromBotId : pendingClarification?.ownerBotId ?? config.id),
+                ownerUnionId: collaboration?.ownerUnionId ?? pendingClarification?.ownerUnionId ?? msg.senderUnionId,
+                collaboration: collaborationContext,
+              },
+              request: normalizedRequest,
+              handoffToken,
+            });
+            await cardUpdater.finish(buildArchitectureApprovalCard(archFlow), { kind: 'product', token: archFlow.token });
+            await sendResultNotification({
+              runtime, botId: config.id, sessionId: session.id, afterCardId: cardId,
+              bot,
+              replyToMessageId: msg.messageId,
+              target: {
+                openId: collaboration?.ownerOpenId ?? pendingClarification?.ownerOpenId ?? msg.senderOpenId,
+                name: '',
+              },
+              text: '架构设计已生成，请查看上方卡片了解确认状态。',
+              replyInThread: hasThread,
+            });
+            console.log('[架构文档] 已展示待确认架构设计');
+            if (collaboration) collaborationInbox.finish(collaboration.dispatchId, true);
             return;
           }
           const snapshot = progress.snapshot();
@@ -525,6 +651,10 @@ export function createMessageHandler(options: {
               await bot.reply(msg.messageId, `协作派发失败：${message}`, hasThread);
             }
           }
+          // 协作终态在全部制品后处理（产品/架构确认卡、派发、通知）成功之后
+          // 才落为 completed：中途任何失败走 catch 分支记 failed，不会出现
+          // 「协作已成功、制品创建失败」的状态错位（work/30）。
+          if (collaboration) collaborationInbox.finish(collaboration.dispatchId, true);
         })
         .catch(async (error) => {
           clearInterval(progressHeartbeat);

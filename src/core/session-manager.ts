@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { TaskOwner } from './identity.js';
 import type { CliId } from '../cli/types.js';
+import { normalizeModelSelection, type ModelSelection } from './model-selection.js';
 import type { SessionStore } from './session-store.js';
 
 export type SessionStatus = 'creating' | 'active' | 'idle' | 'closed';
@@ -14,6 +15,13 @@ export interface Session {
   chatId: string;
   cliId: CliId;
   cliSessionId?: string;
+  /**
+   * 生成当前原生会话时实际使用的模型选择（含 native-default 的显式 null）。
+   * 只存 model/reasoningEffort 两字段（store schema 为 strict，比较逻辑也
+   * 只用 selection）。缺失 = 旧记录或外来会话，模型绑定不可核验，续接按
+   * compareExecutionSelection 的 legacy 规则处理（recreate），不能凭空当作一致。
+   */
+  cliModelSelection?: ModelSelection;
   workspaceDir: string;
   status: SessionStatus;
   createdAt: string;
@@ -60,9 +68,14 @@ function sessionKey(botId: string, chatId: string, threadId: string): string {
 }
 
 function cloneSession(session: Session): Session {
+  // 深拷贝嵌套对象（owner、模型绑定）：get/resolve 返回的快照不得能被调用方
+  // 无持久化地改动绑定内容。
   return {
     ...session,
     ...(session.owner ? { owner: { ...session.owner } } : {}),
+    ...(session.cliModelSelection
+      ? { cliModelSelection: Object.freeze({ ...session.cliModelSelection }) }
+      : {}),
   };
 }
 
@@ -161,17 +174,33 @@ export class SessionManager {
   async setCliSessionId(
     sessionId: string,
     cliSessionId: string,
+    modelSelection?: ModelSelection | null,
   ): Promise<Session> {
     if (!cliSessionId) throw new Error('CLI 会话 ID 不能为空');
-    return this.updateCliSelection(sessionId, cliSessionId);
+    return this.updateCliSelection(sessionId, { cliSessionId, modelSelection });
   }
 
   async clearCliSessionId(sessionId: string): Promise<Session> {
-    return this.selectCliSessionId(sessionId, undefined);
+    return this.updateCliSelection(sessionId, { clear: true, switchContext: true });
+  }
+
+  /**
+   * 执行期绑定事实不明时丢弃原生会话与模型绑定（executeTask 在会话 active
+   * 期间调用，不能走 clearCliSessionId 的状态守卫；也不加版本——这是执行
+   * 收尾的一部分，不是用户可见的上下文切换）。
+   */
+  async resetCliBinding(sessionId: string): Promise<Session> {
+    return this.updateCliSelection(sessionId, { clear: true, dropModelSelection: true });
   }
 
   async selectCliSessionId(sessionId: string, cliSessionId: string | undefined): Promise<Session> {
-    return this.updateCliSelection(sessionId, cliSessionId, true);
+    // 切到外来原生会话：模型选择不可核验，重置为缺失（legacy 语义）。
+    return this.updateCliSelection(sessionId, {
+      cliSessionId,
+      clear: cliSessionId === undefined,
+      switchContext: true,
+      dropModelSelection: true,
+    });
   }
 
   async setWorkspaceDir(
@@ -185,7 +214,7 @@ export class SessionManager {
         if (!['idle', 'creating'].includes(current.status)) throw new Error('当前会话不能切换工作目录');
         if (current.workspaceDir === workspaceDir) return null;
 
-        const { cliSessionId: _previousCliSessionId, ...rest } = current;
+        const { cliSessionId: _previousCliSessionId, cliModelSelection: _previousModel, ...rest } = current;
         return {
           ...rest,
           workspaceDir,
@@ -220,16 +249,42 @@ export class SessionManager {
 
   private async updateCliSelection(
     sessionId: string,
-    cliSessionId: string | undefined,
-    switchContext = false,
+    options: {
+      cliSessionId?: string;
+      switchContext?: boolean;
+      modelSelection?: ModelSelection | null;
+      clear?: boolean;
+      /** 外来/清空场景丢弃模型绑定，恢复为「不可核验」的缺失态。 */
+      dropModelSelection?: boolean;
+    },
   ): Promise<Session> {
+    const {
+      cliSessionId,
+      switchContext = false,
+      modelSelection,
+      clear = false,
+      dropModelSelection = false,
+    } = options;
     return this.commitSessionChange({
       sessionId,
       mutate: (current) => {
         if (switchContext && !['idle', 'creating'].includes(current.status)) throw new Error('当前会话不能切换上下文');
+        const { cliSessionId: previousCliSessionId, cliModelSelection: previousModel, ...rest } = current;
+        const storesModelSelection = modelSelection !== undefined && !dropModelSelection;
+        // 旧绑定只在原生会话 id 未变时才可信；换到新 native session 而没有
+        // 新的模型选择 = 绑定不可核验，置为缺失（失败关闭）。缺失绑定在续接
+        // 决策中按 legacy 规则 recreate，不会把旧模型声明冒充新会话的事实。
+        const sameNativeSession = !clear
+          && (cliSessionId === undefined || cliSessionId === previousCliSessionId);
+        const keepsModelSelection = !storesModelSelection
+          && !dropModelSelection
+          && sameNativeSession;
         return {
-          ...current,
-          cliSessionId,
+          ...rest,
+          ...(clear || cliSessionId === undefined ? {} : { cliSessionId }),
+          ...(storesModelSelection
+            ? { cliModelSelection: Object.freeze(normalizeModelSelection(modelSelection)) }
+            : keepsModelSelection ? { cliModelSelection: previousModel } : {}),
           ...(switchContext ? { version: (current.version ?? 0) + 1 } : {}),
           updatedAt: this.now().toISOString(),
         };

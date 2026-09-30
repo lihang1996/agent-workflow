@@ -10,6 +10,7 @@ import { parseAgentOsConfig, buildBotPrompt } from '../src/core/bot-registry.js'
 import { TeamRegistry } from '../src/core/team-registry.js';
 import { getCliAdapter } from '../src/cli/registry.js';
 import { runCli } from '../src/cli/runner.js';
+import { createFixtureIsolationSupplier } from './fixtures/isolation-fixture.js';
 import { findClarificationRequest, ClarificationFlowStore } from '../src/core/clarification.js';
 import { buildClarificationCard } from '../src/im/card.js';
 import type { CliAdapter, CliId } from '../src/cli/types.js';
@@ -18,8 +19,8 @@ const config = parseAgentOsConfig({
   teamLeader: 'coordinator',
   bots: [
     { id: 'coordinator', role: 'CEO 助理', skills: [] },
-    { id: 'requirements', role: '产品经理', skills: ['grill-me', 'to-spec'] },
-    { id: 'engineer', role: '开发工程师', skills: [] },
+    { id: 'requirements', role: '产品经理', skills: ['grill-me', 'to-spec'], specStages: ['product'] },
+    { id: 'engineer', role: '开发工程师', skills: [], specStages: ['architecture'] },
   ].map((bot) => ({ ...bot, appIdEnv: 'TEST_APP_ID', appSecretEnv: 'TEST_APP_SECRET', defaultCli: 'claude' })),
 }, { TEST_APP_ID: 'placeholder', TEST_APP_SECRET: 'placeholder' });
 const team = new TeamRegistry(config.teamLeaderId, config.bots);
@@ -34,11 +35,33 @@ const clarification = {
 test('role policy uses the configured leader; every executing member may ask the user with a card', () => {
   assert.deepEqual(team.appToolsFor('coordinator'), ['dispatch_task']);
   assert.deepEqual(team.appToolsFor('requirements'), ['request_clarification', 'request_spec_approval']);
-  assert.deepEqual(team.appToolsFor('engineer'), ['request_clarification']);
+  assert.deepEqual(team.appToolsFor('engineer'), ['request_clarification', 'request_architecture_review']);
   assert.deepEqual(appToolsForBot({ id: 'coordinator', skills: ['grill-me', 'lark-doc'] }, 'coordinator'), ['dispatch_task']);
   assert.throws(() => team.appToolsFor('missing'), /不存在/);
   assert.deepEqual(parseAppTools(''), []);
   assert.throws(() => parseAppTools('unknown'), /未知/);
+});
+
+test('artifact submission tools are granted by server-side stage, never by skills (T-020)', () => {
+  // 开发 bot 即使有 lark-doc/to-spec Skill（文档编辑能力），没有 product 阶段
+  // 就不能提交产品方案；架构阶段同理按 specStages 授予。
+  assert.deepEqual(
+    appToolsForBot({ id: 'dev', skills: ['lark-doc', 'to-spec'], specStages: ['architecture'] }, 'leader'),
+    ['request_clarification', 'request_architecture_review'],
+  );
+  assert.deepEqual(
+    appToolsForBot({ id: 'dev', skills: ['lark-doc'] }, 'leader'),
+    ['request_clarification'],
+  );
+  assert.deepEqual(
+    appToolsForBot({ id: 'prod', skills: [], specStages: ['product'] }, 'leader'),
+    ['request_clarification', 'request_spec_approval'],
+  );
+  assert.deepEqual(
+    appToolsForBot({ id: 'both', skills: ['lark-doc'], specStages: ['product', 'architecture'] }, 'leader'),
+    ['request_clarification', 'request_spec_approval', 'request_architecture_review'],
+  );
+  assert.deepEqual(appToolsForBot({ id: 'plain', skills: ['lark-doc'] }, 'leader'), ['request_clarification']);
 });
 
 test('leader prompt delegates ambiguity and does not repeat confirmed repair scope', () => {
@@ -70,7 +93,9 @@ for (const cli of ['claude', 'codex'] as const) {
       const resumed = serverParameters(adapter.buildResumeArgs('test', 'old-session', 'argument'), cli);
       assert.deepEqual(resumed, fresh);
       // Start the actual configured server, without invoking an AI CLI or Feishu.
-      const transport = new StdioClientTransport(fresh);
+      // 传入完整环境（含 TMPDIR）：MCP SDK 默认最小 env 不含 TMPDIR，tsx 子进程
+      // 会把 IPC 管道建到 /tmp（本会话宿主沙箱拒绝 /tmp named pipe）。
+      const transport = new StdioClientTransport({ ...fresh, env: { ...process.env } });
       const client = new Client({ name: 'role-policy-test', version: '1.0.0' });
       try {
         await client.connect(transport);
@@ -109,6 +134,7 @@ for (const cli of ['claude', 'codex'] as const) {
 
 async function replayClaude(allowed: AppToolName[], toolName: string, input: unknown, failed = false) {
   const directory = mkdtempSync(join(tmpdir(), 'agent-os-role-replay-'));
+  const fixture = createFixtureIsolationSupplier();
   try {
     const script = join(directory, 'replay.mjs');
     const events = [
@@ -129,8 +155,9 @@ async function replayClaude(allowed: AppToolName[], toolName: string, input: unk
       },
       parseEvents: (line) => parser.parseEvents(line),
     };
-    return await runCli({ adapter, cwd: directory, prompt: 'test' });
+    return await runCli({ adapter, cwd: directory, prompt: 'test', isolation: fixture.supplier });
   } finally {
+    fixture.cleanup();
     rmSync(directory, { recursive: true, force: true });
   }
 }

@@ -1,0 +1,6 @@
+# stdout (codex exec --json JSONL)
+
+# stderr
+Reading additional input from stdin...
+2026-09-30T14:24:51.785307Z ERROR codex_models_manager::manager: failed to refresh available models: request timed out
+

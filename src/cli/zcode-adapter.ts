@@ -1,4 +1,6 @@
 import type { AppToolName } from '../core/app-tool-policy.js';
+import type { ModelSelection } from '../core/model-selection.js';
+import { assertModelSelectionSupported } from '../core/engine-capabilities.js';
 import type {
   CliAdapter,
   CliAttachment,
@@ -170,6 +172,19 @@ function outputArgs(prompt: string, sessionId?: string): string[] {
 }
 
 /**
+ * 官方 CLI 0.16.9 headless 无模型参数（/model 仅 TUI，新会话模型来自
+ * provider 配置 defaultModelSelection）：显式模型/推理强度声明直接拒绝，
+ * 不允许静默退回原生默认。
+ */
+function rejectModelSelection(modelSelection?: ModelSelection | null): void {
+  if (!modelSelection?.model && !modelSelection?.reasoningEffort) return;
+  assertModelSelectionSupported('zcode', {
+    model: modelSelection?.model ?? null,
+    reasoningEffort: modelSelection?.reasoningEffort ?? null,
+  });
+}
+
+/**
  * ZCode Adapter。事件映射依据官方 CLI 0.16.9 的序列化实现（见
  * docs/zcode-cli-integration-plan.md 第 3 节）。turn.failed 已有失败样本；
  * 顶层 result 的 usage/projection 字段来自源码序列化，待成功 stdout 样本复核。
@@ -189,8 +204,10 @@ export class ZcodeAdapter implements CliAdapter {
     prompt: string,
     promptInput: CliPromptInput,
     attachments?: readonly CliAttachment[],
+    modelSelection?: ModelSelection | null,
   ): string[] {
     this.assertArgumentPrompt(promptInput);
+    rejectModelSelection(modelSelection);
     return [...outputArgs(prompt), ...zcodeAttachArgs(attachments)];
   }
 
@@ -199,8 +216,10 @@ export class ZcodeAdapter implements CliAdapter {
     sessionId: string,
     promptInput: CliPromptInput,
     attachments?: readonly CliAttachment[],
+    modelSelection?: ModelSelection | null,
   ): string[] {
     this.assertArgumentPrompt(promptInput);
+    rejectModelSelection(modelSelection);
     return [...outputArgs(prompt, sessionId), ...zcodeAttachArgs(attachments)];
   }
 

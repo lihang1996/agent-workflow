@@ -12,8 +12,18 @@ export class ProductCommentScheduler {
 
   schedule(config: BotConfig, bot: Bot, comment: IncomingDocumentComment): void {
     if (!comment.mentionedBot) return;
-    const flow = this.runtime.productSpecFlows.findPendingByDocument(config.id, comment.fileToken);
-    if (!flow || !flowMatchesSession(flow, this.runtime.sessions.get(flow.sessionId)) || !isProductSpecOwner(flow, {
+    // 同一文档 URL 只允许对应唯一有效 pending flow：多条匹配时无法唯一定位
+    // 评论目标，失败关闭（不静默取第一条，work/30）。
+    const candidates = this.runtime.productSpecFlows.listPendingByDocument(config.id, comment.fileToken);
+    if (candidates.length === 0) return;
+    if (candidates.length > 1) {
+      console.error(
+        `[产品评论] 文档 ${comment.fileToken} 存在 ${candidates.length} 个待确认制品，无法唯一定位评论目标，拒绝处理（失败关闭）`,
+      );
+      return;
+    }
+    const flow = candidates[0];
+    if (!flowMatchesSession(flow, this.runtime.sessions.get(flow.sessionId)) || !isProductSpecOwner(flow, {
       operatorOpenId: comment.senderOpenId, operatorUnionId: comment.senderUnionId, operatorBotId: config.id,
     })) return;
     const key = `${config.id}:${comment.eventId || [comment.fileToken, comment.commentId, comment.replyId].join(':')}`;

@@ -8,6 +8,7 @@ import { TeamRegistry } from '../src/core/team-registry.js';
 import { ClarificationFlowStore, isClarificationOwner } from '../src/core/clarification.js';
 import { ProductSpecFlowStore, ProductSpecRequestSchema } from '../src/core/product-spec.js';
 import { JsonProductSpecFlowStore } from '../src/core/product-spec-store.js';
+import { computeLocalArtifactDigest } from '../src/core/artifact-digest.js';
 import { CollaborationInbox, type CollaborationMessage } from '../src/core/collaboration.js';
 import { requestTaskAbort } from '../src/core/task-abort.js';
 import { createCardActionHandler } from '../src/app/card-action-handler.js';
@@ -26,6 +27,7 @@ import { type BotConfig } from '../src/core/bot-registry.js';
 import type { AppRuntime } from '../src/app/runtime.js';
 
 const request = { title: '方案', summary: '说明', deliveryMode: 'lark-doc' as const, documentUrl: 'https://team.feishu.cn/docx/abc' };
+const localRequest = { title: '方案', summary: '说明', deliveryMode: 'local' as const, specPath: 'spec.md', ticketsPath: 'tickets' };
 const origin = { taskId: 'task', fromBotId: 'leader', reportToBotId: 'leader', round: 1, maxRounds: 16 };
 const questions = { title: '范围', intro: '', questions: [
   { id: 'q1', prompt: '范围？', options: [{ id: 'a', label: '小' }, { id: 'b', label: '大' }] },
@@ -37,20 +39,35 @@ function temp(t: { after: (fn: () => void) => void }): string {
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   return dir;
 }
+// fixture 自身的会话工作区：本地模式方案的制品文件必须落在会话工作区里，
+// G1 才能回读重算摘要。多数用例没有 test 上下文，统一登记到进程退出清理。
+const workspaces: string[] = [];
+process.on('exit', () => { for (const dir of workspaces) rmSync(dir, { recursive: true, force: true }); });
 async function fixture() {
-  const config: BotConfig = { id: 'product', appId: 'app', appSecret: 'test', defaultCliId: 'claude', modelOverrides: {}, workspaceDir: '/tmp', role: '产品', skills: ['grill-me', 'lark-doc'], systemPrompt: '', collaborationMaxRounds: 16 };
+  const workspaceDir = mkdtempSync(join(tmpdir(), 'agent-os-workspace-'));
+  workspaces.push(workspaceDir);
+  const config: BotConfig = { id: 'product', appId: 'app', appSecret: 'test', defaultCliId: 'claude', modelOverrides: {}, workspaceDir, role: '产品', skills: ['grill-me', 'lark-doc'], systemPrompt: '', collaborationMaxRounds: 16 };
   const leader: BotConfig = { ...config, id: 'leader', skills: [] };
   const bot = { reply: async () => 'text', replyCard: async () => 'card', replyMention: async () => 'notice', updateCard: async () => {}, replyToDocumentComment: async () => {}, setDocumentCommentWorking: async () => {}, subscribeToDocumentComments: async () => {} } as unknown as Bot;
   const sessions = new SessionManager();
-  const { session } = await sessions.resolve({ chatId: 'chat', threadId: 'thread', rootId: 'root', messageId: 'msg' }, 'claude', config.id, '/tmp');
+  const { session } = await sessions.resolve({ chatId: 'chat', threadId: 'thread', rootId: 'root', messageId: 'msg' }, 'claude', config.id, workspaceDir);
   await sessions.transition(session.id, 'idle');
   await sessions.setCliSessionId(session.id, 'cli-session');
-  const runtime: AppRuntime = { sessions, teamRegistry: new TeamRegistry('leader', [leader, config]), activeRuns: new Map(), contextWindows: new Map(), botRuntimes: new Map(), processedCollaborationTurns: new Set(), collaborationInbox: new CollaborationInbox(), clarificationFlows: new ClarificationFlowStore(), productSpecFlows: new ProductSpecFlowStore() };
+  const runtime: AppRuntime = { sessions, teamRegistry: new TeamRegistry('leader', [leader, config]), activeRuns: new Map(), contextWindows: new Map(), botRuntimes: new Map(), processedCollaborationTurns: new Set(),
+  sessionScratches: new Map(), collaborationInbox: new CollaborationInbox(), clarificationFlows: new ClarificationFlowStore(), productSpecFlows: new ProductSpecFlowStore() };
   for (const cfg of [config, leader]) runtime.botRuntimes.set(cfg.id, { config: cfg, bot, identity: { openId: `bot-${cfg.id}`, name: cfg.id } });
   const createFlow = (collaboration = true) => runtime.productSpecFlows.create({ taskId: 'task', botId: config.id, sessionId: session.id, ownerOpenId: 'leader-owner', ownerUnionId: 'union-owner', ownerBotId: 'leader', request, ...(collaboration ? { collaboration: origin } : {}) });
+  // 本地模式 flow：真实制品文件 + 提交时绑定的完整摘要（G1 审批路径用）。
+  const createLocalFlow = async (collaboration = true) => {
+    writeFileSync(join(workspaceDir, 'spec.md'), '# 方案\n\n本地交付。\n');
+    mkdirSync(join(workspaceDir, 'tickets'), { recursive: true });
+    writeFileSync(join(workspaceDir, 'tickets', 't1.md'), '## 需求 1\n\n下单展示会员价。');
+    const digest = await computeLocalArtifactDigest(workspaceDir, localRequest);
+    return runtime.productSpecFlows.create({ taskId: 'task', botId: config.id, sessionId: session.id, ownerOpenId: 'leader-owner', ownerUnionId: 'union-owner', ownerBotId: 'leader', request: localRequest, content_digest: digest.digest, digest_algorithm: 'canonical-sha256-v1', content_sources: digest.content_sources, ...(collaboration ? { collaboration: origin } : {}) });
+  };
   const handler = () => createCardActionHandler({ runtime, config, defaultProductDeliveryMode: 'lark-doc' });
   const action = (token: string): CardAction => ({ messageId: 'approval-card', operatorOpenId: 'product-owner', operatorUnionId: 'union-owner', formValue: {}, value: { action: 'approve_product_spec', flowToken: token } });
-  return { runtime, bot, config, session, createFlow, handler, action };
+  return { runtime, bot, config, session, workspaceDir, createFlow, createLocalFlow, handler, action };
 }
 
 test('approval of a leader-dispatched proposal ends the flow: recorded, durable, never dispatched', async (t) => {
@@ -58,7 +75,7 @@ test('approval of a leader-dispatched proposal ends the flow: recorded, durable,
   const specPath = join(dir, 'specs.json'), inboxPath = join(dir, 'inbox.json');
   f.runtime.productSpecFlows = new JsonProductSpecFlowStore(specPath);
   f.runtime.collaborationInbox = new CollaborationInbox(inboxPath);
-  const flow = f.createFlow(); let notices = 0, cards = 0;
+  const flow = await f.createLocalFlow(); let notices = 0, cards = 0;
   f.bot.replyCard = async () => { cards++; return 'card'; };
   f.bot.replyMention = async () => { notices++; return 'notice'; };
   const first = await f.handler()(f.action(flow.token));
@@ -66,6 +83,7 @@ test('approval of a leader-dispatched proposal ends the flow: recorded, durable,
   assert.match(JSON.stringify(first?.card), /没有自动派发/);
   const approved = f.runtime.productSpecFlows.get(flow.token)!;
   assert.equal(approved.status, 'approved'); assert.equal(approved.approvalMessageId, 'approval-card'); assert.ok(approved.approvedAt);
+  assert.equal(approved.content_digest, flow.content_digest);
   f.runtime.productSpecFlows = new JsonProductSpecFlowStore(specPath);
   f.runtime.collaborationInbox = new CollaborationInbox(inboxPath);
   assert.equal(f.runtime.productSpecFlows.get(flow.token)?.status, 'approved');
@@ -76,7 +94,7 @@ test('approval of a leader-dispatched proposal ends the flow: recorded, durable,
 });
 
 test('concurrent confirmation clicks approve exactly once', async () => {
-  const f = await fixture(); const flow = f.createFlow();
+  const f = await fixture(); const flow = await f.createLocalFlow();
   const handler = f.handler();
   const results = await Promise.all([handler(f.action(flow.token)), handler(f.action(flow.token)), handler(f.action(flow.token))]);
   const types = results.map((result) => result?.toast?.type).sort();
@@ -85,7 +103,16 @@ test('concurrent confirmation clicks approve exactly once', async () => {
   assert.equal(f.runtime.productSpecFlows.get(flow.token)?.status, 'approved');
 });
 
-test('approval rejects other users and queued comments block confirmation until drained', async () => {
+test('G1 blocks approval when local artifact files drift after submission', async () => {
+  const f = await fixture(); const flow = await f.createLocalFlow();
+  writeFileSync(join(f.workspaceDir, 'tickets', 't2.md'), '## 需求 2\n\n提交后被外部修改。');
+  const gate = await f.handler()(f.action(flow.token));
+  assert.equal(gate?.toast?.type, 'warning');
+  assert.match(gate?.toast?.content ?? '', /发生了变化/);
+  assert.equal(f.runtime.productSpecFlows.get(flow.token)?.status, 'pending');
+});
+
+test('approval rejects other users, queued comments block confirmation, lark approval stays blocked (U-3)', async () => {
   const f = await fixture(); const flow = f.createFlow(); let edits = 0;
   let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
   const scheduler = new ProductCommentScheduler(f.runtime, async () => { edits++; await gate; });
@@ -97,9 +124,16 @@ test('approval rejects other users and queued comments block confirmation until 
   assert.equal((await handler(f.action(flow.token)))?.toast?.type, 'warning');
   assert.equal(f.runtime.productSpecFlows.get(flow.token)?.status, 'pending');
   release(); await scheduler.drain(); assert.equal(edits, 2);
-  assert.equal((await handler(f.action(flow.token)))?.toast?.type, 'success');
+  // 评论队列排空后审批互斥解除；但飞书完整回读能力未核验（U-3），
+  // G1 对 lark 交付保持 blocked——确认被拒、状态保持 pending。
+  const blocked = await handler(f.action(flow.token));
+  assert.equal(blocked?.toast?.type, 'error');
+  assert.match(blocked?.toast?.content ?? '', /blocked/);
+  assert.equal(f.runtime.productSpecFlows.get(flow.token)?.status, 'pending');
+  // 方案仍是 pending：新的评论修订继续被调度处理（原“审批后拒绝评论”
+  // 行为仅在 approved 状态成立）。
   scheduler.schedule(f.config, f.bot, { ...comment, eventId: 'after-approval' });
-  await scheduler.drain(); assert.equal(edits, 2);
+  await scheduler.drain(); assert.equal(edits, 3);
 });
 
 test('queued comments recheck expired proposal and failed comments can be retried', async () => {
@@ -173,10 +207,60 @@ test('confirmation never dispatches, whether the proposal came from the leader o
     const f = await fixture(); const flow = f.createFlow(viaLeader); let dispatched = 0;
     f.bot.replyMention = async () => { dispatched++; return 'notice'; };
     f.bot.replyCard = async () => { dispatched++; return 'card'; };
-    assert.match(JSON.stringify(buildProductSpecApprovalCard(flow)), /不会自动派发.*@ 开发/);
+    assert.match(JSON.stringify(buildProductSpecApprovalCard(flow)), /不会自动派发.*授权开发/);
     await f.handler()(f.action(flow.token)); assert.equal(dispatched, 0);
-    assert.match(JSON.stringify(buildProductSpecApprovedCard(flow)), /没有自动派发.*@ 开发/);
+    // 84 号 P2：已确认卡指引显式授权入口（不再是“@ 开发”自由文本）。
+    assert.match(JSON.stringify(buildProductSpecApprovedCard(flow)), /没有自动派发.*授权开发/);
+    assert.ok(!JSON.stringify(buildProductSpecApprovedCard(flow)).includes('请 @ 开发'));
   }
+});
+
+test('W5 返修（work/44-5）：无法确认的 flow 展示 blocked 原因，不放误导性确认按钮', async () => {
+  const f = await fixture();
+  // 飞书模式（U-3，digest 恒 null）：G1 必拒，卡片不得提供可点确认。
+  const larkFlow = f.createFlow();
+  const larkCard = JSON.stringify(buildProductSpecApprovalCard(larkFlow));
+  assert.match(larkCard, /blocked/);
+  assert.match(larkCard, /U-3/);
+  assert.ok(!larkCard.includes('确认产品方案'), '不可确认的 flow 不得出现确认按钮');
+  assert.match(larkCard, /不会自动派发.*授权开发/);
+
+  // 本地旧 pending 未绑定摘要：同样 blocked 展示。
+  const legacyLocal = f.runtime.productSpecFlows.create({
+    taskId: 'task-legacy', botId: f.config.id, sessionId: f.session.id,
+    ownerOpenId: 'leader-owner', ownerUnionId: 'union-owner', ownerBotId: 'leader', request: localRequest,
+  });
+  const legacyCard = JSON.stringify(buildProductSpecApprovalCard(legacyLocal));
+  assert.match(legacyCard, /blocked/);
+  assert.match(legacyCard, /没有绑定内容摘要/);
+  assert.ok(!legacyCard.includes('确认产品方案'));
+
+  // 绑定了摘要的本地 flow：正常可确认展示（对照）。
+  const bound = await f.createLocalFlow();
+  const boundCard = JSON.stringify(buildProductSpecApprovalCard(bound));
+  assert.ok(boundCard.includes('确认产品方案'));
+
+  // work/45-6：摘要已绑定但知识基准 degraded → blocked 展示，无确认按钮，
+  // G1 必拒且例外通道未开放。
+  writeFileSync(join(f.workspaceDir, 'spec.md'), '# 方案\n\n本地交付（degraded 基准）。\n');
+  mkdirSync(join(f.workspaceDir, 'tickets'), { recursive: true });
+  writeFileSync(join(f.workspaceDir, 'tickets', 't1.md'), '## 需求 1\n\n下单展示会员价。');
+  const degradedDigest = await computeLocalArtifactDigest(f.workspaceDir, localRequest);
+  const degradedFlow = f.runtime.productSpecFlows.create({
+    taskId: 'task-degraded', botId: f.config.id, sessionId: f.session.id,
+    ownerOpenId: 'leader-owner', ownerUnionId: 'union-owner', ownerBotId: 'leader',
+    request: localRequest, content_digest: degradedDigest.digest,
+    digest_algorithm: 'canonical-sha256-v1', content_sources: degradedDigest.content_sources,
+    knowledge_state: 'degraded',
+  });
+  const degradedCard = JSON.stringify(buildProductSpecApprovalCard(degradedFlow));
+  assert.match(degradedCard, /degraded/);
+  assert.match(degradedCard, /例外确认通道尚未开放/);
+  assert.ok(!degradedCard.includes('确认产品方案'), 'degraded flow 不得出现确认按钮');
+  const degradedGate = await f.handler()(f.action(degradedFlow.token));
+  assert.equal(degradedGate?.toast?.type, 'warning');
+  assert.match(degradedGate?.toast?.content ?? '', /degraded|例外/);
+  assert.equal(f.runtime.productSpecFlows.get(degradedFlow.token)?.status, 'pending');
 });
 
 test('URL validation rejects fake hosts and accepts real Wiki; Wiki resolves to Docx token', async () => {
@@ -285,13 +369,24 @@ test('recovery retries an offline recipient without losing its original dispatch
   await service.recover(); await service.recover(); assert.equal(notices, 1); assert.equal(f.runtime.collaborationInbox.pending().length, 0);
 });
 
-test('finished proposal history is bounded without dropping proposals still awaiting confirmation', () => {
+test('history pruning only trims expired proposals; approved/invalidated records keep their digest and audit basis', () => {
   const store = new ProductSpecFlowStore();
   const awaiting = store.create({ taskId: 'awaiting', botId: 'product', sessionId: 's', ownerOpenId: 'owner', request, collaboration: origin });
-  const first = store.create({ taskId: 'rolling', botId: 'product', sessionId: 's', ownerOpenId: 'owner', request }); store.approve(first.token);
+  // approved 是版本与摘要锚点（架构上游/授权/审计依据）：数量再多也不裁剪
+  //（work/30：不得仅按数量裁剪已完成 flow 丢失 approved PRD 的摘要与上游关系）。
+  const approvedKept = store.create({ taskId: 'approved-kept', botId: 'product', sessionId: 's', ownerOpenId: 'owner', request, content_digest: 'a'.repeat(64) });
+  store.approve(approvedKept.token);
+  const invalidatedKept = store.create({ taskId: 'invalidated-kept', botId: 'product', sessionId: 's', ownerOpenId: 'owner', request, content_digest: 'b'.repeat(64) });
+  store.invalidate(invalidatedKept.token, '外部编辑检测（fixture）');
+  // 大量 expired（同任务滚动重建产生）仍按上限裁剪。
+  const rollingFirst = store.create({ taskId: 'rolling', botId: 'product', sessionId: 's', ownerOpenId: 'owner', request });
   for (let index = 0; index < 1005; index++) {
-    const flow = store.create({ taskId: 'rolling', botId: 'product', sessionId: 's', ownerOpenId: 'owner', request }); store.approve(flow.token);
+    store.create({ taskId: 'rolling', botId: 'product', sessionId: 's', ownerOpenId: 'owner', request });
   }
-  assert.equal(store.get(first.token), undefined);
+  assert.equal(store.get(rollingFirst.token), undefined);
+  assert.equal(store.get(approvedKept.token)?.status, 'approved');
+  assert.ok(store.get(approvedKept.token)?.content_digest);
+  assert.equal(store.get(invalidatedKept.token)?.status, 'invalidated');
+  assert.match(store.get(invalidatedKept.token)?.invalidation_reason ?? '', /外部编辑/);
   assert.equal(store.get(awaiting.token)?.status, 'pending');
 });

@@ -8,12 +8,35 @@ import { dirname } from 'node:path';
 import { z } from 'zod';
 import { CollaborationOriginSchema } from './collaboration.js';
 import {
+  ContentSourceSchema,
+  KnowledgeRefSchema,
   ProductSpecRequestSchema,
+  ArchitectureRequestSchema,
   ProductSpecFlowStore,
+  type ContentSource,
   type CreateProductSpecFlowOptions,
   type ProductSpecFlow,
 } from './product-spec.js';
 
+/**
+ * W5 迁移：旧记录缺新字段时读入补默认（artifact_kind="prd"、content_digest=null、
+ * status 保持）；含 digest=null 的 approved 旧记录不得用于授权编码（G2 拒绝，
+ * 见 artifact-digest.ts 的 assertArtifactAuthorizable）。未知 status 值在枚举
+ * 校验处失败关闭，不会以坏行静默剔除。
+ */
+const ArchitectureUpstreamSchema = z.object({
+  prdToken: z.string().min(1).max(128),
+  prdDigest: z.string().regex(/^[0-9a-f]{64}$/),
+  approvedAt: z.iso.datetime().optional(),
+  approvalMessageId: z.string().min(1).optional(),
+  prdTaskId: z.string().min(1),
+  prdSessionId: z.string().min(1),
+  knowledgeRefs: z.array(KnowledgeRefSchema).default([]),
+  knowledgeState: z
+    .enum(['ok', 'new_project_no_baseline', 'degraded', 'no_current_objects'])
+    .nullish()
+    .default(null),
+}).strict();
 const ProductSpecFlowSchema = z.object({
   sessionVersion: z.number().int().nonnegative().default(0),
   token: z.string().min(1),
@@ -25,9 +48,20 @@ const ProductSpecFlowSchema = z.object({
   ownerBotId: z.string().optional(),
   approvalMessageId: z.string().optional(),
   collaboration: CollaborationOriginSchema.optional(),
-  request: ProductSpecRequestSchema,
-  status: z.enum(['pending', 'approved', 'expired']),
+  request: z.union([ProductSpecRequestSchema, ArchitectureRequestSchema]),
+  status: z.enum(['pending', 'approved', 'expired', 'invalidated']),
   approvedAt: z.iso.datetime().optional(),
+  artifact_kind: z.enum(['prd', 'architecture']).default('prd'),
+  content_digest: z.string().regex(/^[0-9a-f]{64}$/).nullish().default(null),
+  digest_algorithm: z.literal('canonical-sha256-v1').default('canonical-sha256-v1'),
+  content_sources: z.array(ContentSourceSchema).default([]),
+  knowledge_refs: z.array(KnowledgeRefSchema).default([]),
+  knowledge_state: z
+    .enum(['ok', 'new_project_no_baseline', 'degraded', 'no_current_objects'])
+    .nullish()
+    .default(null),
+  invalidation_reason: z.string().min(1).max(200).optional(),
+  upstream: ArchitectureUpstreamSchema.optional(),
 });
 
 export class JsonProductSpecFlowStore extends ProductSpecFlowStore {
@@ -41,6 +75,18 @@ export class JsonProductSpecFlowStore extends ProductSpecFlowStore {
 
   override approve(token: string, messageId?: string): ProductSpecFlow | undefined {
     return this.mutate(() => super.approve(token, messageId));
+  }
+
+  override invalidate(token: string, reason: string): ProductSpecFlow | undefined {
+    return this.mutate(() => super.invalidate(token, reason));
+  }
+
+  override rebindDigest(
+    token: string,
+    contentDigest: string,
+    contentSources: ContentSource[],
+  ): ProductSpecFlow | undefined {
+    return this.mutate(() => super.rebindDigest(token, contentDigest, contentSources));
   }
 
   private mutate<T>(operation: () => T): T {

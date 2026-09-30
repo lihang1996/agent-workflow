@@ -9,21 +9,45 @@ import { resolveResultCard } from './app/result-delivery.js';
 import { DeliveryOutbox } from './app/delivery-outbox.js';
 import { subscribeDocumentComments } from './app/document-subscription.js';
 import { join, resolve } from 'node:path';
+import { acquireDataDirLock } from './core/data-lock.js';
 import { startBot } from './im/lark.js';
 import { SessionManager } from './core/session-manager.js';
 import { JsonSessionStore } from './core/session-store.js';
 import type { ActiveRun } from './core/task-abort.js';
 import { ClarificationFlowStore } from './core/clarification.js';
 import { JsonProductSpecFlowStore } from './core/product-spec-store.js';
+import { ArchitectureHandoffStore } from './core/architecture-handoff.js';
+import { JsonCodingAuthorizationStore } from './core/coding-authorization.js';
 import { CollaborationInbox } from './core/collaboration.js';
 import { ensureWorkspaceDirectory } from './core/workspace.js';
 import { loadAgentOsConfig, type BotConfig } from './core/bot-registry.js';
+import { loadSessionScratchBindings } from './core/isolation.js';
 import { TeamRegistry } from './core/team-registry.js';
 import { listCliAdapters } from './cli/registry.js';
 import { createCardActionHandler } from './app/card-action-handler.js';
 import { ProductCommentScheduler } from './app/product-comment-scheduler.js';
 import { CollaborationService } from './app/collaboration-service.js';
 import type { AppRuntime, BotRuntime } from './app/runtime.js';
+
+// A08：data 目录单实例锁——多进程共写 data/ 台账会互相覆盖，启动最前面抢锁；
+// 已有存活实例即拒绝启动，上次崩溃残留的死锁会被接管。
+const dataDirLock = acquireDataDirLock(join('data'));
+const releaseDataDirLock = (): void => {
+  try {
+    dataDirLock.release();
+  } catch {
+    // 退出路径上锁释放失败不影响关停。
+  }
+};
+process.once('exit', releaseDataDirLock);
+process.once('SIGINT', () => {
+  releaseDataDirLock();
+  process.exit(130);
+});
+process.once('SIGTERM', () => {
+  releaseDataDirLock();
+  process.exit(143);
+});
 
 const botConfigPath = resolve(
   process.env.BOTS_CONFIG ?? join('config', 'bots.json'),
@@ -58,8 +82,27 @@ const clarificationFlows = new ClarificationFlowStore(join('data', 'clarificatio
 const productSpecFlows = new JsonProductSpecFlowStore(
   join('data', 'product-spec-flows.json'),
 );
+// 架构交接台账（T-020）：服务端签发的 PRD→架构 capability（单次使用）。
+// A07：持久化到 data/architecture-handoffs.json（tmp+rename 原子写），重启后
+// 交接码与已消费状态不丢；坏文件在构造处失败关闭。
+const architectureHandoffs = new ArchitectureHandoffStore(join('data', 'architecture-handoffs.json'));
+// 编码授权台账（T-021 首批）：本地模型与显式入口；active 不接真实开发派发
+//（T-022 每引擎读写隔离 canary 未通过前，仅作为可校验的数据状态）。
+// 文件名对齐 09 号架构 §3.5 的 data/authorizations.json（新文件无迁移包袱）。
+const codingAuthorizations = new JsonCodingAuthorizationStore(
+  join('data', 'authorizations.json'),
+);
+const taskExecutions = new TaskExecutionStore(join('data', 'task-executions.json'));
+// A07：会话 scratch 绑定恢复（119 号 P1-4 之前重启即丢失，本地制品提交只能
+// 等下一次隔离任务）——恢复时逐条重新核对：realpath 仍存在且解析一致、
+// taskKey 与会话最近任务一致、未过期，任一不满足即丢弃（安全拒绝）。
+const sessionScratches = loadSessionScratchBindings({
+  filePath: join('data', 'session-scratches.json'),
+  resolveWorkspaceDir: (sessionId) => sessions.get(sessionId)?.workspaceDir,
+  taskKeyOf: (sessionId) => taskExecutions.forSession(sessionId)?.id,
+});
 const runtime: AppRuntime = {
-  taskExecutions: new TaskExecutionStore(join('data', 'task-executions.json')),
+  taskExecutions,
   deliveries: new DeliveryOutbox((id) => botRuntimes.get(id)?.bot, join('data', 'result-deliveries.json'), 100, (operation) => resolveResultCard(runtime, operation)),
   sessions,
   teamRegistry,
@@ -70,6 +113,11 @@ const runtime: AppRuntime = {
   collaborationInbox,
   clarificationFlows,
   productSpecFlows,
+  architectureHandoffs,
+  codingAuthorizations,
+  // 119 号 P1-4 + A07：会话 scratch 绑定表（SessionScratchBindingStore——
+  // Map 子类，cli-execution 的 set 路径自动落盘）。
+  sessionScratches,
 };
 const collaborationService = new CollaborationService(runtime);
 const productComments = new ProductCommentScheduler(runtime);

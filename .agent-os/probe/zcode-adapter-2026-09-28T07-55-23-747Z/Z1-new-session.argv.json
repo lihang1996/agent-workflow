@@ -1,0 +1,11 @@
+{
+  "command": "zcode",
+  "args": [
+    "--prompt",
+    "Reply with exactly: pong. 不要调用任何工具，不要写任何文件。",
+    "--mode",
+    "yolo",
+    "--output-format",
+    "stream-json"
+  ]
+}

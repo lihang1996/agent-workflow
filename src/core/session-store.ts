@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { z } from 'zod';
 import { CLI_IDS } from '../cli/types.js';
+import { ModelSelectionSchema } from './model-selection.js';
 import type { Session } from './session-manager.js';
 
 export interface SessionStore {
@@ -18,6 +19,8 @@ const SessionSchema = z.object({
   chatId: z.string().min(1),
   cliId: z.enum(CLI_IDS),
   cliSessionId: z.string().min(1).optional(),
+  // 旧记录没有该字段：按「模型绑定不可核验」读取（缺失≠原生默认），不在加载层补造。
+  cliModelSelection: ModelSelectionSchema.optional(),
   workspaceDir: z.string().min(1),
   status: z.enum(['creating', 'active', 'idle', 'closed']),
   createdAt: z.iso.datetime(),

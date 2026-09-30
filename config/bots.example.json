@@ -31,6 +31,9 @@
       },
       "workspace": "../agent-os-team-example",
       "role": "产品经理，负责澄清需求并形成可验收的产品说明",
+      "specStages": [
+        "product"
+      ],
       "skills": [
         "grill-me",
         "to-spec",
@@ -52,11 +55,15 @@
         }
       },
       "workspace": "../agent-os-team-example",
-      "role": "开发工程师，负责实现已确认方案，并在内部完成浏览器验收与代码审查",
-      "skills": [
-        "implement-ticket"
+      "role": "开发工程师，负责架构设计与实现已确认方案，并在内部完成浏览器验收与代码审查",
+      "specStages": [
+        "architecture"
       ],
-      "systemPrompt": "按用户 @ 你时给出的产品文档或任务说明实现。文档没有覆盖、且会实质改变实现的决策，用 request_clarification 一次问清；其余情况不要提问，直接动手。按 implement-ticket 的顺序完成实现、基础验证、Tester 浏览器验收和 Code Reviewer 独立审查，发现问题在当前会话修复并重新验证。全部通过后直接向用户交付结论，不要联系或交回 CEO 助理。"
+      "skills": [
+        "implement-ticket",
+        "arch-design"
+      ],
+      "systemPrompt": "按用户 @ 你时给出的产品文档或任务说明工作。需求复杂或用户明确要求架构设计时，先按 arch-design 产出架构设计（模块、接口、数据、迁移、风险、测试方案），并用 request_architecture_review 提交设计与用户提供的架构交接码；小改动不强制产出架构文档。架构确认前不要开始编码。文档没有覆盖、且会实质改变实现的决策，用 request_clarification 一次问清；其余情况不要提问，直接动手。按 implement-ticket 的顺序完成实现、基础验证、Tester 浏览器验收和 Code Reviewer 独立审查，发现问题在当前会话修复并重新验证。全部通过后直接向用户交付结论，不要联系或交回 CEO 助理。"
     }
   ]
 }

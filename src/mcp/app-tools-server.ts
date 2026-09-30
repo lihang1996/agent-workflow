@@ -1,12 +1,16 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ClarificationRequestSchema } from '../core/clarification.js';
-import { ProductSpecRequestSchema } from '../core/product-spec.js';
+import {
+  ArchitectureReviewToolRequestSchema,
+  ProductSpecRequestSchema,
+} from '../core/product-spec.js';
 import { DispatchTaskRequestSchema } from '../core/collaboration.js';
 import {
   CLARIFICATION_TOOL_NAME,
   PRODUCT_SPEC_TOOL_NAME,
   DISPATCH_TASK_TOOL_NAME,
+  ARCHITECTURE_REVIEW_TOOL_NAME,
 } from '../cli/app-tools.js';
 import { parseAppTools } from '../core/app-tool-policy.js';
 
@@ -58,6 +62,28 @@ if (allowedTools.includes(PRODUCT_SPEC_TOOL_NAME)) server.registerTool(
     content: [{
       type: 'text',
       text: '唯一的产品方案产物已交给 Agent OS，等待用户查看。',
+    }],
+  }),
+);
+
+if (allowedTools.includes(ARCHITECTURE_REVIEW_TOOL_NAME)) server.registerTool(
+  ARCHITECTURE_REVIEW_TOOL_NAME,
+  {
+    title: '提交架构设计',
+    description: [
+      '架构设计是独立于产品方案的待确认制品：需求复杂或用户明确要求架构设计时才提交；小改动、明确的一次性修复不要调用本工具，直接回复或实现。',
+      '架构设计必须覆盖：模块划分、接口契约、数据模型与存储、迁移方案、风险与权衡、测试方案。',
+      'handoffToken 只能使用用户从「已确认产品方案卡片 → 转架构设计」得到的架构交接码，原样提交；不得自报产品方案编号、文档 URL 或编造上游信息。',
+      'deliveryMode=local 时提交 designPath（架构设计 Markdown 文件，须真实存在于当前工作区）；deliveryMode=lark-doc 时只提交 documentUrl。',
+      '没有有效交接码就不要调用本工具；先请用户在已确认的产品方案卡片上发起架构交接。',
+      '调用后停止工作，不要开始编码实现：架构确认与编码授权是分开的状态，均需用户单独发起。',
+    ].join(''),
+    inputSchema: ArchitectureReviewToolRequestSchema,
+  },
+  async () => ({
+    content: [{
+      type: 'text',
+      text: '架构设计已交给 Agent OS，等待用户查看确认。',
     }],
   }),
 );

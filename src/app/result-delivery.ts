@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { ThrottledCardUpdater, type CardJson, buildClarificationCard, buildClarificationContinuingCard,
   buildClarificationSupersededCard, buildProductSpecApprovalCard, buildProductSpecApprovedCard,
-  buildProductSpecExpiredCard, buildSessionNoticeCard } from '../im/card.js';
+  buildProductSpecExpiredCard, buildProductSpecUnusableApprovalCard, buildSessionNoticeCard } from '../im/card.js';
 import type { Bot } from '../im/lark.js';
 import { DeliveryOutbox, type CardDelivery } from './delivery-outbox.js';
 import type { AppRuntime } from './runtime.js';
@@ -21,8 +21,17 @@ export function resolveResultCard(runtime: AppRuntime, operation: CardDelivery):
   } else {
     const flow = runtime.productSpecFlows.get(reference.token);
     if (flow) {
-      if (flow.status === 'approved') return buildProductSpecApprovedCard(flow);
-      if (flow.status === 'expired' || !flowMatchesSession(flow, runtime.sessions.get(flow.sessionId))) return buildProductSpecExpiredCard(flow);
+      // W5 返修：旧 approved 未绑定摘要 / invalidated 的补发渲染都标不可用，
+      // 不让重试链路把失效确认重新展示成可用版本。
+      if (flow.status === 'invalidated') return buildProductSpecUnusableApprovalCard(flow);
+      if (flow.status === 'approved') {
+        return flow.content_digest == null
+          ? buildProductSpecUnusableApprovalCard(flow)
+          : buildProductSpecApprovedCard(flow);
+      }
+      if (flow.status === 'expired' || !flowMatchesSession(flow, runtime.sessions.get(flow.sessionId))) {
+        return buildProductSpecExpiredCard(flow, flow.status === 'expired' ? flow.invalidation_reason : undefined);
+      }
       return buildProductSpecApprovalCard(flow);
     }
   }

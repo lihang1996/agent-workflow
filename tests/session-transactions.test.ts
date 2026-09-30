@@ -88,6 +88,7 @@ function runtimeFixture(sessions: SessionManager): AppRuntime {
     contextWindows: new Map(),
     botRuntimes: new Map(),
     processedCollaborationTurns: new Set(),
+  sessionScratches: new Map(),
     collaborationInbox: { pending: () => [] } as unknown as AppRuntime['collaborationInbox'],
     clarificationFlows: { forSession: () => [] } as unknown as AppRuntime['clarificationFlows'],
     productSpecFlows: { forSession: () => [] } as unknown as AppRuntime['productSpecFlows'],

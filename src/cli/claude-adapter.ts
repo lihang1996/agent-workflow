@@ -1,6 +1,8 @@
 import { promptInputForPlatform } from './types.js';
 import type { AppToolName } from '../core/app-tool-policy.js';
-import type { CliAdapter, CliPromptInput, CliEvent, CliRunStats } from './types.js';
+import type { ModelSelection } from '../core/model-selection.js';
+import { assertModelSelectionSupported } from '../core/engine-capabilities.js';
+import type { CliAdapter, CliAttachment, CliPromptInput, CliEvent, CliRunStats } from './types.js';
 import {
   CLAUDE_CLARIFICATION_TOOL_NAME,
   CLAUDE_PRODUCT_SPEC_TOOL_NAME,
@@ -125,9 +127,15 @@ function parseStats(event: ClaudeEvent): CliRunStats | undefined {
     : undefined;
 }
 
-function outputArgs(prompt: string, promptInput: CliPromptInput, appTools: readonly AppToolName[]): string[] {
+function outputArgs(
+  prompt: string,
+  promptInput: CliPromptInput,
+  appTools: readonly AppToolName[],
+  modelSelection?: ModelSelection | null,
+): string[] {
   return [
     '--dangerously-skip-permissions',
+    ...modelArgs(modelSelection),
     '-p',
     ...(promptInput === 'argument' ? [prompt] : []),
     '--output-format',
@@ -137,18 +145,44 @@ function outputArgs(prompt: string, promptInput: CliPromptInput, appTools: reado
   ];
 }
 
+/** --model/--effort 的参数名来自 claude --help（2.1.261），矩阵外组合先拒绝。 */
+function modelArgs(modelSelection?: ModelSelection | null): string[] {
+  if (!modelSelection?.model && !modelSelection?.reasoningEffort) return [];
+  assertModelSelectionSupported('claude', {
+    model: modelSelection?.model ?? null,
+    reasoningEffort: modelSelection?.reasoningEffort ?? null,
+  });
+  return [
+    ...(modelSelection.model ? ['--model', modelSelection.model] : []),
+    ...(modelSelection.reasoningEffort
+      ? ['--effort', modelSelection.reasoningEffort]
+      : []),
+  ];
+}
+
 export class ClaudeAdapter implements CliAdapter {
   constructor(readonly appTools: readonly AppToolName[] = []) {}
   readonly id = 'claude' as const;
   readonly command = 'claude';
   readonly displayName = 'Claude Code';
 
-  buildArgs(prompt: string, promptInput: CliPromptInput): string[] {
-    return outputArgs(prompt, promptInput, this.appTools);
+  buildArgs(
+    prompt: string,
+    promptInput: CliPromptInput,
+    _attachments?: readonly CliAttachment[],
+    modelSelection?: ModelSelection | null,
+  ): string[] {
+    return outputArgs(prompt, promptInput, this.appTools, modelSelection);
   }
 
-  buildResumeArgs(prompt: string, sessionId: string, promptInput: CliPromptInput): string[] {
-    return ['--resume', sessionId, ...outputArgs(prompt, promptInput, this.appTools)];
+  buildResumeArgs(
+    prompt: string,
+    sessionId: string,
+    promptInput: CliPromptInput,
+    _attachments?: readonly CliAttachment[],
+    modelSelection?: ModelSelection | null,
+  ): string[] {
+    return ['--resume', sessionId, ...outputArgs(prompt, promptInput, this.appTools, modelSelection)];
   }
 
   buildCompactPlan(sessionId: string, instructions?: string) {

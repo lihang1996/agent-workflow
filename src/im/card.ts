@@ -4,6 +4,7 @@
 import { FEISHU_TEXT_LIMIT } from './text-limits.js';
 import type { CliRunStats, CliSessionSummary } from '../cli/types.js';
 import type { ClarificationFlow } from '../core/clarification.js';
+import type { CodingAuthorizationRecord } from '../core/coding-authorization.js';
 import type { ProductSpecFlow } from '../core/product-spec.js';
 import type { TaskActivity, TaskProgressSnapshot } from '../core/task-progress.js';
 
@@ -836,12 +837,16 @@ export function buildTeamCard(options: TeamCardOptions): CardJson {
 
 
 function productDocumentList(flow: ProductSpecFlow): string {
-  if (flow.request.deliveryMode === 'lark-doc') {
-    return `☁️ **飞书云文档** · [打开文档](${flow.request.documentUrl})`;
+  const request = flow.request;
+  if (request.deliveryMode === 'lark-doc') {
+    return `☁️ **飞书云文档** · [打开文档](${request.documentUrl})`;
+  }
+  if ('designPath' in request) {
+    return `📐 **架构设计** · \`${escapeFeishuMarkdown(request.designPath)}\``;
   }
   return [
-    `📘 **Spec** · \`${escapeFeishuMarkdown(flow.request.specPath)}\``,
-    `🎫 **Tickets** · \`${escapeFeishuMarkdown(flow.request.ticketsPath)}\``,
+    `📘 **Spec** · \`${escapeFeishuMarkdown(request.specPath)}\``,
+    `🎫 **Tickets** · \`${escapeFeishuMarkdown(request.ticketsPath)}\``,
   ].join('\n');
 }
 
@@ -862,6 +867,50 @@ export function buildProductSpecApprovalCard(
       content: `**共享产物**\n${productDocumentList(flow)}`,
     },
   ];
+
+  // W5 返修（work/44-5 / work/45-6）：无法确认的 flow 展示准确的 blocked 原因，
+  // 不放误导性的可点确认按钮——飞书模式（U-3，digest 恒 null）、本地未绑定摘要
+  // 的旧记录、以及知识基准 degraded（G1 必拒且例外通道未开放）都必然被拒。
+  const blockedReason = flow.request.deliveryMode === 'lark-doc'
+    ? '飞书文档完整回读能力尚未核验（U-3）：这份方案的确认与编码暂时 blocked，需要改用本地交付或等待能力核验。'
+    : flow.content_digest == null
+      ? '这份方案没有绑定内容摘要（旧记录或绑定未完成）：不能确认，请让产品成员重新生成方案。'
+      : flow.knowledge_state === 'degraded'
+        ? '知识基准不可用（degraded）：兼容性分析 incomplete，需要用户明确确认例外；例外确认通道尚未开放，暂时无法确认。'
+        : flow.knowledge_state === 'no_current_objects'
+          ? '知识库没有任何可作为现行事实的对象（no_current_objects）：PRD 不得引用现行事实；例外确认通道尚未开放，暂时无法确认。'
+          : null;
+
+  if (blockedReason) {
+    elements.push({
+      tag: 'markdown',
+      content: `**确认暂不可用（blocked）**\n${blockedReason}`,
+    });
+    elements.push({
+      tag: 'markdown',
+      content: '_确认后本轮流程结束，不会自动派发。需要实现时，请在确认后的卡片上通过「授权开发」按钮显式发起编码授权（需提供允许路径并二次确认）。_',
+    });
+    return {
+      schema: '2.0',
+      config: {
+        update_multi: true,
+        summary: { content: `${flow.request.title}：确认暂不可用` },
+      },
+      header: {
+        template: 'grey',
+        title: { tag: 'plain_text', content: '产品文档已生成' },
+        subtitle: {
+          tag: 'plain_text',
+          content: '确认暂不可用（blocked）',
+        },
+      },
+      body: {
+        direction: 'vertical',
+        vertical_spacing: '12px',
+        elements,
+      },
+    };
+  }
 
   elements.push({
     tag: 'button',
@@ -910,6 +959,39 @@ export function buildProductSpecApprovalCard(
 export function buildProductSpecApprovedCard(
   flow: ProductSpecFlow,
 ): CardJson {
+  const isPrd = (flow.artifact_kind ?? 'prd') === 'prd';
+  const actionButtons = [
+    ...(isPrd
+      ? [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: '转架构设计（交开发）' },
+          type: 'default',
+          width: 'fill',
+          size: 'medium',
+          behaviors: [{
+            type: 'callback',
+            value: {
+              action: 'handoff_architecture',
+              flowToken: flow.token,
+            },
+          }],
+        } satisfies Record<string, unknown>]
+      : []),
+    {
+      tag: 'button',
+      text: { tag: 'plain_text', content: '授权开发' },
+      type: 'default',
+      width: 'fill',
+      size: 'medium',
+      behaviors: [{
+        type: 'callback',
+        value: {
+          action: 'authorize_coding',
+          flowToken: flow.token,
+        },
+      }],
+    } satisfies Record<string, unknown>,
+  ];
   return {
     schema: '2.0',
     config: {
@@ -918,8 +1000,8 @@ export function buildProductSpecApprovedCard(
     },
     header: {
       template: 'green',
-      title: { tag: 'plain_text', content: '产品方案已确认' },
-      subtitle: { tag: 'plain_text', content: '产品阶段已就绪' },
+      title: { tag: 'plain_text', content: isPrd ? '产品方案已确认' : '架构设计已确认' },
+      subtitle: { tag: 'plain_text', content: isPrd ? '产品阶段已就绪' : '架构阶段已就绪' },
     },
     body: {
       direction: 'vertical',
@@ -929,19 +1011,310 @@ export function buildProductSpecApprovedCard(
         content: [
           `**${escapeFeishuMarkdown(flow.request.title)}**`,
           escapeFeishuMarkdown(flow.request.summary),
-          `**已确认文档**\n${productDocumentList(flow)}`,
+          `**已确认${isPrd ? '文档' : '产物'}**\n${productDocumentList(flow)}`,
           flow.approvedAt
             ? `确认时间：${escapeFeishuMarkdown(flow.approvedAt)}`
             : '',
-          '_确认记录已保存，本轮流程到此结束，没有自动派发后续任务。需要实现时，请 @ 开发并附上上方文档。_',
+          isPrd
+            ? '_确认记录已保存，本轮流程到此结束，没有自动派发后续任务。需要实现时，请通过下方或本卡的「授权开发」按钮显式发起编码授权（需提供允许路径并二次确认）。_'
+            : '_确认记录已保存。架构确认不等于允许开发：需要编码时，请通过下方「授权开发」按钮显式发起编码授权（需提供允许路径并二次确认）。_',
         ].filter(Boolean).join('\n\n'),
+      }, ...actionButtons],
+    },
+  };
+}
+
+/**
+ * 编码授权草稿卡（T-021）：展示**完整**授权内容后，必须第二次明确确认才
+ * active。草稿只在有效期内可确认；不确认不产生任何效力。
+ */
+export function buildCodingAuthorizationDraftCard(record: CodingAuthorizationRecord): CardJson {
+  return {
+    schema: '2.0',
+    config: {
+      update_multi: true,
+      summary: { content: `编码授权草稿：${record.id}` },
+    },
+    header: {
+      template: 'orange',
+      title: { tag: 'plain_text', content: '编码授权草稿（待二次确认）' },
+      subtitle: { tag: 'plain_text', content: '确认前不产生任何效力' },
+    },
+    body: {
+      direction: 'vertical',
+      vertical_spacing: '12px',
+      elements: [
+        {
+          tag: 'markdown',
+          content: [
+            '**授权内容（请逐项核对）**',
+            `授权对象（PRD）：\`${record.prdFlowToken}\` · 摘要 \`${record.prdDigest.slice(0, 16)}…\``,
+            record.architectureFlowToken
+              ? `架构设计：\`${record.architectureFlowToken}\` · 摘要 \`${record.architectureDigest?.slice(0, 16)}…\``
+              : '架构设计：无（仅 PRD 授权）',
+            `工作区真实路径：\`${escapeFeishuMarkdown(record.workspaceRealpath)}\``,
+            `允许路径：${record.allowedPaths.map((path) => `\`${escapeFeishuMarkdown(path)}\``).join('、')}${record.pendingPathRecheck ? '（含尚未存在的路径，使用前会复核）' : ''}`,
+            `有效期至：${escapeFeishuMarkdown(record.expiresAt)}`,
+            `授权发起人：\`${escapeFeishuMarkdown(record.requesterOpenId)}\``,
+            record.statusReason ? `备注：${escapeFeishuMarkdown(record.statusReason)}` : '',
+          ].filter(Boolean).join('\n'),
+        },
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '确认授权（第二次确认）' },
+          type: 'primary_filled',
+          width: 'fill',
+          size: 'medium',
+          behaviors: [{
+            type: 'callback',
+            value: {
+              action: 'confirm_coding_authorization',
+              authorizationId: record.id,
+            },
+          }],
+        },
+        {
+          tag: 'markdown',
+          content: '_确认后授权进入 active 并可随时撤销；执行层读写隔离（每引擎 canary）通过前，授权只作为数据模型，不会启动真实编码任务。_',
+        },
+      ],
+    },
+  };
+}
+
+/** active 授权卡：可查询、可撤销。主状态明确「记录已确认、编码仍阻断」（84 号 P2）。 */
+export function buildCodingAuthorizationActiveCard(record: CodingAuthorizationRecord): CardJson {
+  return {
+    schema: '2.0',
+    config: {
+      update_multi: true,
+      summary: { content: `编码授权记录已确认：${record.id}` },
+    },
+    header: {
+      template: 'yellow',
+      title: { tag: 'plain_text', content: '授权记录已确认（编码仍阻断）' },
+      subtitle: { tag: 'plain_text', content: `有效期至 ${record.expiresAt}` },
+    },
+    body: {
+      direction: 'vertical',
+      vertical_spacing: '12px',
+      elements: [
+        {
+          tag: 'markdown',
+          content: [
+            '⚠️ **授权只是数据记录：执行层读写隔离（T-022 每引擎 canary）未通过前，不会启动任何真实编码任务。**',
+            `授权 ID：\`${record.id}\``,
+            `PRD：\`${record.prdFlowToken}\` · 摘要 \`${record.prdDigest.slice(0, 16)}…\``,
+            record.architectureFlowToken
+              ? `架构设计：\`${record.architectureFlowToken}\` · 摘要 \`${record.architectureDigest?.slice(0, 16)}…\``
+              : '',
+            `工作区：\`${escapeFeishuMarkdown(record.workspaceRealpath)}\` · 允许路径：${record.allowedPaths.map((path) => `\`${escapeFeishuMarkdown(path)}\``).join('、')}`,
+            `授权人：\`${escapeFeishuMarkdown(record.grantedBy ?? '')}\` · 确认时间：${escapeFeishuMarkdown(record.grantedAt ?? '')}`,
+            `有效期至：${escapeFeishuMarkdown(record.expiresAt)}${record.pendingPathRecheck ? '（含待复核路径，使用前复核）' : ''}`,
+          ].filter(Boolean).join('\n'),
+        },
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '撤销授权' },
+          type: 'danger',
+          width: 'fill',
+          size: 'medium',
+          behaviors: [{
+            type: 'callback',
+            value: {
+              action: 'revoke_coding_authorization',
+              authorizationId: record.id,
+            },
+          }],
+        },
+        {
+          tag: 'markdown',
+          content: '_上游方案失效、超期或撤销都会使授权立即不可用。_',
+        },
+      ],
+    },
+  };
+}
+
+/** 终态授权卡（expired/revoked/invalidated）：不可用展示。 */
+export function buildCodingAuthorizationInactiveCard(record: CodingAuthorizationRecord): CardJson {
+  const label = record.status === 'expired' ? '已过期'
+    : record.status === 'revoked' ? '已撤销'
+      : record.status === 'invalidated' ? '已失效（级联）'
+        : '不可用';
+  return {
+    schema: '2.0',
+    config: {
+      update_multi: true,
+      summary: { content: `编码授权${label}：${record.id}` },
+    },
+    header: {
+      template: 'grey',
+      title: { tag: 'plain_text', content: `编码授权${label}` },
+    },
+    body: {
+      direction: 'vertical',
+      vertical_spacing: '12px',
+      elements: [{
+        tag: 'markdown',
+        content: [
+          `授权 ID：\`${record.id}\``,
+          `PRD：\`${record.prdFlowToken}\` · 摘要 \`${record.prdDigest.slice(0, 16)}…\``,
+          record.statusReason ? `原因：${escapeFeishuMarkdown(record.statusReason)}` : '',
+          `有效期至：${escapeFeishuMarkdown(record.expiresAt)}`,
+          '该授权不再可用；需要继续开发时请在当前有效的已确认制品卡片上重新发起授权。',
+        ].filter(Boolean).join('\n'),
       }],
     },
   };
 }
 
+/**
+ * 架构交接卡（T-020）：已确认 PRD 的 owner 点击「转架构设计」后展示。
+ * 交接码由服务端签发（唯一、单次使用、绑定创建者）；用户把它带给开发 Bot，
+ * 开发提交架构设计时由服务端核验——CLI/正文自报的上游一律不被采信。
+ * 交接只是发起架构阶段：不构成架构批准，也不构成编码授权。
+ */
+export function buildArchitectureHandoffCard(options: {
+  handoffToken: string;
+  flow: ProductSpecFlow;
+}): CardJson {
+  const { flow } = options;
+  return {
+    schema: '2.0',
+    config: {
+      update_multi: true,
+      summary: { content: `${flow.request.title}：架构交接已创建` },
+    },
+    header: {
+      template: 'turquoise',
+      title: { tag: 'plain_text', content: '架构交接已创建' },
+      subtitle: { tag: 'plain_text', content: '待开发 Bot 提交架构设计' },
+    },
+    body: {
+      direction: 'vertical',
+      vertical_spacing: '12px',
+      elements: [
+        {
+          tag: 'markdown',
+          content: [
+            `**${escapeFeishuMarkdown(flow.request.title)}**`,
+            `上游确认版本：\`${flow.content_digest?.slice(0, 16) ?? ''}…\`（${escapeFeishuMarkdown(flow.approvedAt ?? '')}）`,
+          ].filter(Boolean).join('\n\n'),
+        },
+        { tag: 'hr' },
+        {
+          tag: 'markdown',
+          content: [
+            '**架构交接码（单次有效，仅任务发起人可用）**',
+            `\`${options.handoffToken}\``,
+            '在新话题 @ 开发成员，并把这段交接码原样带给它。开发成员完成架构设计后会用 `request_architecture_review` 提交设计与这段交接码，由 Agent OS 校验绑定关系。',
+            '这次交接不等于批准架构，也不等于允许编码：架构设计完成后仍需你在架构卡片上单独确认；编码授权是另一个独立步骤（尚未开放）。',
+          ].join('\n\n'),
+        },
+      ],
+    },
+  };
+}
+
+/** 架构设计的待确认卡：独立的确认动作（approve_architecture），不复用 PRD 确认。 */
+export function buildArchitectureApprovalCard(flow: ProductSpecFlow): CardJson {
+  const upstream = flow.upstream;
+  const elements: Record<string, unknown>[] = [
+    {
+      tag: 'markdown',
+      content: [
+        `**${escapeFeishuMarkdown(flow.request.title)}**`,
+        escapeFeishuMarkdown(flow.request.summary),
+      ].join('\n\n'),
+    },
+    { tag: 'hr' },
+    {
+      tag: 'markdown',
+      content: `**架构产物**\n${productDocumentList(flow)}`,
+    },
+    {
+      tag: 'markdown',
+      content: `**上游产品方案**\n确认版本 \`${upstream ? `${upstream.prdDigest.slice(0, 16)}…` : '（缺失）'}\`${
+        upstream?.approvedAt ? ` · ${escapeFeishuMarkdown(upstream.approvedAt)}` : ''}${
+        (upstream?.knowledgeRefs?.length ?? 0) > 0 ? ` · 继承 ${upstream!.knowledgeRefs.length} 条知识引用` : ''
+      }`,
+    },
+  ];
+
+  const blockedReason = flow.request.deliveryMode === 'lark-doc'
+    ? '飞书文档完整回读能力尚未核验（U-3）：这份架构设计的确认与编码暂时 blocked。'
+    : flow.upstream == null
+      ? '这份架构设计没有绑定上游产品方案（服务端交接缺失），不能确认。'
+      : flow.content_digest == null
+        ? '这份架构设计没有绑定内容摘要（旧记录或绑定未完成）：不能确认，请让开发成员重新提交。'
+        : flow.knowledge_state === 'degraded'
+          ? '上游方案生成时知识基准不可用（degraded）：需要用户明确确认例外；例外确认通道尚未开放。'
+          : flow.knowledge_state === 'no_current_objects'
+            ? '上游方案生成时知识库没有可作为现行事实的对象（no_current_objects）：例外确认通道尚未开放。'
+            : null;
+
+  if (blockedReason) {
+    elements.push({
+      tag: 'markdown',
+      content: `**确认暂不可用（blocked）**\n${blockedReason}`,
+    });
+    elements.push({
+      tag: 'markdown',
+      content: '_架构确认与编码授权是分开的状态；确认通道 blocked 时不会自动放行任何实现。_',
+    });
+    return {
+      schema: '2.0',
+      config: {
+        update_multi: true,
+        summary: { content: `${flow.request.title}：确认暂不可用` },
+      },
+      header: {
+        template: 'grey',
+        title: { tag: 'plain_text', content: '架构设计已生成' },
+        subtitle: { tag: 'plain_text', content: '确认暂不可用（blocked）' },
+      },
+      body: { direction: 'vertical', vertical_spacing: '12px', elements },
+    };
+  }
+
+  elements.push({
+    tag: 'button',
+    text: { tag: 'plain_text', content: '确认架构设计' },
+    type: 'primary_filled',
+    width: 'fill',
+    size: 'medium',
+    behaviors: [{
+      type: 'callback',
+      value: {
+        action: 'approve_architecture',
+        flowToken: flow.token,
+      },
+    }],
+  });
+  elements.push({
+    tag: 'markdown',
+    content: '_确认架构设计只结束架构阶段，不会自动开始编码；编码授权需要你单独发起（尚未开放）。上游 PRD 失效时这份架构确认会级联失效。_',
+  });
+
+  return {
+    schema: '2.0',
+    config: {
+      update_multi: true,
+      summary: { content: `${flow.request.title}：待确认` },
+    },
+    header: {
+      template: 'purple',
+      title: { tag: 'plain_text', content: '架构设计已生成' },
+      subtitle: { tag: 'plain_text', content: '本地架构设计待确认' },
+    },
+    body: { direction: 'vertical', vertical_spacing: '12px', elements },
+  };
+}
+
 export function buildProductSpecExpiredCard(
   flow: ProductSpecFlow,
+  reason?: string,
 ): CardJson {
   return {
     schema: '2.0',
@@ -960,8 +1333,42 @@ export function buildProductSpecExpiredCard(
         tag: 'markdown',
         content: [
           `**${escapeFeishuMarkdown(flow.request.title)}**`,
-          '同一任务已经提交了更新的产品方案，请查看话题中最新的确认卡。',
+          reason
+            ? `方案已失效：${escapeFeishuMarkdown(reason)}。请查看话题中最新的确认卡或重新生成方案。`
+            : '同一任务已经提交了更新的产品方案，请查看话题中最新的确认卡。',
         ].join('\n\n'),
+      }],
+    },
+  };
+}
+
+/**
+ * 旧 approved 未绑定摘要 / 已失效的 flow：确认记录不可用，不得让用户误认
+ * 已绑定有效版本（W5 返修：展示与处理都标不可用）。
+ */
+export function buildProductSpecUnusableApprovalCard(flow: ProductSpecFlow): CardJson {
+  return {
+    schema: '2.0',
+    config: {
+      update_multi: true,
+      summary: { content: `${flow.request.title}：确认记录不可用` },
+    },
+    header: {
+      template: 'grey',
+      title: { tag: 'plain_text', content: '产品方案确认记录不可用' },
+    },
+    body: {
+      direction: 'vertical',
+      vertical_spacing: '12px',
+      elements: [{
+        tag: 'markdown',
+        content: [
+          `**${escapeFeishuMarkdown(flow.request.title)}**`,
+          flow.invalidation_reason
+            ? `这份方案的确认已失效：${escapeFeishuMarkdown(flow.invalidation_reason)}。`
+            : '这份确认记录没有绑定内容摘要（旧记录或未完成绑定），不能作为有效版本使用。',
+          '需要实现时，请让产品成员重新生成方案并重新确认；旧的确认不能再用于授权编码。',
+        ].filter(Boolean).join('\n\n'),
       }],
     },
   };

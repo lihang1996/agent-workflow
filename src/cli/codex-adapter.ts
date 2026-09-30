@@ -1,5 +1,7 @@
 import type { CliAdapter, CliAttachment, CliPromptInput, CliEvent, CliRunStats } from './types.js';
 import type { AppToolName } from '../core/app-tool-policy.js';
+import type { ModelSelection } from '../core/model-selection.js';
+import { assertModelSelectionSupported } from '../core/engine-capabilities.js';
 import {
   CLARIFICATION_TOOL_NAME,
   PRODUCT_SPEC_TOOL_NAME,
@@ -98,6 +100,24 @@ function codexImageArgs(attachments: readonly CliAttachment[] = []): string[] {
     .flatMap((attachment) => ['-i', attachment.path]);
 }
 
+/**
+ * -m/--model 来自 codex exec --help（0.150.1）；推理强度键名
+ * model_reasoning_effort 在二进制源码字符串中核实，取值枚举本地不校验。
+ */
+function codexModelArgs(modelSelection?: ModelSelection | null): string[] {
+  if (!modelSelection?.model && !modelSelection?.reasoningEffort) return [];
+  assertModelSelectionSupported('codex', {
+    model: modelSelection?.model ?? null,
+    reasoningEffort: modelSelection?.reasoningEffort ?? null,
+  });
+  return [
+    ...(modelSelection.model ? ['-m', modelSelection.model] : []),
+    ...(modelSelection.reasoningEffort
+      ? ['-c', `model_reasoning_effort="${modelSelection.reasoningEffort}"`]
+      : []),
+  ];
+}
+
 export class CodexAdapter implements CliAdapter {
   constructor(readonly appTools: readonly AppToolName[] = []) {}
   readonly id = 'codex' as const;
@@ -108,10 +128,12 @@ export class CodexAdapter implements CliAdapter {
     prompt: string,
     promptInput: CliPromptInput,
     attachments?: readonly CliAttachment[],
+    modelSelection?: ModelSelection | null,
   ): string[] {
     const args = [
       ...codexAppToolArgs(this.appTools),
       'exec',
+      ...codexModelArgs(modelSelection),
       '--json',
       '--skip-git-repo-check',
       ...codexImageArgs(attachments),
@@ -132,11 +154,13 @@ export class CodexAdapter implements CliAdapter {
     sessionId: string,
     promptInput: CliPromptInput,
     attachments?: readonly CliAttachment[],
+    modelSelection?: ModelSelection | null,
   ): string[] {
     const args = [
       ...codexAppToolArgs(this.appTools),
       'exec',
       'resume',
+      ...codexModelArgs(modelSelection),
       '--json',
       '--skip-git-repo-check',
       ...codexImageArgs(attachments),

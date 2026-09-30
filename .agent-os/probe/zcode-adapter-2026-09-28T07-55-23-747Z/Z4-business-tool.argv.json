@@ -1,0 +1,11 @@
+{
+  "command": "zcode",
+  "args": [
+    "--prompt",
+    "请立即调用 request_clarification 工具（MCP agent_os server 已注入），只提一个问题：\"这是 Z4 探测问题，选一个\"，给 A、B 两个选项。\n调用完成后停止本轮，不要再做其他事。不要写文件。",
+    "--mode",
+    "yolo",
+    "--output-format",
+    "stream-json"
+  ]
+}

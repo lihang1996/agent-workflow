@@ -1,5 +1,7 @@
 import type { AppToolName } from '../core/app-tool-policy.js';
-import type { CliAdapter, CliEvent, CliPromptInput } from './types.js';
+import type { ModelSelection } from '../core/model-selection.js';
+import { assertModelSelectionSupported } from '../core/engine-capabilities.js';
+import type { CliAdapter, CliAttachment, CliEvent, CliPromptInput } from './types.js';
 import {
   CLARIFICATION_TOOL_NAME,
   PRODUCT_SPEC_TOOL_NAME,
@@ -132,8 +134,15 @@ function toolDetail(payload: Record<string, unknown>): string | undefined {
     ?? shortText(args.query);
 }
 
-function outputArgs(prompt: string, promptInput: CliPromptInput, sessionId?: string): string[] {
-  const model = process.env.CURSOR_CLI_MODEL?.trim();
+function outputArgs(
+  prompt: string,
+  promptInput: CliPromptInput,
+  sessionId?: string,
+  modelSelection?: ModelSelection | null,
+): string[] {
+  // 执行级模型声明优先；未声明时沿用用户全局 CURSOR_CLI_MODEL（历史行为）。
+  const declared = modelSelection?.model?.trim();
+  const model = declared ?? process.env.CURSOR_CLI_MODEL?.trim();
   return [
     '-p',
     '--force',
@@ -145,6 +154,15 @@ function outputArgs(prompt: string, promptInput: CliPromptInput, sessionId?: str
   ];
 }
 
+/** cursor 无独立推理强度参数（--model 来自 agent --help，2026.08.11），显式配置即拒绝。 */
+function cursorModelArgs(modelSelection?: ModelSelection | null): void {
+  if (!modelSelection?.model && !modelSelection?.reasoningEffort) return;
+  assertModelSelectionSupported('cursor', {
+    model: modelSelection?.model ?? null,
+    reasoningEffort: modelSelection?.reasoningEffort ?? null,
+  });
+}
+
 export class CursorAdapter implements CliAdapter {
   constructor(readonly appTools: readonly AppToolName[] = []) {}
   readonly id = 'cursor' as const;
@@ -152,12 +170,25 @@ export class CursorAdapter implements CliAdapter {
   readonly displayName = 'Cursor';
   private readonly emittedBusinessCalls = new Set<string>();
 
-  buildArgs(prompt: string, promptInput: CliPromptInput): string[] {
-    return outputArgs(prompt, promptInput);
+  buildArgs(
+    prompt: string,
+    promptInput: CliPromptInput,
+    _attachments?: readonly CliAttachment[],
+    modelSelection?: ModelSelection | null,
+  ): string[] {
+    cursorModelArgs(modelSelection);
+    return outputArgs(prompt, promptInput, undefined, modelSelection);
   }
 
-  buildResumeArgs(prompt: string, sessionId: string, promptInput: CliPromptInput): string[] {
-    return outputArgs(prompt, promptInput, sessionId);
+  buildResumeArgs(
+    prompt: string,
+    sessionId: string,
+    promptInput: CliPromptInput,
+    _attachments?: readonly CliAttachment[],
+    modelSelection?: ModelSelection | null,
+  ): string[] {
+    cursorModelArgs(modelSelection);
+    return outputArgs(prompt, promptInput, sessionId, modelSelection);
   }
 
   buildEnv(): Record<string, string> {

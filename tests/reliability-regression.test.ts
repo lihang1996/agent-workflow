@@ -10,6 +10,7 @@ import { SessionManager } from '../src/core/session-manager.js';
 import { JsonSessionStore } from '../src/core/session-store.js';
 import { ClarificationFlowStore } from '../src/core/clarification.js';
 import { JsonProductSpecFlowStore } from '../src/core/product-spec-store.js';
+import { computeLocalArtifactDigest } from '../src/core/artifact-digest.js';
 import { CollaborationInbox, type CollaborationMessage } from '../src/core/collaboration.js';
 import { TaskExecutionStore } from '../src/core/task-execution.js';
 import { TeamRegistry } from '../src/core/team-registry.js';
@@ -35,12 +36,13 @@ async function until(predicate: () => boolean): Promise<void> {
 }
 const message: IncomingMessage = { messageId: 'user-message', chatId: 'chat', chatType: 'group', threadId: 'thread', rootId: 'root', messageType: 'text', text: '检查任务', rawContent: '{"text":"检查任务"}', mentions: [], senderType: 'user', senderOpenId: 'owner', senderUnionId: 'union-owner' };
 const request = { title: '方案', summary: '说明', deliveryMode: 'lark-doc' as const, documentUrl: 'https://team.feishu.cn/docx/docToken' };
+const localRequest = { title: '方案', summary: '说明', deliveryMode: 'local' as const, specPath: '.fx/spec.md', ticketsPath: '.fx/tickets' };
 const comment: IncomingDocumentComment = { eventId: 'event', fileToken: 'docToken', fileType: 'docx', commentId: 'comment', replyId: 'reply', senderOpenId: 'owner', senderUnionId: 'union-owner', mentionedBot: true };
 
 async function fixture(t: { after: (callback: () => void) => void }) {
   const dir = mkdtempSync(join(tmpdir(), 'agent-os-lifecycle-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const config: BotConfig = { id: 'product', appId: 'fixture', appSecret: 'fixture', defaultCliId: 'claude', modelOverrides: {}, role: '产品', skills: ['lark-doc', 'lark-drive'], systemPrompt: '', workspaceDir: dir, collaborationMaxRounds: 16 };
+  const config: BotConfig = { id: 'product', appId: 'fixture', appSecret: 'fixture', defaultCliId: 'claude', modelOverrides: {}, role: '产品', skills: ['lark-doc', 'lark-drive'], systemPrompt: '', workspaceDir: dir, collaborationMaxRounds: 16, specStages: ['product'] };
   const leader: BotConfig = { ...config, id: 'leader', skills: [] };
   const calls = { cards: 0, updates: 0, texts: [] as string[], comments: [] as string[] };
   const bot = {
@@ -54,6 +56,7 @@ async function fixture(t: { after: (callback: () => void) => void }) {
   const runtime: AppRuntime = {
     sessions: await SessionManager.open({ store: new JsonSessionStore(join(dir, 'sessions.json')) }),
     activeRuns: new Map(), contextWindows: new Map(), botRuntimes: new Map(), processedCollaborationTurns: new Set(),
+  sessionScratches: new Map(),
     teamRegistry: new TeamRegistry('leader', [leader, config]),
     clarificationFlows: new ClarificationFlowStore(join(dir, 'clarifications.json')),
     productSpecFlows: new JsonProductSpecFlowStore(join(dir, 'specs.json')),
@@ -72,6 +75,14 @@ async function fixture(t: { after: (callback: () => void) => void }) {
     request: { title: '范围', intro: '', questions: [{ id: 'q', prompt: '范围？', options: [{ id: 'a', label: '小' }, { id: 'b', label: '大' }] }] },
   });
   const createSpec = () => runtime.productSpecFlows.create({ ...owner, taskId: topicTaskId(message), botId: 'product', sessionId: session.id, sessionVersion: runtime.sessions.get(session.id)?.version ?? 0, request });
+  // 本地模式 spec（带完整摘要绑定，G1 审批路径用）；制品落在会话工作区 dir 内。
+  const createLocalSpec = async () => {
+    mkdirSync(join(dir, '.fx', 'tickets'), { recursive: true });
+    writeFileSync(join(dir, '.fx', 'spec.md'), '# 方案\n\n本地交付。\n');
+    writeFileSync(join(dir, '.fx', 'tickets', 't1.md'), '## 需求 1\n\n下单展示会员价。');
+    const digest = await computeLocalArtifactDigest(dir, localRequest);
+    return runtime.productSpecFlows.create({ ...owner, taskId: topicTaskId(message), botId: 'product', sessionId: session.id, sessionVersion: runtime.sessions.get(session.id)?.version ?? 0, request: localRequest, content_digest: digest.digest, digest_algorithm: 'canonical-sha256-v1', content_sources: digest.content_sources });
+  };
   const cardAction = (token: string) => ({ operatorOpenId: 'owner', operatorUnionId: 'union-owner', messageId: 'clarification-card', formValue: {}, value: { action: 'answer_clarification', flowToken: token, questionId: 'q', optionId: 'a' } });
   const handler = (execute: Parameters<typeof createMessageHandler>[0]['execute']) => createMessageHandler({ runtime, config, defaultProductDeliveryMode: 'lark-doc', collaborationService: new CollaborationService(runtime), execute });
   const command = async (name: 'new' | 'close' | 'cd', senderOpenId = 'owner', path?: string) => handleSessionCommand({
@@ -87,7 +98,7 @@ async function fixture(t: { after: (callback: () => void) => void }) {
     runtime.productSpecFlows = new JsonProductSpecFlowStore(join(dir, 'specs.json'));
     runtime.deliveries = new DeliveryOutbox((id) => runtime.botRuntimes.get(id)?.bot, join(dir, 'deliveries.json'), 0, (operation) => resolveResultCard(runtime, operation));
   };
-  return { runtime, bot, config, session, dir, owner, calls, createClarification, createSpec, cardAction, command, handler, restart };
+  return { runtime, bot, config, session, dir, owner, calls, createClarification, createSpec, createLocalSpec, cardAction, command, handler, restart };
 }
 
 test('a rejected progress update does not reject the process or poison later/final updates', async () => {
@@ -186,15 +197,15 @@ test('completed CLI survives failed result delivery; restart only sends saved re
 for (const change of ['new', 'cd', 'resume'] as const) test(`${change} invalidates old clarification and product flows durably`, async (t) => {
   const f = await fixture(t); const flow = f.createClarification(); const spec = f.createSpec();
   if (change === 'resume') {
-    // Native session enumeration reads only this temporary project directory.
-    const claudeDir = join(f.dir, 'claude');
-    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
-    process.env.CLAUDE_CONFIG_DIR = claudeDir;
-    t.after(() => { if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = previousConfigDir; });
-    const project = join(claudeDir, 'projects', f.dir.replace(/[^A-Za-z0-9]/g, '-')); mkdirSync(project, { recursive: true });
-    writeFileSync(join(project, 'other.jsonl'), JSON.stringify({ type: 'user', sessionId: 'other-cli', cwd: f.dir, message: { content: 'other task' } }) + '\n');
+    // T-022（W6b）：Claude 全局会话历史（~/.claude 或外部 CLAUDE_CONFIG_DIR）
+    // 未隔离前，resume 入口的会话列表一律 blocked——不再直读任何全局目录。
     const handler = createCardActionHandler({ runtime: f.runtime, config: f.config, defaultProductDeliveryMode: 'lark-doc' });
-    assert.equal((await handler({ ...f.cardAction(flow.token), value: { action: 'resume_cli_session', agentSessionId: f.session.id, cliSessionId: 'other-cli' } }))?.toast?.type, 'success');
+    const blocked = await handler({ ...f.cardAction(flow.token), value: { action: 'resume_cli_session', agentSessionId: f.session.id, cliSessionId: 'other-cli' } });
+    assert.equal(blocked?.toast?.type, 'error');
+    assert.match(blocked?.toast?.content ?? '', /隔离|isolation|blocked|失败关闭|无法读取/s);
+    // 版本失效逻辑（本测试的本体）经会话 API 直接驱动（resume 列表被阻断后，
+    // 正常路径无从选择历史会话；此处只验证 selectCliSessionId 的失效语义）。
+    await f.runtime.sessions.selectCliSessionId(f.session.id, 'other-cli');
   } else {
     if (change === 'cd') mkdirSync(join(f.dir, 'other'));
     await f.command(change, 'owner', change === 'cd' ? join(f.dir, 'other') : undefined);
@@ -247,7 +258,71 @@ test('document edits do not repeat after a comment reply failure and process res
   f.bot.replyToDocumentComment = async (_comment, text) => { f.calls.comments.push(text); };
   await f.runtime.deliveries!.recover();
   await runProductDocumentComment({ runtime: f.runtime, bot: f.bot, flow, comment, execute });
-  assert.equal(edits, 1); assert.deepEqual(f.calls.comments, ['document updated']);
+  assert.equal(edits, 1);
+  // T-019/61 号 P1：飞书路径没有已核验的完整回读 reader（U-3），回复由服务端
+  // 生成中性文案——不回显 CLI 的「document updated」完成自述，只陈述处理
+  // 尝试与核验缺口。
+  assert.equal(f.calls.comments.length, 1);
+  assert.ok(!f.calls.comments[0]!.includes('document updated'));
+  assert.match(f.calls.comments[0]!, /未能完成制品完整性核验/);
+  assert.match(f.calls.comments[0]!, /U-3/);
+});
+
+test('collaboration terminal state follows post-processing: artifact failure marks failed, plain success marks completed', async (t) => {
+  const f = await fixture(t);
+  const register = (dispatchId: string) => f.runtime.collaborationInbox.register({
+    dispatchId, taskId: `task-${dispatchId}`, ownerOpenId: 'owner', ownerUnionId: 'union-owner',
+    fromBotId: 'leader', toBotId: 'product', reportToBotId: 'leader',
+    objective: '生成本地方案', instruction: '生成并提交方案', round: 1, maxRounds: 16,
+    workspaceDir: f.dir,
+  });
+  const collabMessage = (dispatchId: string): IncomingMessage => ({
+    ...message,
+    senderType: 'app',
+    senderOpenId: 'bot-leader',
+    messageType: 'post',
+    text: `@product 任务编号：${dispatchId}`,
+    rawContent: '{}',
+    mentions: [{ key: '@_user_1', name: 'product', openId: 'bot-product' }],
+  });
+
+  // 1) 工具调用声称提交本地方案，但制品不完整：flow 创建失败关闭——协作终态
+  //    必须是 failed，不得先记 completed 再丢制品（work/30 状态时序）。
+  register('aabbccddeeff');
+  const failing = async () => ({ answer: '方案已生成', toolCalls: [{ toolUseId: 'tu1', toolName: 'request_spec_approval', input: { ...localRequest } }] });
+  await f.handler(failing)(collabMessage('aabbccddeeff'), f.bot);
+  await until(() => f.runtime.sessions.get(f.session.id)?.status === 'idle');
+  assert.equal(f.runtime.collaborationInbox.get('aabbccddeeff')?.status, 'failed');
+  assert.equal(f.runtime.productSpecFlows.forSession(f.session.id).length, 0);
+
+  // 2) 普通成功协作：全部后处理结束后才落 completed。
+  register('aabbccddeef1');
+  const succeeding = async () => ({ answer: '已完成' });
+  await f.handler(succeeding)(collabMessage('aabbccddeef1'), f.bot);
+  await until(() => f.runtime.collaborationInbox.get('aabbccddeef1')?.status === 'completed');
+});
+
+test('plain-text authorization phrases are never executed or auto-authorized (T-021)', async (t) => {
+  const f = await fixture(t);
+  // 同一 bot 开放架构阶段（模拟开发角色会话入口）。
+  const architectureStageConfig: BotConfig = { ...f.config, specStages: ['product', 'architecture'] };
+  let executed = 0;
+  const handler = createMessageHandler({
+    runtime: f.runtime, config: architectureStageConfig,
+    defaultProductDeliveryMode: 'lark-doc',
+    collaborationService: new CollaborationService(f.runtime),
+    execute: async () => { executed += 1; return { answer: 'done' }; },
+  });
+  await handler({ ...message, text: '可以开发了' }, f.bot);
+  await handler({ ...message, messageId: 'm-2', text: '开始编码！' }, f.bot);
+  const hints = f.calls.texts.filter((text) => text.includes('不能自动创建授权'));
+  assert.equal(hints.length, 2);
+  assert.equal(executed, 0, '授权口令文本不得进入任务执行');
+  assert.equal(f.runtime.productSpecFlows.forSession(f.session.id).length, 0);
+  // 正常任务文本（含子串）不被拦截。
+  await handler({ ...message, messageId: 'm-3', text: '评估一下什么时候可以开发了，先做技术调研' }, f.bot);
+  await until(() => f.runtime.sessions.get(f.session.id)?.status === 'idle');
+  assert.equal(executed, 1);
 });
 
 test('session version, owner, and completed execution records survive reload', async (t) => {
@@ -285,8 +360,39 @@ test('concurrent run claims preserve the first controller and run at most one en
   await releaseTask(f.runtime, f.session.id, run);
 });
 
+test('local spec submissions bind the full artifact digest at creation and approve via G1', async (t) => {
+  const f = await fixture(t);
+  mkdirSync(join(f.dir, '.fx', 'tickets'), { recursive: true });
+  writeFileSync(join(f.dir, '.fx', 'spec.md'), '# 方案\n\n本地交付。\n');
+  writeFileSync(join(f.dir, '.fx', 'tickets', 't1.md'), '## 需求 1\n\n下单展示会员价。');
+  // W6b：本地制品提交需要当前任务的 scratch 绑定（fixture 直接 seed 等价状态）。
+  f.runtime.sessionScratches.set(f.session.id, { relative: '.fx', taskKey: topicTaskId(message), at: Date.now() });
+  const execute = async () => ({ answer: '方案已生成', toolCalls: [{ toolUseId: 'tu1', toolName: 'request_spec_approval', input: { ...localRequest } }] });
+  await f.handler(execute)(message, f.bot);
+  await until(() => f.runtime.productSpecFlows.forSession(f.session.id).length === 1);
+  const flow = f.runtime.productSpecFlows.forSession(f.session.id)[0]!;
+  const digest = await computeLocalArtifactDigest(f.dir, localRequest);
+  assert.equal(flow.content_digest, digest.digest);
+  assert.deepEqual(flow.content_sources, [{ kind: 'local', path: '.fx/spec.md' }, { kind: 'local', path: '.fx/tickets' }]);
+  assert.equal(flow.status, 'pending');
+  const handler = createCardActionHandler({ runtime: f.runtime, config: f.config, defaultProductDeliveryMode: 'lark-doc' });
+  const approved = await handler({ operatorOpenId: 'owner', operatorUnionId: 'union-owner', messageId: 'approval-card', formValue: {}, value: { action: 'approve_product_spec', flowToken: flow.token } });
+  assert.equal(approved?.toast?.type, 'success');
+  assert.equal(f.runtime.productSpecFlows.get(flow.token)?.status, 'approved');
+});
+
+test('incomplete local artifacts never create an approval flow (fail closed)', async (t) => {
+  const f = await fixture(t);
+  writeFileSync(join(f.dir, 'spec.md'), '# 方案\n');
+  // tickets 目录缺失：提交即失败关闭，不生成确认卡对应的 flow。
+  const execute = async () => ({ answer: '方案已生成', toolCalls: [{ toolUseId: 'tu1', toolName: 'request_spec_approval', input: { ...localRequest } }] });
+  await f.handler(execute)(message, f.bot);
+  await until(() => f.runtime.sessions.get(f.session.id)?.status === 'idle');
+  assert.equal(f.runtime.productSpecFlows.forSession(f.session.id).length, 0);
+});
+
 test('retrying a timed-out approval card preserves a later user approval after restart', async (t) => {
-  const f = await fixture(t); const flow = f.createSpec();
+  const f = await fixture(t); const flow = await f.createLocalSpec();
   f.bot.updateCard = async () => { throw new Error('response lost after server accepted the card'); };
   const updater = createTaskCardUpdater({ runtime: f.runtime, bot: f.bot, botId: 'product', sessionId: f.session.id,
     cardId: 'approval-card', replyToMessageId: message.messageId, replyInThread: true });
@@ -298,4 +404,33 @@ test('retrying a timed-out approval card preserves a later user approval after r
   await f.runtime.deliveries!.recover();
   assert.match(delivered, /产品方案已确认/);
   assert.doesNotMatch(delivered, /approve_product_spec/);
+});
+
+test('W5 返修：澄清后创建的本地方案也绑定完整摘要，并可通过 G1 审批（共享创建路径）', async (t) => {
+  const f = await fixture(t);
+  mkdirSync(join(f.dir, '.fx', 'tickets'), { recursive: true });
+  writeFileSync(join(f.dir, '.fx', 'spec.md'), '# 方案\n\n澄清后本地交付。\n');
+  writeFileSync(join(f.dir, '.fx', 'tickets', 't1.md'), '## 需求 1\n\n按澄清结果展示会员价。');
+  const flow = f.createClarification();
+  f.runtime.sessionScratches.set(f.session.id, { relative: '.fx', taskKey: flow.taskId, at: Date.now() });
+  await f.runtime.sessions.transition(f.session.id, 'active');
+  const run = new AbortController();
+  f.runtime.activeRuns.set(f.session.id, { controller: run, ownerOpenId: 'owner' });
+  await continueClarificationFlow({
+    runtime: f.runtime, bot: f.bot, config: f.config, flow, run,
+    defaultDeliveryMode: 'local',
+    execute: async () => ({
+      answer: '方案已生成',
+      toolCalls: [{ toolUseId: 'tu1', toolName: 'request_spec_approval', input: { ...localRequest } }],
+    }),
+  });
+  const created = f.runtime.productSpecFlows.forSession(f.session.id);
+  assert.equal(created.length, 1, '澄清后提交必须生成确认 flow');
+  const digest = await computeLocalArtifactDigest(f.dir, localRequest);
+  assert.equal(created[0]!.content_digest, digest.digest, '澄清路径与直接提交共用同一摘要绑定（此前恒为 null 导致 G1 永远拒绝）');
+  assert.deepEqual(created[0]!.content_sources, [{ kind: 'local', path: '.fx/spec.md' }, { kind: 'local', path: '.fx/tickets' }]);
+  const handler = createCardActionHandler({ runtime: f.runtime, config: f.config, defaultProductDeliveryMode: 'lark-doc' });
+  const approved = await handler({ operatorOpenId: 'owner', operatorUnionId: 'union-owner', messageId: 'approval-card', formValue: {}, value: { action: 'approve_product_spec', flowToken: created[0]!.token } });
+  assert.equal(approved?.toast?.type, 'success');
+  assert.equal(f.runtime.productSpecFlows.get(created[0]!.token)?.status, 'approved');
 });

@@ -6,9 +6,15 @@ import {
   CLARIFICATION_TOOL_NAME,
   PRODUCT_SPEC_TOOL_NAME,
   DISPATCH_TASK_TOOL_NAME,
+  ARCHITECTURE_REVIEW_TOOL_NAME,
   type AppToolName,
 } from '../core/app-tool-policy.js';
-export { CLARIFICATION_TOOL_NAME, PRODUCT_SPEC_TOOL_NAME, DISPATCH_TASK_TOOL_NAME };
+export {
+  CLARIFICATION_TOOL_NAME,
+  PRODUCT_SPEC_TOOL_NAME,
+  DISPATCH_TASK_TOOL_NAME,
+  ARCHITECTURE_REVIEW_TOOL_NAME,
+};
 export const CLAUDE_CLARIFICATION_TOOL_NAME =
   `mcp__agent_os__${CLARIFICATION_TOOL_NAME}`;
 export const CLAUDE_PRODUCT_SPEC_TOOL_NAME =
@@ -33,10 +39,10 @@ function mcpServerScript(scriptName: string): { command: string; args: string[] 
   if (!runningFromTypeScript) {
     return { command: process.execPath, args: [server] };
   }
-  const tsxCli = fileURLToPath(
-    new URL('../../node_modules/tsx/dist/cli.mjs', import.meta.url),
-  );
-  return { command: process.execPath, args: [tsxCli, server] };
+  // 用 `--import tsx`（loader register）而非 tsx cli.mjs：CLI 形态会创建
+  // named-pipe IPC 服务器，受限沙箱下 listen EPERM 导致子进程立即退出
+  //（表现为 MCP Connection closed）；loader 形态无此依赖，行为等价。
+  return { command: process.execPath, args: ['--import', 'tsx', server] };
 }
 
 function serverBase(): { command: string; args: string[] } {

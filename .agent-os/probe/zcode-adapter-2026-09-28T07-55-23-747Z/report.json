@@ -1,0 +1,44 @@
+{
+  "probedAt": "2026-09-28T07:56:32.744Z",
+  "adapter": "src/cli/zcode-adapter.ts",
+  "workspacePolicy": "一次性临时目录（mkdtemp），未触碰业务仓库，未连接飞书",
+  "cases": [
+    {
+      "case": "cli",
+      "status": "pass",
+      "detail": "zcode 0.16.9 可运行"
+    },
+    {
+      "case": "Z1",
+      "status": "pass",
+      "detail": "新建会话成功 sessionId=sess_8b86be85-877c-4805-9e6e-0ea35de8c64e answer=\"pong.\"",
+      "evidence": [
+        "Z1-new-session.raw.ndjson",
+        "Z1-new-session.events.ndjson"
+      ]
+    },
+    {
+      "case": "Z2",
+      "status": "pass",
+      "detail": "续接成功（上下文可回忆 pong）sessionId=sess_8b86be85-877c-4805-9e6e-0ea35de8c64e",
+      "evidence": [
+        "Z2-resume.raw.ndjson",
+        "Z2-resume.events.ndjson"
+      ]
+    },
+    {
+      "case": "Z3",
+      "status": "blocked",
+      "detail": "zcode headless 无模型参数，显式声明被正确拒绝：zcode（0.16.9，zcode --help 无模型参数；zcode.cjs 源码仅 provider 配置 defaultModelSelection 路径） 的 headless 模式没有模型选择参数，无法保证使用指定模型 glm-5.3。请移除该角色对 zcode 的模型声明，或改用支持模型选择的引擎。"
+    },
+    {
+      "case": "Z4",
+      "status": "pass",
+      "detail": "request_clarification 经 mcp__agent_os__ 调用链成功产生 tool_call 事件",
+      "evidence": [
+        "Z4-business-tool.raw.ndjson",
+        "Z4-business-tool.events.ndjson"
+      ]
+    }
+  ]
+}

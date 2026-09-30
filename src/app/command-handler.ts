@@ -8,6 +8,7 @@ import {
 import type { CliAdapter } from "../cli/types.js";
 import { getCliAdapter } from "../cli/registry.js";
 import { listNativeCliSessions } from "../cli/native-sessions.js";
+import { createProductionIsolationPreparer } from "../core/isolation.js";
 import type { CliRequest, SlashCommand } from "../core/command-parser.js";
 import type { Session } from "../core/session-manager.js";
 import type { BotConfig } from "../core/bot-registry.js";
@@ -149,6 +150,7 @@ export async function handleSessionCommand(options: {
       const nativeSessions = await listNativeCliSessions({
         adapter: cliAdapter,
         cwd: session.workspaceDir,
+        isolation: runtime.isolationPreparer ?? createProductionIsolationPreparer(),
       });
       await bot.replyCard(
         msg.messageId,
@@ -205,7 +207,7 @@ export async function handleSessionCommand(options: {
   if (command?.name === "status") {
     await bot.reply(
       msg.messageId,
-      [formatSessionStatus(session, config.id),
+      [formatSessionStatus(session, config.id, config),
         `最近执行：${runtime.taskExecutions?.forSession(session.id)?.status ?? '(无记录)'}`,
         `待补发结果：${runtime.deliveries?.pending(session.id) ?? 0}`,
       ].join('\n'),

@@ -8,6 +8,9 @@ const ProductDeliveryModeSchema = z.enum(['local', 'lark-doc']);
 
 export type ProductDeliveryMode = z.infer<typeof ProductDeliveryModeSchema>;
 
+/** 制品提交阶段（服务端配置授权，work/30 T-020）：产品方案 / 架构设计。 */
+export type SpecStage = 'product' | 'architecture';
+
 export interface BotConfig {
   id: string;
   appId: string;
@@ -19,6 +22,20 @@ export interface BotConfig {
   systemPrompt: string;
   workspaceDir: string;
   collaborationMaxRounds: number;
+  /**
+   * 可提交审批的制品阶段（T-020）：来自服务端 bots.json，不是 CLI 自报。
+   * `product` → request_spec_approval；`architecture` → request_architecture_review。
+   * 与 Skill 无关：`lark-doc` 只授予文档编辑能力，不授予审批提交权。
+   * 配置加载后恒为数组；接口层面可选以兼容直接构造 BotConfig 的调用方。
+   */
+  specStages?: SpecStage[];
+  /**
+   * 可信知识作用域绑定（T-016/13 号 C1）：bot 可预取知识的 system 白名单。
+   * 来源是服务端持有的 bots.json 配置——不是需求正文或 CLI 自报；KB_CALLER
+   * 仅为审计标签。缺省/为空 = 空作用域，该 bot 的一切 KB 预取请求按越权
+   * 拒绝，多系统运行态消费在 W6/W7 门禁通过前保持 blocked。
+   */
+  kbSystems?: string[];
 }
 
 export interface AgentOsConfig {
@@ -48,6 +65,14 @@ const BotSchema = z.object({
   workspace: z.string().trim().min(1).optional(),
   systemPrompt: z.string().trim().optional().default(''),
   collaborationMaxRounds: z.number().int().min(1).max(32).optional().default(16),
+  specStages: z
+    .array(z.enum(['product', 'architecture']))
+    .optional()
+    .default([]),
+  kbSystems: z
+    .array(z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/))
+    .optional()
+    .default([]),
   enabled: z.boolean().optional().default(true),
 });
 
@@ -93,6 +118,8 @@ export function parseAgentOsConfig(
         skills: [...new Set(bot.skills)],
         systemPrompt: bot.systemPrompt,
         collaborationMaxRounds: bot.collaborationMaxRounds,
+        specStages: [...new Set(bot.specStages)],
+        kbSystems: [...new Set(bot.kbSystems)],
         workspaceDir: resolveWorkspacePath(
           bot.workspace ?? env.CLI_WORKDIR ?? env.CLAUDE_WORKDIR ?? '.',
           baseDirectory,
@@ -152,14 +179,14 @@ export async function loadBotConfigs(
 }
 
 export function buildBotPrompt(
-  config: Pick<BotConfig, 'role' | 'skills' | 'systemPrompt'>,
+  config: Pick<BotConfig, 'role' | 'skills' | 'systemPrompt' | 'specStages'>,
   prompt: string,
   teamContext = '',
   defaultProductDeliveryMode: ProductDeliveryMode = 'lark-doc',
 ): string {
-  const managesProductDocuments = config.skills.some((skill) =>
-    ['to-spec', 'to-tickets', 'lark-doc'].includes(skill));
-  const productDeliveryPolicy = managesProductDocuments
+  const stages = config.specStages ?? [];
+  // 交付规则按服务端授予的制品阶段（specStages）注入，与 Skill 无关。
+  const productDeliveryPolicy = stages.includes('product')
     ? [
         '产品方案交付规则（必须遵守）：',
         `- 当前默认交付方式：${defaultProductDeliveryMode}。`,
@@ -167,6 +194,16 @@ export function buildBotPrompt(
         '- 不要为了选择交付格式单独发起澄清。',
         '- 只有实际完成了可确认的方案产物时，才调用 request_spec_approval，提交 deliveryMode 与对应字段。普通问答、状态查询和未形成新方案的讨论直接回复，不要创建确认卡。',
         '- 不能只在普通回复中罗列 deliveryMode、documentUrl、specPath 或 ticketsPath。工具调用成功后停止本轮。',
+      ].join('\n')
+    : '';
+  const architectureStagePolicy = stages.includes('architecture')
+    ? [
+        '架构设计交付规则（必须遵守）：',
+        '- 架构设计是独立于产品方案的制品：需求复杂或用户明确要求架构设计时，先完成架构设计再谈实现；小改动、明确的一次性修复不要强制产出架构文档。',
+        '- 架构设计必须覆盖：模块划分、接口契约、数据模型与存储、迁移方案、风险与权衡、测试方案。',
+        '- 只有用户从已确认产品方案卡片发起「转架构设计」并提供了架构交接码时，才调用 request_architecture_review，提交 designPath 与交接码（handoffToken）。',
+        '- 不得自报产品方案编号、文档 URL 或其他上游信息充当交接码；没有有效交接码就不要提交架构审批。',
+        '- 架构确认与编码授权是分开的状态：架构确认前不要开始编码；架构确认也不等于允许开发，开发授权需要用户单独发起。',
       ].join('\n')
     : '';
   const feishuOutputPolicy = [
@@ -183,6 +220,7 @@ export function buildBotPrompt(
     config.systemPrompt.trim(),
     teamContext.trim(),
     productDeliveryPolicy,
+    architectureStagePolicy,
     config.skills.length > 0
       ? [
           '项目 Skill 加载规则（优先级不可颠倒）：',

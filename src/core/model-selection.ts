@@ -183,6 +183,12 @@ export function compareExecutionSelection(
 
   const current = binding.selection;
   if (!current) {
+    if (desired.selection.model === null && desired.selection.reasoningEffort === null) {
+      // 目标本身就是 native-default（无任何模型要求）：续接原会话让其继续
+      // 自己的模型正是原生语义，不存在「不能确认在用目标模型」的问题。
+      // 只有带显式模型/强度要求时，不可核验的绑定才需要重建。
+      return { action: 'keep' };
+    }
     return {
       action: 'recreate',
       reason: '现有原生会话没有可核验的模型绑定，不能确认它正在使用目标模型。',
