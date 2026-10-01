@@ -1,13 +1,8 @@
 import type { CliAdapter, CliAttachment, CliPromptInput, CliEvent, CliRunStats } from './types.js';
-import type { AppToolName } from '../core/app-tool-policy.js';
+import { isAppToolName, type AppToolName } from '../core/app-tool-policy.js';
 import type { ModelSelection } from '../core/model-selection.js';
 import { assertModelSelectionSupported } from '../core/engine-capabilities.js';
-import {
-  CLARIFICATION_TOOL_NAME,
-  PRODUCT_SPEC_TOOL_NAME,
-  DISPATCH_TASK_TOOL_NAME,
-  codexAppToolArgs,
-} from './app-tools.js';
+import { codexAppToolArgs } from './app-tools.js';
 
 interface CodexEvent {
   type?: unknown;
@@ -226,11 +221,8 @@ export class CodexAdapter implements CliAdapter {
       if (
         item.type === 'mcp_tool_call'
         && item.server === 'agent_os'
-        && (
-          item.tool === CLARIFICATION_TOOL_NAME
-          || item.tool === PRODUCT_SPEC_TOOL_NAME
-          || item.tool === DISPATCH_TASK_TOOL_NAME
-        )
+        && typeof item.tool === 'string'
+        && isAppToolName(item.tool)
       ) {
         events.push({
           type: 'tool_call',

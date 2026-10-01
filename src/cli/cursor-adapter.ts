@@ -1,19 +1,7 @@
-import type { AppToolName } from '../core/app-tool-policy.js';
+import { isAppToolName, type AppToolName } from '../core/app-tool-policy.js';
 import type { ModelSelection } from '../core/model-selection.js';
 import { assertModelSelectionSupported } from '../core/engine-capabilities.js';
 import type { CliAdapter, CliAttachment, CliEvent, CliPromptInput } from './types.js';
-import {
-  CLARIFICATION_TOOL_NAME,
-  PRODUCT_SPEC_TOOL_NAME,
-  DISPATCH_TASK_TOOL_NAME,
-} from './app-tools.js';
-
-const APP_TOOL_NAMES = new Set<string>([
-  CLARIFICATION_TOOL_NAME,
-  PRODUCT_SPEC_TOOL_NAME,
-  DISPATCH_TASK_TOOL_NAME,
-]);
-
 const NATIVE_TOOLS: Record<string, { toolName: string; label: string }> = {
   readToolCall: { toolName: 'Read', label: '读取文件' },
   writeToolCall: { toolName: 'Write', label: '写入文件' },
@@ -55,11 +43,11 @@ function parseInput(value: unknown): unknown {
 }
 
 function appToolName(name: string): AppToolName | undefined {
-  if (APP_TOOL_NAMES.has(name)) return name as AppToolName;
+  if (isAppToolName(name)) return name;
   const stripped = name.startsWith('mcp__agent_os__')
     ? name.slice('mcp__agent_os__'.length)
     : name;
-  return APP_TOOL_NAMES.has(stripped) ? stripped as AppToolName : undefined;
+  return isAppToolName(stripped) ? stripped : undefined;
 }
 
 function toolCallEntry(toolCall: Record<string, unknown>): {

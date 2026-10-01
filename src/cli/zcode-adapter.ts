@@ -1,4 +1,4 @@
-import type { AppToolName } from '../core/app-tool-policy.js';
+import { isAppToolName, type AppToolName } from '../core/app-tool-policy.js';
 import type { ModelSelection } from '../core/model-selection.js';
 import { assertModelSelectionSupported } from '../core/engine-capabilities.js';
 import type {
@@ -8,18 +8,6 @@ import type {
   CliEvent,
   CliRunStats,
 } from './types.js';
-import {
-  CLARIFICATION_TOOL_NAME,
-  PRODUCT_SPEC_TOOL_NAME,
-  DISPATCH_TASK_TOOL_NAME,
-} from './app-tools.js';
-
-const APP_TOOL_NAMES = new Set<string>([
-  CLARIFICATION_TOOL_NAME,
-  PRODUCT_SPEC_TOOL_NAME,
-  DISPATCH_TASK_TOOL_NAME,
-]);
-
 /** ZCode 用 `mcp__<server>__<tool>` 命名 MCP 工具；只认 agent_os 来源的业务调用。 */
 const AGENT_OS_TOOL_PREFIX = 'mcp__agent_os__';
 
@@ -122,15 +110,15 @@ function toolDetail(input: unknown): string | undefined {
     ?? shortText(input.query);
 }
 
-/** 业务调用候选：仅识别 `mcp__agent_os__<tool>` 且工具名在三个业务工具内。 */
+/** 业务调用候选：仅识别 `mcp__agent_os__<tool>` 且工具名在中心注册表内。 */
 function businessToolCall(name: string | undefined, input: unknown): {
   name: AppToolName;
   input: unknown;
 } | undefined {
   if (!name || !name.startsWith(AGENT_OS_TOOL_PREFIX)) return undefined;
   const tool = name.slice(AGENT_OS_TOOL_PREFIX.length);
-  return APP_TOOL_NAMES.has(tool)
-    ? { name: tool as AppToolName, input: parseInput(input) }
+  return isAppToolName(tool)
+    ? { name: tool, input: parseInput(input) }
     : undefined;
 }
 

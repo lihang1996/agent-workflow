@@ -20,6 +20,15 @@ const toolSchemas = {
 };
 export type AppToolName = keyof typeof toolSchemas;
 
+/** 注册工具的只读名单，由 toolSchemas 派生；适配器识别一律以此为单一来源。 */
+export const APP_TOOL_NAMES: readonly AppToolName[] = Object.freeze(
+  Object.keys(toolSchemas) as AppToolName[],
+);
+
+export function isAppToolName(value: string): value is AppToolName {
+  return Object.hasOwn(toolSchemas, value);
+}
+
 /**
  * 制品提交权限按服务端配置的阶段（specStages）授予，不按 Skill 推断：
  * `lark-doc` 只说明会编辑飞书文档，不代表能提交产品/架构审批——开发 Bot 即使
@@ -46,10 +55,10 @@ export function appToolsForBot(
 export function parseAppTools(value: string): AppToolName[] {
   if (!value) return [];
   return [...new Set(value.split(','))].map((name) => {
-    if (!Object.hasOwn(toolSchemas, name)) {
+    if (!isAppToolName(name)) {
       throw new Error(`未知的 Agent OS 工具: ${name}`);
     }
-    return name as AppToolName;
+    return name;
   });
 }
 

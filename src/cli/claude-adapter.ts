@@ -1,16 +1,12 @@
 import { promptInputForPlatform } from './types.js';
-import type { AppToolName } from '../core/app-tool-policy.js';
+import { isAppToolName, type AppToolName } from '../core/app-tool-policy.js';
 import type { ModelSelection } from '../core/model-selection.js';
 import { assertModelSelectionSupported } from '../core/engine-capabilities.js';
 import type { CliAdapter, CliAttachment, CliPromptInput, CliEvent, CliRunStats } from './types.js';
-import {
-  CLAUDE_CLARIFICATION_TOOL_NAME,
-  CLAUDE_PRODUCT_SPEC_TOOL_NAME,
-  CLAUDE_DISPATCH_TASK_TOOL_NAME,
-  PRODUCT_SPEC_TOOL_NAME,
-  DISPATCH_TASK_TOOL_NAME,
-  claudeAppToolArgs,
-} from './app-tools.js';
+import { claudeAppToolArgs } from './app-tools.js';
+
+/** Claude 把 MCP 工具暴露为 `mcp__<server>__<tool>`；只认 agent_os 来源的业务调用。 */
+const AGENT_OS_TOOL_PREFIX = 'mcp__agent_os__';
 
 interface ClaudeEvent {
   type?: unknown;
@@ -81,6 +77,12 @@ function toolDetail(name: string, input: unknown): string | undefined {
   if (name === 'Agent' || name === 'Task') return shortText(input.description);
   if (name === 'WebSearch') return shortText(input.query);
   return undefined;
+}
+
+function businessToolName(name: string): AppToolName | undefined {
+  if (!name.startsWith(AGENT_OS_TOOL_PREFIX)) return undefined;
+  const tool = name.slice(AGENT_OS_TOOL_PREFIX.length);
+  return isAppToolName(tool) ? tool : undefined;
 }
 
 function messageBlocks(message: unknown): ClaudeContentBlock[] {
@@ -236,27 +238,12 @@ export class ClaudeAdapter implements CliAdapter {
           label: TOOL_LABELS[block.name] ?? `调用 ${block.name}`,
           ...(detail ? { detail } : {}),
         }];
-        if (block.name === CLAUDE_CLARIFICATION_TOOL_NAME) {
+        const business = businessToolName(block.name);
+        if (business) {
           events.push({
             type: 'tool_call',
             toolUseId: block.id,
-            toolName: 'request_clarification',
-            input: block.input,
-          });
-        }
-        if (block.name === CLAUDE_PRODUCT_SPEC_TOOL_NAME) {
-          events.push({
-            type: 'tool_call',
-            toolUseId: block.id,
-            toolName: PRODUCT_SPEC_TOOL_NAME,
-            input: block.input,
-          });
-        }
-        if (block.name === CLAUDE_DISPATCH_TASK_TOOL_NAME) {
-          events.push({
-            type: 'tool_call',
-            toolUseId: block.id,
-            toolName: DISPATCH_TASK_TOOL_NAME,
+            toolName: business,
             input: block.input,
           });
         }
