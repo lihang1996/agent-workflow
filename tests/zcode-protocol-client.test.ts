@@ -1049,3 +1049,42 @@ test('same-typed idFactory duplicate rejected; expired tombstone id reusable', a
   assert.equal(await c, 2);
   assert.ok(!ctx2.client.isClosed());
 });
+
+test('reverse chain internal throw seals client and rejects pending with fixed -32035', async (t) => {
+  // 故障注入：仅在链尾 finishReverse 删除 AbortController 时抛出，
+  // 触发 .catch 分支的 failAll(-32035)。全程 finally 恢复原型，不并行污染。
+  const originalDelete = Set.prototype.delete;
+  let armed = true;
+  Set.prototype.delete = function deleted(this: Set<unknown>, value: unknown) {
+    if (armed && value instanceof AbortController) {
+      armed = false;
+      throw new Error('fake-review-secret');
+    }
+    return originalDelete.call(this, value);
+  } as typeof Set.prototype.delete;
+  try {
+    const ctx = makeClient(t);
+    let authSignal: AbortSignal | undefined;
+    ctx.setReverseHandler(async (_req, signal) => {
+      authSignal = signal;
+      return null;
+    });
+    const pending = ctx.client.request('session/read', { path: 'a' });
+    ctx.client.push(`${JSON.stringify({ id: 'r1', method: 'interaction/requestProviderRuntimeHeaders', params: {} })}\n`);
+    let caught: unknown;
+    await assert.rejects(
+      pending,
+      (error: unknown) => {
+        caught = error;
+        return error instanceof ZcodeProtocolError && error.code === -32035;
+      },
+    );
+    const err = caught as ZcodeProtocolError;
+    assert.equal(err.message, 'zcode protocol reverse handler failure');
+    assert.ok(!err.message.includes('fake-secret'));
+    assert.ok(ctx.client.isClosed());
+    assert.ok(authSignal?.aborted);
+  } finally {
+    Set.prototype.delete = originalDelete;
+  }
+});

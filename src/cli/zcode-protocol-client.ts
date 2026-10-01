@@ -53,7 +53,7 @@ const TRACE_KEYS: ReadonlySet<string> = new Set([
   'spanId',
 ]);
 
-const FIXED_MESSAGES: Readonly<Record<string, string>> = {
+const FIXED_MESSAGES = Object.freeze({
   transport: 'zcode protocol transport failure',
   eof: 'zcode protocol stream ended',
   disposed: 'zcode protocol client disposed',
@@ -67,7 +67,8 @@ const FIXED_MESSAGES: Readonly<Record<string, string>> = {
   observer: 'zcode protocol observer failed',
   limits: 'zcode protocol limits invalid',
   id: 'zcode protocol request id invalid',
-};
+  handler: 'zcode protocol reverse handler failure',
+} as const);
 
 /** 固定 message 的协议错误；code 为对端 error.code 或内部固定码。 */
 export class ZcodeProtocolError extends Error {
@@ -604,7 +605,9 @@ export class ZcodeProtocolClient {
     // 不能await handler：调用方可能在 handler 里 request('session/read')，
     // 路由循环必须继续处理后续响应帧，否则死锁。排队期间可能已 dispose/end/
     // abort 或 id 不再 inflight，此时不得调用 handler。同步 throw / 异步 reject
-    // 一律由 reject 分支转固定 -32603，链尾固定 catch 保证内部异常不 unhandled。
+    // 一律由 reject 分支转固定 -32603。链尾不再静默吞错：链本身异常（如
+    // finishReverse 内部抛出）按合同 failAll（封口、abort reverse、拒绝全部
+    // pending），错误固定为 -32035，不外泄原始 Error/params/result。
     Promise.resolve()
       .then(() => {
         if (this.closed || controller.signal.aborted || !this.reverseInFlight.has(id)) {
@@ -630,7 +633,9 @@ export class ZcodeProtocolClient {
           }));
         },
       )
-      .catch(() => undefined);
+      .catch(() => {
+        this.failAll(new ZcodeProtocolError(-32035, 'handler'));
+      });
   }
 
   private handleResponse(frame: Record<string, unknown>): void {
