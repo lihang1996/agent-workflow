@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { statSync } from 'node:fs';
+import { createReadStream, readFileSync } from 'node:fs';
 import { readJsonState } from './json-state.js';
 import { z } from 'zod';
 
@@ -17,12 +17,14 @@ import { z } from 'zod';
  * 方式、CLI 模式、MCP 配置哈希（canary 批扩展并做失效断言）；任一字段加入后
  * 旧身份自然查不到 ⇒ blocked。
  *
- * A03（Codex 深度审查）：① 身份补 **binaryFingerprint** 维度——二进制真实
- * 路径 + `--version` 输出的 sha256 前 16 位（调用方传入；harness 同时提供
- * binaryRealPath/binaryVersion 时 prepare 纳入身份，旧证据自然失效）；② 能力
- * 条目必须有 **expiresAt**（ISO 时间）与 **evidenceRef**（证据文件路径）——
- * 无限期证据等于无审计的永久通行证；③ store 每次 lookup 前核对文件 mtime，
- * 被撤销/重写即时生效；④ 过期条目按无证据处理（失败关闭）。
+ * A03（Codex 深度审查 + 166 号返工）：① 身份补 **binaryFingerprint** 维度
+ * ——二进制真实路径 + **文件内容 sha256**（computeBinaryFingerprint；canary
+ * 与生产以相同输入计算，任一变化旧证据自然失效；`--version` 文本不再进入
+ * 身份——版本探测本身须走受控环境）；② 能力条目必须有 **expiresAt**（ISO
+ * 时间）与 **evidenceRef**（证据文件路径）——无限期证据等于无审计的永久
+ * 通行证；③ store 每次 lookup 前**重读文件内容比对 sha256**（不以单个
+ * mtime 充当撤销协议——mtime 可被原子替换保留），被撤销/重写即时生效；
+ * ④ 过期条目按无证据处理（失败关闭）。
  *
  * 本模块只提供**只读** store：条目只能由未来的 G-W6b-CANARY 写入；空库/缺文件
  * ⇒ lookup 返回 undefined ⇒ 一切真实启动失败关闭。
@@ -61,6 +63,9 @@ export type IsolationCapabilityIdentityInput = {
    * 身份查不到它，保持失败关闭）。
    */
   binaryFingerprint?: string;
+  protectedRootsDigest?: string;
+  templateVersion?: string;
+  executionDescriptorDigest?: string;
 };
 
 /** 能力身份（可跨任务 scratch 复用；单次运行的完整 profile 仍由预检/启动核验）。 */
@@ -72,22 +77,49 @@ export function computeIsolationCapabilityIdentity(input: IsolationCapabilityIde
     input.writePolicy,
     input.platform,
     input.binaryFingerprint ?? '',
+    input.protectedRootsDigest ?? '',
+    input.templateVersion ?? 'seatbelt/2',
+    input.executionDescriptorDigest ?? '',
   ]);
   return createHash('sha256').update(canonical).digest('hex');
 }
 
+/** Root contents, not an operator-maintained version label, define the boundary. */
+export function protectedRootsDigest(roots: readonly string[]): string {
+  return createHash('sha256').update(JSON.stringify([...new Set(roots)].sort())).digest('hex');
+}
+
 /**
- * A03：引擎二进制指纹 = sha256(二进制真实路径 + `--version` 输出) 前 16 位。
- * 由调用方（canary 写入侧/装配侧）传入；版本升级或二进制被替换 ⇒ 指纹变化
- * ⇒ 旧能力证据查不到 ⇒ blocked（重新 canary）。
+ * A03（166 号返工）：引擎二进制**内容**摘要——流式读取整个可执行文件计算
+ * sha256。旧实现只哈希路径与 `--version` 文本，同一路径内容被替换、版本输出
+ * 不变时旧身份不失效；本函数把真实字节内容纳入身份。读取失败（文件缺失/
+ * 无权读取）抛错失败关闭——身份维度不允许静默降级为「无指纹」。
+ */
+export async function computeBinaryContentSha256(binaryPath: string): Promise<string> {
+  const hash = createHash('sha256');
+  await new Promise<void>((resolve, reject) => {
+    const stream = createReadStream(binaryPath);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.once('error', reject);
+    stream.once('end', () => resolve());
+  });
+  return hash.digest('hex');
+}
+
+/**
+ * A03（166 号返工）：引擎二进制指纹 = sha256([真实路径, 内容 sha256]) 前 16 位。
+ * 由调用方（canary 写入侧/生产装配侧）以**相同输入**计算——canary 与生产共用
+ * 同一函数与同一维度：二进制被原地替换（内容变化）或 PATH 换绑（路径变化）
+ * ⇒ 指纹变化 ⇒ 旧能力证据查不到 ⇒ blocked（重新 canary）。版本文本不再进入
+ * 身份（`--version` 探测必须走受控环境，不能为算身份裸执行引擎）。
  */
 export function computeBinaryFingerprint(input: {
   /** 二进制真实路径（realpath 解析后；符号链接换绑即指纹变化）。 */
   binaryRealPath: string;
-  /** `--version` 的完整 stdout（trim 后参与哈希）。 */
-  versionOutput: string;
+  /** computeBinaryContentSha256 的输出（真实文件内容的 sha256，64 位 hex）。 */
+  contentSha256: string;
 }): string {
-  const canonical = JSON.stringify([input.binaryRealPath, input.versionOutput.trim()]);
+  const canonical = JSON.stringify([input.binaryRealPath, input.contentSha256]);
   return createHash('sha256').update(canonical).digest('hex').slice(0, 16);
 }
 
@@ -107,23 +139,28 @@ const VerdictsSchema = z.object({
 /** 只读 JSON 能力库：`{ _v: 2, entries: { [key]: verdicts } }`。坏文件失败关闭。 */
 export class JsonIsolationCapabilityStore implements IsolationCapabilityReader {
   private readonly entries = new Map<string, IsolationCapabilityVerdicts>();
-  /** 上次加载时的文件 mtime（毫秒）；文件未变则不重复解析。 */
-  private loadedMtimeMs: number | undefined;
+  /**
+   * 上次加载内容的 sha256（166 号 A03：撤销协议以**内容身份**为准，不以单个
+   * mtime 充当——mtime 可被原子替换保留）。每次 lookup 重读文件字节并比对
+   * 摘要：内容变化（含保留 mtime 的替换）⇒ 重新解析；文件被删 ⇒ 清空条目。
+   */
+  private loadedContentSha256: string | undefined;
   private readonly now: () => number;
 
   constructor(private readonly filePath: string, options: { now?: () => number } = {}) {
     this.now = options.now ?? (() => Date.now());
-    this.loadedMtimeMs = this.statMtimeMs();
+    this.loadedContentSha256 = this.readFileSha256();
     this.reload();
   }
 
   lookup(key: string): IsolationCapabilityVerdicts | undefined {
-    // A03：每次 lookup 前核对 mtime——外部撤销（重写/删除证据文件）不必等
-    // 进程重启即生效。stat 失败（含文件被删）⇒ 清空内存条目，失败关闭。
-    const mtimeMs = this.statMtimeMs();
-    if (mtimeMs !== this.loadedMtimeMs) {
-      this.loadedMtimeMs = mtimeMs;
-      if (mtimeMs === undefined) {
+    // A03（166 号返工）：每次 lookup 前**重读文件内容**并比对摘要——外部撤销
+    // （重写/删除证据文件，包括保留 mtime 的原子替换）不必等进程重启即生效。
+    // 读失败（含文件被删）⇒ 清空内存条目，失败关闭。
+    const contentSha256 = this.readFileSha256();
+    if (contentSha256 !== this.loadedContentSha256) {
+      this.loadedContentSha256 = contentSha256;
+      if (contentSha256 === undefined) {
         this.entries.clear();
       } else {
         this.reload();
@@ -138,12 +175,16 @@ export class JsonIsolationCapabilityStore implements IsolationCapabilityReader {
     return entry;
   }
 
-  private statMtimeMs(): number | undefined {
+  /** 读整个文件内容的 sha256；ENOENT ⇒ undefined；其他读失败 ⇒ 抛错失败关闭。 */
+  private readFileSha256(): string | undefined {
+    let content: string;
     try {
-      return statSync(this.filePath).mtimeMs;
-    } catch {
-      return undefined;
+      content = readFileSync(this.filePath, 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
     }
+    return createHash('sha256').update(content, 'utf8').digest('hex');
   }
 
   private reload(): void {

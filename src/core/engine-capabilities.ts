@@ -9,6 +9,7 @@ import type { ModelSelection, ModelSelectionCapabilities } from './model-selecti
  * 用引擎自述或历史成功日志替代。capabilities 不来自用户配置，避免自报。
  */
 export interface EngineModelCapabilities extends ModelSelectionCapabilities {
+  modelSelectionSources?: { argv: boolean; sessionCommand: string; verifiedConfig: string };
   /** 已核验的 CLI 版本与证据来源；null 表示本机尚未核验。 */
   evidence: {
     cliVersion: string;
@@ -70,6 +71,7 @@ export const ENGINE_MODEL_CAPABILITIES: Record<CliId, EngineModelCapabilities> =
     notes: '未显式指定模型时沿用 CURSOR_CLI_MODEL 环境变量（历史行为）。',
   },
   zcode: {
+    modelSelectionSources: { argv: false, sessionCommand: 'tui-only', verifiedConfig: 'requires-protected-runtime-receipt' },
     // 官方 CLI 0.16.9 headless（--prompt）没有模型参数；/model 仅 TUI。
     // 新会话模型来自 provider 配置 defaultModelSelection（源码核对），不受
     // 单次执行控制，显式声明模型只能 blocked，不允许静默用原生默认。
@@ -82,7 +84,7 @@ export const ENGINE_MODEL_CAPABILITIES: Record<CliId, EngineModelCapabilities> =
       source: 'zcode --help 无模型参数；zcode.cjs 源码仅 provider 配置 defaultModelSelection 路径',
     },
     modelSelectionArgs: '（无）',
-    notes: '默认模型需在官方 TUI/provider 配置中预先选定；agent-os 无法逐执行声明。',
+    notes: '默认模型需在官方 TUI/provider 配置中预先选定；当前适配器不伪造模型 argv；可核验配置/会话单列 host receipt 契约，未取得真实 fresh/resume/recreate 证据时拒绝。',
   },
 };
 

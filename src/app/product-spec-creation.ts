@@ -55,7 +55,7 @@ export async function createBoundProductSpecFlow(options: {
   verifyCitations?: (input: {
     artifactTexts: readonly string[];
     declaredRefs: KnowledgeRef[];
-  }) => { ok: true } | { ok: false; reason: string };
+  }) => { ok: true } | { ok: false; reason: string } | Promise<{ ok: true } | { ok: false; reason: string }>;
   /** 测试注入：读取与稳定性复核之间触发「读取过程中变化」时序。 */
   artifactReadHook?: () => Promise<void>;
 }): Promise<ProductSpecFlow> {
@@ -92,7 +92,7 @@ export async function createBoundProductSpecFlow(options: {
       if (!options.verifyCitations) {
         throw new Error('方案包含知识引用（或声明了服务端知识引用），但引用核验通道不可用：提交失败关闭，不生成确认卡。');
       }
-      const verified = options.verifyCitations({ artifactTexts: snapshot.texts, declaredRefs });
+      const verified = await options.verifyCitations({ artifactTexts: snapshot.texts, declaredRefs });
       if (!verified.ok) {
         throw new Error(`方案知识引用核验未通过，提交失败关闭：${verified.reason}`);
       }

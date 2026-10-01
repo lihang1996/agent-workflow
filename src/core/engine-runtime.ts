@@ -64,6 +64,7 @@ export function runIsolatedProbe(
       prepared = await preparer({
         taskId: `probe-${command}`,
         purpose: 'probe',
+        cliMode: 'probe',
         command,
         cwd: probeWorkspace,
       });

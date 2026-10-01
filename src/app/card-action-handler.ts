@@ -36,15 +36,22 @@ import { listNativeCliSessions } from '../cli/native-sessions.js';
 import { createProductionIsolationPreparer } from '../core/isolation.js';
 import { continueClarificationFlow } from './clarification-runner.js';
 import type { AppRuntime } from './runtime.js';
+import { verifySourceFlowCitations } from './source-citations.js';
+import { startCoding } from './coding-start.js';
 
 export function createCardActionHandler(options: {
   runtime: AppRuntime;
   config: BotConfig;
   defaultProductDeliveryMode: ProductDeliveryMode;
   continueFlow?: typeof continueClarificationFlow;
+  startCoding?: typeof startCoding;
 }): (action: CardAction) => Promise<CardActionResponse | undefined> {
   const { runtime, config, defaultProductDeliveryMode } = options;
   return async (action) => {
+    if (action.value.action === 'start_coding') {
+      try { return { toast: { type: 'success', content: await (options.startCoding ?? startCoding)({ runtime, config, action, background: true }) } }; }
+      catch (error) { return { toast: { type: 'error', content: (error as Error).message } }; }
+    }
     if (action.value.action === 'approve_product_spec') {
       const flowToken = typeof action.value.flowToken === 'string'
         ? action.value.flowToken
@@ -98,7 +105,9 @@ export function createCardActionHandler(options: {
         const gate = await verifyApprovableArtifact({
           flow,
           workspaceDir: runtime.sessions.get(flow.sessionId)?.workspaceDir,
-          verifyKnowledgeCitations: runtime.knowledgePrefetch
+          verifyKnowledgeCitations: flow.knowledge_refs?.some(ref=>ref.fact_kind==='source-current')
+            ? ({ artifactTexts, declaredRefs }) => verifySourceFlowCitations(runtime, flow, artifactTexts, declaredRefs)
+            : runtime.knowledgePrefetch
             ? ({ artifactTexts, declaredRefs }) => verifyArtifactCitations({
                 artifactTexts,
                 declaredRefs,
@@ -225,7 +234,9 @@ export function createCardActionHandler(options: {
         const gate = await verifyApprovableArtifact({
           flow,
           workspaceDir: runtime.sessions.get(flow.sessionId)?.workspaceDir,
-          verifyKnowledgeCitations: runtime.knowledgePrefetch && flow.upstream
+          verifyKnowledgeCitations: flow.knowledge_refs?.some(ref=>ref.fact_kind==='source-current')
+            ? ({ artifactTexts, declaredRefs }) => verifySourceFlowCitations(runtime, flow, artifactTexts, declaredRefs)
+            : runtime.knowledgePrefetch && flow.upstream
             ? ({ artifactTexts, declaredRefs }) => verifyArchitectureCitations({
                 artifactTexts,
                 declaredRefs,
@@ -305,7 +316,7 @@ export function createCardActionHandler(options: {
           resolveWorkspaceDir: (sessionId) => runtime.sessions.get(sessionId)?.workspaceDir,
         });
         return {
-          toast: { type: 'success', content: '授权记录已确认（执行层隔离未接线前编码保持阻断）。' },
+          toast: { type: 'success', content: '授权记录已确认；点击开始开发时会再次核验模型、知识和隔离证据。' },
           card: { type: 'raw', data: buildCodingAuthorizationActiveCard(confirmed) },
         };
       } catch (error) {
@@ -333,6 +344,12 @@ export function createCardActionHandler(options: {
           operator: { ...action, operatorBotId: config.id },
           authorizationId,
         });
+        const handoff = runtime.codingHandoffs?.get(authorizationId);
+        if (handoff) {
+          runtime.activeRuns.get(handoff.sessionId)?.controller.abort();
+          if (handoff.state === 'issued') runtime.codingHandoffs!.transition(authorizationId, handoff.operationId, 'revoked');
+          else if (handoff.state === 'running') runtime.codingHandoffs!.transition(authorizationId, handoff.operationId, 'launch_unknown', { error: '授权撤销，等待实际进程组收尾' });
+        }
         return {
           toast: { type: 'success', content: '编码授权已撤销。' },
           card: { type: 'raw', data: buildCodingAuthorizationInactiveCard(revoked) },

@@ -1,4 +1,5 @@
 import type { CliAttachment } from '../cli/types.js';
+import { prefetchSourceContext, sourceSubmission, sourceBinding } from './source-context.js';
 import { resolve } from 'node:path';
 import { type Bot } from '../im/lark.js';
 import { answerContinuation, answerNeedsContinuation, buildArchitectureApprovalCard, buildClarificationCard, buildProductSpecApprovalCard, buildClarificationSupersededCard, buildSessionNoticeCard, buildTaskCard, splitLongText } from '../im/card.js';
@@ -264,12 +265,14 @@ export function createMessageHandler(options: {
           console.error(`  [下载失败] ${res.key}:`, (e as Error).message);
         }
       }
-      const prompt = buildBotPrompt(
+      let prompt = buildBotPrompt(
         config,
         taskText + attachmentPromptSection(attachments),
         teamRegistry.contextFor(config.id),
         defaultProductDeliveryMode,
       );
+      const sourceIdentity = sourceBinding(config, { taskId, sessionId: session.id, sessionVersion: session.version ?? 0, ...owner }, session.workspaceDir);
+      if (!isCompacting) prompt += await prefetchSourceContext(runtime, config, sourceIdentity, taskText);
 
       // 先回复一张卡片，让用户知道任务已经进入执行队列。
       const cardId = await bot.replyCard(
@@ -488,7 +491,7 @@ export function createMessageHandler(options: {
               workspaceDir: session.workspaceDir,
               // 119 号 P1-4：本地交付必须持有当前任务的 scratch 绑定（缺/跨任务/过期失败关闭）。
               ...(productSpecRequest.deliveryMode === 'local'
-                ? { scratchRoot: requireScratchRootForSubmission(runtime, session.id, taskId) }
+                ? { scratchRoot: requireScratchRootForSubmission(runtime, session.id, taskId, session.workspaceDir) }
                 : {}),
               identity: {
                 taskId,
@@ -501,6 +504,7 @@ export function createMessageHandler(options: {
                 collaboration: collaborationContext,
               },
               request: productSpecRequest,
+              ...sourceSubmission(runtime, sourceIdentity),
             });
             await cardUpdater.finish(buildProductSpecApprovalCard(flow), { kind: 'product', token: flow.token });
             await sendResultNotification({
@@ -528,7 +532,7 @@ export function createMessageHandler(options: {
               handoffs: runtime.architectureHandoffs!,
               workspaceDir: session.workspaceDir,
               ...(normalizedRequest.deliveryMode === 'local'
-                ? { scratchRoot: requireScratchRootForSubmission(runtime, session.id, taskId) }
+                ? { scratchRoot: requireScratchRootForSubmission(runtime, session.id, taskId, session.workspaceDir) }
                 : {}),
               resolvePrdWorkspaceDir: ({ prdSessionId }) => sessions.get(prdSessionId)?.workspaceDir,
               identity: {

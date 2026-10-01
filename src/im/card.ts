@@ -1092,7 +1092,7 @@ export function buildCodingAuthorizationActiveCard(record: CodingAuthorizationRe
     },
     header: {
       template: 'yellow',
-      title: { tag: 'plain_text', content: '授权记录已确认（编码仍阻断）' },
+      title: { tag: 'plain_text', content: '授权记录已确认（启动前复核）' },
       subtitle: { tag: 'plain_text', content: `有效期至 ${record.expiresAt}` },
     },
     body: {
@@ -1112,6 +1112,12 @@ export function buildCodingAuthorizationActiveCard(record: CodingAuthorizationRe
             `授权人：\`${escapeFeishuMarkdown(record.grantedBy ?? '')}\` · 确认时间：${escapeFeishuMarkdown(record.grantedAt ?? '')}`,
             `有效期至：${escapeFeishuMarkdown(record.expiresAt)}${record.pendingPathRecheck ? '（含待复核路径，使用前复核）' : ''}`,
           ].filter(Boolean).join('\n'),
+        },
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '开始开发' },
+          type: 'primary',
+          behaviors: [{ type: 'callback', value: { action: 'start_coding', authorizationId: record.id } }],
         },
         {
           tag: 'button',

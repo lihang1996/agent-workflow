@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as Lark from '@larksuiteoapi/node-sdk';
@@ -338,8 +338,11 @@ test('session version, owner, and completed execution records survive reload', a
 
 test('failed session reset rolls back its version and preserves the original clarification', async (t) => {
   const f = await fixture(t); const flow = f.createClarification();
-  mkdirSync(join(f.dir, 'sessions.json.tmp'));
+  // 持久化失败注入：目标文件换成目录（唯一 tmp 写入成功、rename 撞目录失败）。
+  rmSync(join(f.dir, 'sessions.json'));
+  mkdirSync(join(f.dir, 'sessions.json'));
   await assert.rejects(f.command('new'));
+  rmSync(join(f.dir, 'sessions.json'), { recursive: true, force: true });
   assert.equal(f.runtime.sessions.get(f.session.id)?.version, 0);
   assert.equal(f.runtime.sessions.get(f.session.id)?.cliSessionId, 'original-cli');
   assert.equal(f.runtime.clarificationFlows.get(flow.token)?.currentIndex, 0);
@@ -366,7 +369,7 @@ test('local spec submissions bind the full artifact digest at creation and appro
   writeFileSync(join(f.dir, '.fx', 'spec.md'), '# 方案\n\n本地交付。\n');
   writeFileSync(join(f.dir, '.fx', 'tickets', 't1.md'), '## 需求 1\n\n下单展示会员价。');
   // W6b：本地制品提交需要当前任务的 scratch 绑定（fixture 直接 seed 等价状态）。
-  f.runtime.sessionScratches.set(f.session.id, { relative: '.fx', taskKey: topicTaskId(message), at: Date.now() });
+  f.runtime.sessionScratches.set(f.session.id, { relative: '.fx', taskKey: topicTaskId(message), at: Date.now(), workspaceRealpath: realpathSync(f.dir) });
   const execute = async () => ({ answer: '方案已生成', toolCalls: [{ toolUseId: 'tu1', toolName: 'request_spec_approval', input: { ...localRequest } }] });
   await f.handler(execute)(message, f.bot);
   await until(() => f.runtime.productSpecFlows.forSession(f.session.id).length === 1);
@@ -412,7 +415,7 @@ test('W5 返修：澄清后创建的本地方案也绑定完整摘要，并可�
   writeFileSync(join(f.dir, '.fx', 'spec.md'), '# 方案\n\n澄清后本地交付。\n');
   writeFileSync(join(f.dir, '.fx', 'tickets', 't1.md'), '## 需求 1\n\n按澄清结果展示会员价。');
   const flow = f.createClarification();
-  f.runtime.sessionScratches.set(f.session.id, { relative: '.fx', taskKey: flow.taskId, at: Date.now() });
+  f.runtime.sessionScratches.set(f.session.id, { relative: '.fx', taskKey: flow.taskId, at: Date.now(), workspaceRealpath: realpathSync(f.dir) });
   await f.runtime.sessions.transition(f.session.id, 'active');
   const run = new AbortController();
   f.runtime.activeRuns.set(f.session.id, { controller: run, ownerOpenId: 'owner' });

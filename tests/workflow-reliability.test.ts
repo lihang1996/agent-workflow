@@ -301,10 +301,10 @@ test('durable collaboration inbox recovers unconsumed dispatches and retains bou
 test('failed durable writes roll back approval and answers', async (t) => {
   const dir = temp(t); const file = join(dir, 'specs.json'); const store = new JsonProductSpecFlowStore(file);
   const flow = store.create({ taskId: 'task', botId: 'product', sessionId: 's', ownerOpenId: 'owner', request });
-  mkdirSync(`${file}.tmp`); assert.throws(() => store.approve(flow.token, 'card')); assert.equal(store.get(flow.token)?.status, 'pending');
+  rmSync(file); mkdirSync(file); assert.throws(() => store.approve(flow.token, 'card')); assert.equal(store.get(flow.token)?.status, 'pending'); rmSync(file, { recursive: true, force: true });
   const answersFile = join(dir, 'answers.json'); const answers = new ClarificationFlowStore(answersFile);
   const q = answers.create({ taskId: 't', botId: 'p', sessionId: 's', ownerOpenId: 'owner', request: questions, originalMessageId: 'm', replyInThread: true });
-  mkdirSync(`${answersFile}.tmp`); assert.throws(() => answers.answer(q.token, 'q1', '大')); assert.equal(answers.get(q.token)?.currentIndex, 0);
+  rmSync(answersFile); mkdirSync(answersFile); assert.throws(() => answers.answer(q.token, 'q1', '大')); assert.equal(answers.get(q.token)?.currentIndex, 0); rmSync(answersFile, { recursive: true, force: true });
 });
 
 test('Windows npm shims preserve JSON, spaces and metacharacters without shell parsing', (t) => {

@@ -2,17 +2,23 @@ import { createHash, randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import type { ChildProcess, ChildProcessByStdio, SpawnOptions, StdioOptions } from 'node:child_process';
 import type { Readable, Writable } from 'node:stream';
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { spawnCli } from '../cli/spawn-cli.js';
 import { z } from 'zod';
+import { CONTROL_ROOT, readProtectedJson } from './protected-control.js';
+import { ExecutionDescriptorSchema, descriptorDigest, assertDescriptorCurrent as assertExecutionDescriptorCurrent, type ExecutionDescriptor } from './execution-descriptor.js';
+import { protectedCapabilityReader } from './capability-registrar.js';
+import type { ModelSelection } from './model-selection.js';
 import { readJsonState, writeJsonState } from './json-state.js';
 import {
   assertCapabilityAllowsLaunch,
+  computeBinaryContentSha256,
   computeBinaryFingerprint,
   computeIsolationCapabilityIdentity,
+  protectedRootsDigest,
   type IsolationCapabilityReader,
 } from './isolation-capability.js';
 import {
@@ -84,12 +90,16 @@ export interface IsolationHarness {
   /** 白名单环境来源（默认 process.env；测试注入受控环境）。 */
   envBase?: NodeJS.ProcessEnv;
   /**
-   * A03：引擎二进制真实路径（realpath 后）与 `--version` 输出。两者**必须同时
-   * 提供**（只给其一属调用方错误，失败关闭）；齐备时 prepare 计算指纹并纳入
-   * 能力身份——二进制被替换/升级后旧证据查不到，须重新 canary。
+   * A03（166 号返工）：引擎二进制真实路径（生产 preparer 从 PATH 解析 +
+   * realpath；canary 与生产共用同一来源）。提供时 prepare 读取**文件内容**
+   * sha256 计算指纹并纳入能力身份——二进制被原地替换（内容变化）或 PATH
+   * 换绑（路径变化）后旧证据查不到，须重新 canary。内容读取失败 ⇒ 失败关闭
+   * （身份维度不允许静默降级）。`--version` 文本不再进入身份（版本探测必须
+   * 走受控环境，见 engine-runtime）。
    */
   binaryRealPath?: string;
-  binaryVersion?: string;
+  assertDescriptorCurrent?: () => void;
+  executionDescriptorDigest?: string;
   /**
    * 受信服务端的额外环境注入（如未来 V-5 验证后的 CLAUDE_CONFIG_DIR 重定向）。
    * 以 scratch 为入参的函数（值常依赖随机 scratch 路径）；仅受信代码可设置，
@@ -106,6 +116,7 @@ export type PreparedIsolation = {
   profile: string;
   env: NodeJS.ProcessEnv;
   capabilityKey: string;
+  binaryFingerprint?: string;
   /** 任务 scratch 相对工作区 realpath 的 POSIX 路径（制品约束/基线例外用）。 */
   scratchRelative?: string;
   /** 任务收尾差异判读（purpose='task'）；其余 purpose 为 no-op。 */
@@ -124,6 +135,8 @@ export interface IsolationPrepareInput {
   purpose: IsolationPurpose;
   command: string;
   cwd: string;
+  cliMode?: string;
+  modelSelection?: ModelSelection | null;
   /**
    * T-021 已核验的编码授权（119 号 P1-3）：id 与**精确**相对允许路径一起传入，
    * 绑定进能力身份与 profile；未授权任务（设计/产品/探测/compact）两者皆空
@@ -317,6 +330,7 @@ export function buildIsolationProfile(input: IsolationProfileInput): string {
     lines.push(`(allow file-write* (subpath "${seatbeltLiteral(allowed)}"))`);
   }
   for (const root of input.protectedRootRealpaths) {
+    lines.push(`(deny file-write* (subpath "${seatbeltLiteral(root)}"))`);
     lines.push(`(deny file-read-data (subpath "${seatbeltLiteral(root)}"))`);
   }
   return lines.join('\n');
@@ -492,6 +506,15 @@ export function launchIsolated(
   if (platform === 'win32') {
     throw new Error('Windows 平台无 sandbox-exec 隔离，默认 blocked（不提供跳过开关）。');
   }
+  prepared.harness.assertDescriptorCurrent?.();
+  if (prepared.harness.binaryRealPath) {
+    const path = realpathSync(prepared.harness.binaryRealPath);
+    const fingerprint = computeBinaryFingerprint({ binaryRealPath: path,
+      contentSha256: createHash('sha256').update(readFileSync(path)).digest('hex') });
+    if (path !== prepared.harness.binaryRealPath || fingerprint !== prepared.binaryFingerprint) {
+      throw new Error('隔离失败关闭：准备后可执行文件身份变化，须重新验证。');
+    }
+  }
   assertCapabilityAllowsLaunch(prepared.harness.capabilityStore, prepared.capabilityKey);
   // 注入 spawn 与 spawnCli 重载并集在此收窄为单一通用签名（stdio 恒显式传入）。
   const spawn = (prepared.harness.spawn ?? spawnCli) as (
@@ -505,7 +528,7 @@ export function launchIsolated(
   // Node 的 signal 只杀直接子进程（wrapper），会让 CLI/后端变孤儿逃逸收尾。
   return spawn(
     sandboxExec,
-    ['-p', prepared.profile, '--', prepared.context.command, ...args],
+    ['-p', prepared.profile, '--', prepared.harness.binaryRealPath ?? prepared.context.command, ...args],
     {
       cwd: prepared.context.cwd,
       env: prepared.env,
@@ -682,25 +705,29 @@ export async function prepareIsolation(options: {
   //    随机 scratch——同一写策略（none 或同一授权记录的精确范围）跨任务可
   //    命中同一证据；不同授权/宽窄互不匹配。无证据 ⇒ 此处抛错，用户工作区
   //    不留任何痕迹。
-  //    A03：harness 提供引擎二进制真实路径 + --version 输出时，指纹纳入身份
-  //    （只给其一属调用方错误，失败关闭；都不给 = 沿用无指纹身份，证据文件
-  //    中一旦存在带指纹的键，无指纹身份自然查不到，不会 fail-open）。
+  //    A03（166 号返工）：harness 提供引擎二进制真实路径时，读取**文件内容**
+  //    sha256 计算指纹纳入身份（canary 与生产共用同一函数与维度）；不提供 =
+  //    沿用无指纹身份（仅测试 fixture；证据文件中一旦存在带指纹的键，无指纹
+  //    身份自然查不到，不会 fail-open）。内容读取失败 ⇒ 失败关闭。
   let binaryFingerprint: string | undefined;
-  if (harness.binaryRealPath !== undefined || harness.binaryVersion !== undefined) {
-    if (!harness.binaryRealPath || !harness.binaryVersion) {
-      throw new Error('隔离失败关闭：binaryRealPath 与 binaryVersion 必须同时提供（A03 能力身份校验）。');
+  if (harness.binaryRealPath !== undefined) {
+    if (!harness.binaryRealPath) {
+      throw new Error('隔离失败关闭：binaryRealPath 不能为空（A03 能力身份校验）。');
     }
+    const contentSha256 = await computeBinaryContentSha256(harness.binaryRealPath);
     binaryFingerprint = computeBinaryFingerprint({
       binaryRealPath: harness.binaryRealPath,
-      versionOutput: harness.binaryVersion,
+      contentSha256,
     });
   }
   const capabilityKey = computeIsolationCapabilityIdentity({
     command: input.command,
     purpose: input.purpose,
     protectedRootsVersion: protectedRoots.version,
+    protectedRootsDigest: protectedRootsDigest(protectedRoots.roots),
     writePolicy: describeWritePolicy(input),
     platform: harness.platform ?? process.platform,
+    ...(harness.executionDescriptorDigest ? { executionDescriptorDigest: harness.executionDescriptorDigest } : {}),
     ...(binaryFingerprint !== undefined ? { binaryFingerprint } : {}),
   });
   assertCapabilityAllowsLaunch(harness.capabilityStore, capabilityKey);
@@ -784,6 +811,7 @@ export async function prepareIsolation(options: {
       profile,
       env,
       capabilityKey,
+      ...(binaryFingerprint ? { binaryFingerprint } : {}),
       ...(scratchRelative ? { scratchRelative } : {}),
       finalize: async () => {
         if (finalized || input.purpose !== 'task' || !baseline) return undefined;
@@ -823,7 +851,7 @@ export async function prepareIsolation(options: {
  * 零代码写）；授权 ⇒ 绑定授权记录 id + 其精确相对允许路径摘要。带路径却缺
  * 授权 id 属调用方错误，失败关闭。
  */
-function describeWritePolicy(input: IsolationPrepareInput): string {
+export function describeWritePolicy(input: IsolationPrepareInput): string {
   if (!input.authorizationId) {
     if (input.allowedRelatives && input.allowedRelatives.length > 0) {
       throw new Error('隔离失败关闭：携带允许路径却缺少授权记录 id（allowedRelatives 必须来自已核验的编码授权）。');
@@ -852,33 +880,134 @@ export function assertTaskDiffClean(diff: WorkspaceBaselineDiff | undefined): vo
 // ---- 生产 preparer（默认 = 全部 blocked 的失败关闭实现） ---------------------------
 
 /**
+ * 在 PATH 上解析引擎命令的词面路径（只做文件系统查找，不 spawn——版本/参数
+ * 面探测必须走受控环境，不得为身份解析裸执行引擎）。解析不到 ⇒ 失败关闭：
+ * binaryRealPath 是能力身份的必填维度，生产启动不允许无指纹降级。
+ */
+export function resolveExecutableLiteralPath(
+  command: string,
+  env: NodeJS.ProcessEnv,
+  cwd: string = process.cwd(),
+): string {
+  if (isAbsolute(command)) {
+    if (!existsSync(command)) {
+      throw new Error(`隔离失败关闭：引擎命令 ${command} 不存在（binaryRealPath 为能力身份必填维度）。`);
+    }
+    accessSync(command, constants.X_OK);
+    if (!statSync(command).isFile()) throw new Error('引擎命令不是可执行文件');
+    return command;
+  }
+  for (const dir of (env.PATH ?? '').split(':')) {
+    if (!dir) continue;
+    const candidate = resolve(cwd, dir, command);
+    try {
+      accessSync(candidate, constants.X_OK);
+      if (statSync(candidate).isFile()) return candidate;
+    } catch { /* Continue searching later PATH entries. */ }
+  }
+  throw new Error(
+    `隔离失败关闭：无法在 PATH 上解析引擎命令 ${command}（binaryRealPath 为能力身份必填维度；命令缺失或 PATH 配置错误）。`,
+  );
+}
+
+/**
  * 生产隔离 preparer：受保护根清单 + 只读能力库（G-W6b-CANARY 未执行 ⇒ 库为空
  * ⇒ 一切真实 CLI 启动在能力核验处失败关闭）。任何生产入口不得绕过它提供
  * 「宽松」实现；测试 fixture 自行构造 harness（见 tests/isolation-*.test.ts）。
+ *
+ * A03（166 号返工）：
+ * - **受保护根每次调用重读**（受信清单的权威代次 = 文件内容；运行期替换
+ *   根集合/版本，下一次启动立即生效，不再永久缓存旧清单）；
+ * - **binaryRealPath 必填**：每次调用从 envBase.PATH 解析引擎命令的真实路径
+ *   （PATH 换绑 ⇒ 路径变化 ⇒ 指纹变化 ⇒ 旧证据失效），prepare 内再读文件
+ *   内容 sha256 入身份（同路径替换内容 ⇒ 旧证据失效）。
  */
 export function createProductionIsolationPreparer(overrides: {
   capabilityFilePath?: string;
   protectedRootsFilePath?: string;
   baselineStoreDir?: string;
+  /** PATH/环境来源（默认 process.env；测试注入受控 PATH）。 */
+  envBase?: NodeJS.ProcessEnv;
 } = {}): IsolationSupplier {
   // 惰性加载：坏文件在首次真实启动时失败关闭，而非 import 时崩溃。
   let capabilityStore: IsolationCapabilityReader | undefined;
-  let protectedRoots: IsolationProtectedRoots | undefined;
   return async (input) => {
-    if (!protectedRoots) protectedRoots = loadProtectedRoots(overrides.protectedRootsFilePath);
+    // 根清单不缓存：每次启动重读（realpath 校验由 loadProtectedRoots 负责）。
+    const rootsFile = overrides.protectedRootsFilePath ?? (overrides.capabilityFilePath ? undefined : join(CONTROL_ROOT, 'isolation-protected-roots.json'));
+    if (!overrides.capabilityFilePath && rootsFile) {
+      try { readProtectedJson(rootsFile); }
+      catch (error) { throw new Error(`隔离失败关闭：正式受保护根清单缺失或不可核验（${(error as Error).message}）`); }
+    }
+    const protectedRoots = loadProtectedRoots(rootsFile);
     if (!capabilityStore) {
       const { JsonIsolationCapabilityStore } = await import('./isolation-capability.js');
-      capabilityStore = new JsonIsolationCapabilityStore(
+      capabilityStore = overrides.capabilityFilePath ? new JsonIsolationCapabilityStore(
         overrides.capabilityFilePath ?? join('data', 'isolation-capability.json'),
-      );
+      ) : protectedCapabilityReader();
+    }
+    const envBase = overrides.envBase ?? process.env;
+    const binaryRealPath = realpathSync(
+      resolveExecutableLiteralPath(input.command, envBase, realpathSync(input.cwd)),
+    );
+    const formalDescriptor = overrides.capabilityFilePath ? undefined : ExecutionDescriptorSchema.parse(
+      readProtectedJson(join(CONTROL_ROOT, 'execution-descriptor.json')),
+    );
+    if (formalDescriptor) {
+      assertExecutionDescriptorCurrent(formalDescriptor);
+      if (formalDescriptor.audience !== 'production' || formalDescriptor.binary !== binaryRealPath || formalDescriptor.command !== input.command
+        || formalDescriptor.protectedRootsVersion !== protectedRoots.version
+        || formalDescriptor.requestedModel !== (input.modelSelection?.model ?? null)
+        || formalDescriptor.requestedEffort !== (input.modelSelection?.reasoningEffort ?? null)
+        || formalDescriptor.cliMode !== (input.cliMode ?? input.purpose)
+        || formalDescriptor.purpose !== input.purpose || formalDescriptor.writePolicy !== describeWritePolicy(input)
+        || protectedRootsDigest(formalDescriptor.roots) !== protectedRootsDigest(protectedRoots.roots)
+        || !formalDescriptor.roots.includes(CONTROL_ROOT)
+        || !formalDescriptor.roots.includes(realpathSync(join(process.cwd(), 'data')))) throw new Error('Formal execution descriptor scope mismatch');
     }
     return prepareIsolation({
       input,
-      harness: { capabilityStore },
+      harness: { capabilityStore, envBase, binaryRealPath,
+        ...(formalDescriptor ? { executionDescriptorDigest: descriptorDigest(formalDescriptor) } : {}),
+        assertDescriptorCurrent: () => {
+          if (formalDescriptor) {
+            const current = ExecutionDescriptorSchema.parse(readProtectedJson(join(CONTROL_ROOT, 'execution-descriptor.json')));
+            assertExecutionDescriptorCurrent(current);
+            if (descriptorDigest(current) !== descriptorDigest(formalDescriptor)) throw new Error('Formal execution descriptor changed');
+          }
+          if (!overrides.capabilityFilePath && rootsFile) readProtectedJson(rootsFile);
+          const latest = loadProtectedRoots(rootsFile);
+          if (latest.version !== protectedRoots.version || protectedRootsDigest(latest.roots) !== protectedRootsDigest(protectedRoots.roots)) {
+            throw new Error('隔离失败关闭：准备后受保护根清单变化。');
+          }
+        },
+      },
       protectedRoots,
       // 生产默认持久化基线（119 号 P2）；持久化失败在 prepare 内失败关闭。
       baselineStoreDir: overrides.baselineStoreDir ?? join('data', 'task-baselines'),
     });
+  };
+}
+
+/** Explicit local controller harness. Its signed local audience is rejected by the formal reader. */
+export function createLocalDescriptorIsolationPreparer(options: {
+  descriptor: () => ExecutionDescriptor; capabilityStore: IsolationCapabilityReader;
+  baselineStoreDir: string; envBase?: NodeJS.ProcessEnv;
+}): IsolationSupplier {
+  return async input => {
+    const descriptor = ExecutionDescriptorSchema.parse(options.descriptor());
+    const check = () => {
+      assertExecutionDescriptorCurrent(descriptor);
+      if (descriptor.audience !== 'local-test' || descriptorDigest(options.descriptor()) !== descriptorDigest(descriptor)
+        || descriptor.command !== input.command || descriptor.binary !== realpathSync(resolveExecutableLiteralPath(input.command, options.envBase ?? process.env, realpathSync(input.cwd)))
+        || descriptor.purpose !== input.purpose || descriptor.cliMode !== (input.cliMode ?? input.purpose)
+        || descriptor.requestedModel !== (input.modelSelection?.model ?? null)
+        || descriptor.requestedEffort !== (input.modelSelection?.reasoningEffort ?? null)
+        || descriptor.writePolicy !== describeWritePolicy(input)) throw new Error('Local execution descriptor scope changed');
+    };
+    check();
+    return prepareIsolation({ input, protectedRoots: { version: descriptor.protectedRootsVersion, roots: descriptor.roots },
+      baselineStoreDir: options.baselineStoreDir, harness: { capabilityStore: options.capabilityStore,
+        binaryRealPath: descriptor.binary, envBase: options.envBase, executionDescriptorDigest: descriptorDigest(descriptor), assertDescriptorCurrent: check } });
   };
 }
 
@@ -890,6 +1019,19 @@ export interface SessionScratchBinding {
   /** 建立绑定的任务键（topic taskId）；跨任务引用即失效。 */
   taskKey: string;
   at: number;
+  /**
+   * A07（166 号返工）：绑定的工作区 realpath 身份。恢复时必须与当前工作区
+   * realpath 一致——不能仅凭「同名相对目录再次出现」就恢复授权关联（删后
+   * 同名重建/换工作区后另建同名目录都不是同一个 scratch）。缺省的旧记录
+   * 无法核验身份 ⇒ 恢复时丢弃（安全拒绝）。
+   */
+  workspaceRealpath?: string;
+  /**
+   * A07（166 号返工）：scratch 目录身份（`dev:ino`）。同名重建的目录 inode
+   * 不同 ⇒ 不是同一个 scratch ⇒ 恢复时丢弃。与 workspaceRealpath 一样，
+   * 缺省的旧记录不可核验 ⇒ 丢弃。
+   */
+  scratchIdentity?: string;
 }
 
 export const SESSION_SCRATCH_MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -905,6 +1047,8 @@ export function requireSessionScratchBinding(options: {
   taskKey: string;
   now?: () => number;
   maxAgeMs?: number;
+  /** 提供时核对工作区身份（166 号返工）：绑定必须属于当前工作区 realpath。 */
+  workspaceRealpath?: string;
 }): string {
   const now = (options.now ?? Date.now)();
   const entry = options.scratches.get(options.sessionId);
@@ -913,6 +1057,10 @@ export function requireSessionScratchBinding(options: {
   }
   if (entry.taskKey !== options.taskKey) {
     throw new Error(`本地制品提交失败关闭：scratch 绑定属于任务 ${entry.taskKey}，当前任务为 ${options.taskKey}（跨任务引用被拒）。`);
+  }
+  if (options.workspaceRealpath !== undefined
+    && entry.workspaceRealpath !== options.workspaceRealpath) {
+    throw new Error('本地制品提交失败关闭：scratch 绑定的工作区身份与当前工作区不一致（换工作区/同名目录不可继承授权）。');
   }
   if (now - entry.at > (options.maxAgeMs ?? SESSION_SCRATCH_MAX_AGE_MS)) {
     throw new Error('本地制品提交失败关闭：scratch 绑定已过期，须重新执行隔离任务后提交。');
@@ -926,14 +1074,20 @@ const SessionScratchBindingSchema = z.object({
   relative: z.string().min(1),
   taskKey: z.string().min(1),
   at: z.number().int().nonnegative(),
+  workspaceRealpath: z.string().min(1).optional(),
+  scratchIdentity: z.string().min(1).optional(),
 }).strict();
 
 /**
  * A07：可持久化的会话 scratch 绑定表（Map 子类，runtime 的
  * `Map<string, SessionScratchBinding>` 类型不变；cli-execution 的 set 路径
- * 自动落盘）。set/delete/clear 后 tmp+rename 原子写（writeJsonState）；
- * 持久化失败抛错——静默丢持久化会让「重启后绑定仍在」变成谎言，宁可让本次
- * 任务失败（制品提交门本就失败关闭）。
+ * 自动落盘）。
+ *
+ * A07（166 号返工）：set/delete/clear 改为**先落盘后提交内存**——按「当前
+ * 内容 + 待提交变更」构造下一状态，writeJsonState 成功后才改 Map；持久化
+ * 失败抛错且内存保持与磁盘一致（旧实现先改 Map 再落盘，失败后留下「内存有
+ * 绑定、磁盘没有」的半状态，后续提交仍会用到未落盘的绑定）。构造仍以当前
+ * 内容落盘（恢复路径用核验后的集合覆盖旧文件）。
  */
 export class SessionScratchBindingStore extends Map<string, SessionScratchBinding> {
   constructor(
@@ -943,31 +1097,40 @@ export class SessionScratchBindingStore extends Map<string, SessionScratchBindin
     super(initial ? [...initial] : []);
     // A07：构造即以当前内容落盘（恢复路径用核验后的集合覆盖旧文件，被丢弃
     // 的死条目不再每次启动重复核验）。无 filePath（纯内存）不写盘。
-    if (this.filePath) this.persist();
+    if (this.filePath) this.persistCurrent();
   }
 
   override set(key: string, value: SessionScratchBinding): this {
+    const next = new Map(this);
+    next.set(key, value);
+    this.persistEntries(next); // 失败抛错，内存未动。
     super.set(key, value);
-    this.persist();
     return this;
   }
 
   override delete(key: string): boolean {
-    const removed = super.delete(key);
-    if (removed) this.persist();
-    return removed;
+    if (!this.has(key)) return false;
+    const next = new Map(this);
+    next.delete(key);
+    this.persistEntries(next);
+    return super.delete(key);
   }
 
   override clear(): void {
+    if (this.size === 0) return;
+    this.persistEntries(new Map());
     super.clear();
-    this.persist();
   }
 
-  private persist(): void {
+  private persistCurrent(): void {
+    this.persistEntries(this);
+  }
+
+  private persistEntries(entries: ReadonlyMap<string, SessionScratchBinding>): void {
     if (!this.filePath) return;
-    const entries: Record<string, SessionScratchBinding> = {};
-    for (const [key, value] of this) entries[key] = value;
-    writeJsonState(this.filePath, { _v: 1, entries });
+    const snapshot: Record<string, SessionScratchBinding> = {};
+    for (const [key, value] of entries) snapshot[key] = value;
+    writeJsonState(this.filePath, { _v: 1, entries: snapshot });
   }
 }
 
@@ -976,6 +1139,9 @@ export class SessionScratchBindingStore extends Map<string, SessionScratchBindin
  * 不冒充可用）：
  * - relative 形如工作区相对 POSIX 路径（拒绝绝对路径/`..` 段）；
  * - 会话的工作区 realpath 仍存在；
+ * - **工作区身份一致（166 号返工）**：记录里的 workspaceRealpath 必须与当前
+ *   工作区 realpath 一致；缺该字段的旧记录无法核验身份 ⇒ 丢弃（不能仅凭
+ *   同名相对目录再次出现就恢复授权关联）；
  * - scratch 目录真实存在且 realpath 解析后仍落在工作区内、相对路径一致
  *   （目录被删/被挪/父链符号链接逃逸 ⇒ 丢弃）；
  * - taskKey 非空（schema 保证），提供 taskKeyOf 时还须与该会话最近任务一致
@@ -1015,6 +1181,8 @@ export function loadSessionScratchBindings(options: {
       } catch {
         continue;
       }
+      // 工作区身份核对（166 号返工）：旧记录无 workspaceRealpath ⇒ 不可核验 ⇒ 丢弃。
+      if (entry.workspaceRealpath === undefined || entry.workspaceRealpath !== workspaceReal) continue;
       // 存在性 + 解析一致性：目录被删/被挪/符号链接逃逸都解析不回同一相对路径。
       const scratchAbsolute = join(workspaceReal, entry.relative);
       if (!existsSync(scratchAbsolute)) continue;
@@ -1026,13 +1194,24 @@ export function loadSessionScratchBindings(options: {
       }
       const resolvedRelative = relative(workspaceReal, scratchReal).split(sep).join('/');
       if (resolvedRelative !== entry.relative) continue;
+      // 目录身份核对（166 号返工）：同名重建的目录 inode 不同 ⇒ 不是同一个
+      // scratch ⇒ 丢弃（不能仅凭同名目录再次出现就恢复授权关联）。
+      const scratchStat = statSync(scratchReal);
+      const scratchIdentity = `${scratchStat.dev}:${scratchStat.ino}`;
+      if (entry.scratchIdentity === undefined || entry.scratchIdentity !== scratchIdentity) continue;
       // taskKey 一致性：最近任务已变化（或记录被清理后显式不匹配）⇒ 丢弃。
       const currentTaskKey = options.taskKeyOf?.(sessionId);
       if (currentTaskKey !== undefined && currentTaskKey !== entry.taskKey) continue;
       // 有效期：过期与异常超前的时间戳都不可信。
       if (entry.at > now + 60_000) continue;
       if (now - entry.at > maxAgeMs) continue;
-      restored.set(sessionId, { relative: entry.relative, taskKey: entry.taskKey, at: entry.at });
+      restored.set(sessionId, {
+        relative: entry.relative,
+        taskKey: entry.taskKey,
+        at: entry.at,
+        workspaceRealpath: entry.workspaceRealpath,
+        scratchIdentity: entry.scratchIdentity,
+      });
     }
   }
   // 用核验后的集合建库并把「丢弃」落盘（下次启动不再重复核验死条目）。

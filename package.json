@@ -15,7 +15,8 @@
     "probe:cli": "tsx src/probe-cli.ts",
     "probe:tool": "tsx src/probe-app-tool.ts",
     "probe:zcode-adapter": "tsx src/probe-zcode-adapter.ts",
-    "typecheck": "tsc -p tsconfig.tests.json"
+    "typecheck": "tsc -p tsconfig.tests.json",
+    "typecheck:probe": "tsc -p .agent-os/probe/tsconfig.json"
   },
   "engines": {
     "node": ">=22"

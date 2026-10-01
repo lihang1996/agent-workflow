@@ -101,6 +101,7 @@ async function listClaudeSessions(
   const prepared = await options.isolation({
     taskId: `sessions-${options.cwd}`,
     purpose: 'session-list',
+    cliMode: 'session-list',
     command: options.adapter.command,
     cwd: options.cwd,
   });
@@ -144,6 +145,7 @@ async function listCodexSessions(
   const prepared = await options.isolation({
     taskId: `sessions-${options.cwd}`,
     purpose: 'session-list',
+    cliMode: 'session-list',
     command: options.adapter.command,
     cwd: options.cwd,
   });

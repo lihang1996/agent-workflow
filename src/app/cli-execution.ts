@@ -1,7 +1,7 @@
 import { runCli } from "../cli/runner.js";
 import type { CliAdapter, CliAttachment } from "../cli/types.js";
 import type { ModelSelection } from "../core/model-selection.js";
-import { realpathSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import {
   createProductionIsolationPreparer,
   requireSessionScratchBinding,
@@ -58,6 +58,10 @@ export function executeCli(
  * 路径记录到 runtime.sessionScratches，供制品创建（PRD/tickets/architecture）
  * 的 scratch 子树约束使用。生产默认 supplier（能力库为空）在 prepare 处失败
  * 关闭，不会记录任何东西。
+ *
+ * A07（166 号返工）：绑定携带**工作区 realpath 身份**——恢复与提交时核对，
+ * 不能仅凭同名相对目录再次出现就恢复授权关联。set 失败（如落盘异常）会抛
+ * 错：store 先落盘后提交内存，不会给后续提交留下未落盘的绑定。
  */
 export function createSessionIsolationSupplier(
   runtime: AppRuntime,
@@ -69,10 +73,13 @@ export function createSessionIsolationSupplier(
     // 119 号 P1-4：绑定非可选——只有**成功 prepare** 的任务才写绑定（taskKey
     // + 时间戳）；失败路径在 prepare 内已被清理，不会到达这里。
     if (sessionId && prepared.scratchRelative) {
+      const scratchStat = statSync(prepared.context.scratchDir);
       runtime.sessionScratches.set(sessionId, {
         relative: prepared.scratchRelative,
         taskKey: input.taskId,
         at: Date.now(),
+        workspaceRealpath: realpathSync(input.cwd),
+        scratchIdentity: `${scratchStat.dev}:${scratchStat.ino}`,
       });
     }
     return prepared;
@@ -82,16 +89,19 @@ export function createSessionIsolationSupplier(
 /**
  * 制品提交门（119 号 P1-4）：本地 PRD/架构提交必须持有当前任务的 scratch
  * 绑定；缺绑定/跨任务/过期 ⇒ 失败关闭（不静默跳过）。
+ * A07（166 号返工）：同时核对工作区身份（绑定必须属于当前工作区 realpath）。
  */
 export function requireScratchRootForSubmission(
   runtime: AppRuntime,
   sessionId: string,
   taskKey: string,
+  workspaceDir?: string,
 ): string {
   return requireSessionScratchBinding({
     scratches: runtime.sessionScratches,
     sessionId,
     taskKey,
+    ...(workspaceDir !== undefined ? { workspaceRealpath: realpathSync(workspaceDir) } : {}),
   });
 }
 
@@ -101,41 +111,8 @@ export function requireScratchRootForSubmission(
  * 入口当前都**不会创建**该记录——跨 bot 交接的受信签发通道尚未设计，因此
  * 编码路径整体保持 blocked；本结构仅供未来显式入口与服务端核验使用。
  */
-export interface CodingIntentHandoff {
-  authorizationId: string;
-  taskId: string;
-  sessionId: string;
-  sessionVersion: number;
-  botId: string;
-  ownerOpenId: string;
-  ownerUnionId?: string;
-  consumedAt?: string;
-}
-
-export class CodingIntentHandoffStore {
-  private readonly handoffs = new Map<string, CodingIntentHandoff>();
-
-  /** 受信入口显式签发（生产未接线：编码路径 blocked）。 */
-  issue(handoff: CodingIntentHandoff): void {
-    if (this.handoffs.has(handoff.authorizationId) && !this.handoffs.get(handoff.authorizationId)!.consumedAt) {
-      throw new Error(`授权 ${handoff.authorizationId} 已有未消费的一次性交接，拒绝重复签发。`);
-    }
-    this.handoffs.set(handoff.authorizationId, { ...handoff });
-  }
-
-  get(authorizationId: string): CodingIntentHandoff | undefined {
-    const found = this.handoffs.get(authorizationId);
-    return found ? { ...found } : undefined;
-  }
-
-  consume(authorizationId: string, at: string): CodingIntentHandoff | undefined {
-    const found = this.handoffs.get(authorizationId);
-    if (!found || found.consumedAt) return undefined;
-    const consumed = { ...found, consumedAt: at };
-    this.handoffs.set(authorizationId, consumed);
-    return consumed;
-  }
-}
+export { CodingIntentHandoffStore, type CodingIntentHandoff } from '../core/coding-handoff.js';
+import { CodingIntentHandoffStore } from '../core/coding-handoff.js';
 
 /**
  * 显式按 ID 解析编码授权（138 号 P0-1 替代旧 resolveActiveCodingAuthorization）：
@@ -150,7 +127,7 @@ export class CodingIntentHandoffStore {
  */
 export async function resolveCodingAuthorizationById(options: {
   runtime: AppRuntime;
-  handoffs: Pick<CodingIntentHandoffStore, 'get' | 'consume'>;
+  handoffs: Pick<CodingIntentHandoffStore, 'get' | 'reserve'>;
   authorizationId: string;
   binding: ExecuteCliTaskBinding;
   workspaceDir: string;
@@ -167,8 +144,8 @@ export async function resolveCodingAuthorizationById(options: {
   if (!handoff) {
     throw new Error(`授权 ${authorizationId} 没有一次性交接记录：服务端未把该授权绑定到本次执行，编码路径失败关闭（不能从授权列表猜测）。`);
   }
-  if (handoff.consumedAt) {
-    throw new Error(`授权 ${authorizationId} 的一次性交接已被消费（${handoff.consumedAt}），不能复用。`);
+  if (handoff.consumedAt || handoff.state !== 'issued') {
+    throw new Error(`授权 ${authorizationId} 的一次性交接已被预留/消费（${handoff.state}），不能复用。`);
   }
   // 绑定逐一核对：taskId / agent-os session.id+version / botId / 发起人身份。
   if (handoff.taskId !== binding.taskId
@@ -218,9 +195,9 @@ export async function resolveCodingAuthorizationById(options: {
     || [...finalRecord.allowedPaths].sort().join('\0') !== allowedSnapshot) {
     throw new Error(`授权 ${authorizationId} 在 G3 核验后与交接绑定的记录不一致，编码路径失败关闭。`);
   }
-  const consumed = handoffs.consume(authorizationId, (options.now ?? (() => new Date()))().toISOString());
+  const consumed = handoffs.reserve(authorizationId, (options.now ?? (() => new Date()))().toISOString());
   if (!consumed) {
-    throw new Error(`授权 ${authorizationId} 的一次性交接消费失败（并发使用），编码路径失败关闭。`);
+    throw new Error(`授权 ${authorizationId} 的一次性交接预留失败（并发使用），编码路径失败关闭。`);
   }
   return { id: authorizationId, allowedRelatives: [...finalRecord.allowedPaths] };
 }

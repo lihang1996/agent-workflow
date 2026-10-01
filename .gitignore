@@ -1,10 +1,13 @@
 node_modules/
 dist/
 .env
+.env.*
+!.env.example
 config/bots.json
 data/
 *.log
 work.txt
+.agent-os/probe/runs/
 
 # Local IDE/cache and one-off editorial outputs
 .idea/

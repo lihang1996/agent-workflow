@@ -364,6 +364,7 @@ export async function compactCliSession(
   const prepared = await options.isolation({
     taskId: `compact-${options.sessionId}`,
     purpose: 'task',
+    cliMode: 'compact',
     command: plan.command,
     cwd: options.cwd,
   });

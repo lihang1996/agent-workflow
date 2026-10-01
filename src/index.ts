@@ -101,7 +101,18 @@ const sessionScratches = loadSessionScratchBindings({
   resolveWorkspaceDir: (sessionId) => sessions.get(sessionId)?.workspaceDir,
   taskKeyOf: (sessionId) => taskExecutions.forSession(sessionId)?.id,
 });
+const { createProtectedSourceContexts } = await import('./core/source-context-host.js');
+const { CodingIntentHandoffStore } = await import('./core/coding-handoff.js');
+const { CONTROL_ROOT, readProtectedJson } = await import('./core/protected-control.js');
 const runtime: AppRuntime = {
+  codingHandoffs: new CodingIntentHandoffStore(join('data', 'coding-handoffs.json')),
+  authorizeCodingOperator: (principalId, botId) => {
+    try {
+      const policy = readProtectedJson(join(CONTROL_ROOT, 'coding-principals.json')) as Record<string, unknown>;
+      return Array.isArray(policy[principalId]) && (policy[principalId] as unknown[]).includes(botId);
+    } catch { return false; }
+  },
+  sourceContexts: createProtectedSourceContexts(),
   taskExecutions,
   deliveries: new DeliveryOutbox((id) => botRuntimes.get(id)?.bot, join('data', 'result-deliveries.json'), 100, (operation) => resolveResultCard(runtime, operation)),
   sessions,

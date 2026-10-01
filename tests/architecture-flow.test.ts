@@ -227,8 +227,8 @@ test('architecture flow binds upstream from the server-issued handoff and inheri
   const expected = await computeArchitectureArtifactDigest(f.devWorkspace, archRequest);
   assert.equal(arch.content_digest, expected.digest);
   assert.deepEqual(arch.content_sources, [{ kind: 'local', path: '.fx/arch/design.md' }]);
-  // 交接单次使用：重复消费失败关闭。
-  await assert.rejects(() => createArchitecture(f), /无效|已使用/);
+  // The same operation is replayable, while a different task cannot consume it.
+  assert.equal((await createArchitecture(f)).token, arch.token);
 });
 
 test('unknown or wrong-owner handoff tokens fail closed (zero candidates, no guessing)', async (t) => {
@@ -281,11 +281,11 @@ test('CLI self-reported upstream fields are rejected by the tool schema', () => 
   assert.equal(findArchitectureRequest([{ toolName: 'request_spec_approval', input: base }]), undefined);
 });
 
-test('concurrent consumption of one handoff: single winner, loser flow is voided (not rolled back)', async (t) => {
+test('concurrent consumption of one handoff: single winner; loser rejected before any flow is created (A07 166 号返工)', async (t) => {
   const f = await fixture(t);
-  // 两个并发任务（不同 taskId，模拟两个会话）同时用同一交接码提交：都通过
-  // 交接解析（await 交错），但交接只允许消费一次——赢家得到 pending flow，
-  // 输家的 flow 被作废（invalidated，非事务回滚）。
+  // 两个并发任务（不同 taskId，模拟两个会话）同时用同一交接码提交：消费先行
+  //（open→consumed 原子落盘后才创建 flow）——恰一个赢家得到 pending flow；
+  // 输家在消费处失败关闭，**不创建任何 flow**（旧顺序会留下被作废的输家 flow）。
   const createAs = (taskId: string) => createBoundArchitectureFlow({
     flows: f.store, handoffs: f.handoffs, workspaceDir: f.devWorkspace,
     scratchRoot: '.fx',
@@ -302,16 +302,38 @@ test('concurrent consumption of one handoff: single winner, loser flow is voided
   const rejected = results.filter((r) => r.status === 'rejected');
   assert.equal(fulfilled.length, 1);
   assert.equal(rejected.length, 1);
-  assert.match((rejected[0] as PromiseRejectedResult).reason.message, /失效/);
+  assert.match((rejected[0] as PromiseRejectedResult).reason.message, /交接码无效/);
   const winner = (fulfilled[0] as PromiseFulfilledResult<ProductSpecFlow>).value;
   const flows = f.store.listByUpstreamPrd(f.prd.token);
-  assert.equal(flows.length, 2);
+  // 同一交接码最多一个有效 flow：只有赢家的 pending flow，无 invalidated 残留。
+  assert.equal(flows.length, 1);
+  assert.equal(flows[0]!.token, winner.token);
   assert.equal(f.store.get(winner.token)?.status, 'pending');
-  const voided = flows.find((flow) => flow.token !== winner.token)!;
-  assert.equal(voided.status, 'invalidated');
-  assert.match(voided.invalidation_reason ?? '', /作废/);
-  // 交接已消费：后续不能再使用。
+  // 交接已消费且 flow token 已回绑（审计）。
   assert.equal(f.handoffs.get(f.handoffToken)?.status, 'consumed');
+  assert.equal(f.handoffs.get(f.handoffToken)?.flowToken, winner.token);
+});
+
+test('consume-first survives a crash between consumption and flow creation: retry cannot create a second flow (A07 166 号返工)', async (t) => {
+  const f = await fixture(t);
+  // 直接消费交接（模拟「消费已落盘、flow 创建前进程崩溃」的中间态）。
+  const consumed = f.handoffs.consume(f.handoffToken, { taskId: 'task-dev-9', ownerOpenId: 'owner-open' });
+  assert.ok(consumed);
+  // 崩溃重启：新 store 实例从磁盘恢复（消费状态仍在）。
+  const dir = mkdtempSync(join(tmpdir(), 'agent-os-archflow-crash-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  writeFileSync(join(dir, 'handoffs.json'), JSON.stringify([f.handoffs.get(f.handoffToken)], null, 2));
+  const reopened = new ArchitectureHandoffStore(join(dir, 'handoffs.json'));
+  // 同码重试：交接已消费 ⇒ 失败关闭，不产生第二份 flow。
+  await assert.rejects(() => createBoundArchitectureFlow({
+    flows: f.store, handoffs: reopened, workspaceDir: f.devWorkspace,
+    scratchRoot: '.fx',
+    resolvePrdWorkspaceDir: () => f.prdWorkspace,
+    identity: { ...devIdentity, taskId: 'task-dev-retry' },
+    request: archRequest,
+    handoffToken: f.handoffToken,
+  }), /交接码无效/);
+  assert.equal(f.store.listByUpstreamPrd(f.prd.token).filter((flow) => flow.status === 'pending').length, 0);
 });
 
 // ---- 架构审批：上游门禁 + G1 + 与 PRD 确认分离 --------------------------------
@@ -595,4 +617,56 @@ test('developer prompt includes architecture-stage rules only for stage-granted 
   );
   assert.ok(!plainPrompt.includes('架构设计交付规则'));
   assert.ok(!plainPrompt.includes('产品方案交付规则'));
+});
+
+
+test('reserved architecture creation retries after failed persistence and restart without burning the handoff', async (t) => {
+  const f = await fixture(t);
+  const dir = temp(t);
+  const handoffPath = join(dir, 'handoffs.json');
+  const flowsPath = join(dir, 'flows.json');
+  writeFileSync(handoffPath, JSON.stringify([f.handoffs.get(f.handoffToken)]));
+  writeFileSync(flowsPath, JSON.stringify([f.prd]));
+  let handoffs = new ArchitectureHandoffStore(handoffPath);
+  let flows = new JsonProductSpecFlowStore(flowsPath);
+  const args = () => ({ flows, handoffs, workspaceDir: f.devWorkspace, scratchRoot: '.fx',
+    resolvePrdWorkspaceDir: () => f.prdWorkspace, identity: devIdentity,
+    request: archRequest, handoffToken: f.handoffToken });
+  const original = flows.createWithToken.bind(flows);
+  flows.createWithToken = () => { throw new Error('injected flow write failure'); };
+  await assert.rejects(() => createBoundArchitectureFlow(args()), /injected flow/);
+  assert.equal(handoffs.get(f.handoffToken)?.status, 'reserved');
+  const reservedToken = handoffs.get(f.handoffToken)?.flowToken;
+  flows.createWithToken = original;
+  // Recover from both durable files as a fresh process would.
+  handoffs = new ArchitectureHandoffStore(handoffPath);
+  flows = new JsonProductSpecFlowStore(flowsPath);
+  const first = await createBoundArchitectureFlow(args());
+  assert.equal(first.token, reservedToken);
+  const retry = await createBoundArchitectureFlow(args());
+  assert.equal(retry.token, first.token);
+  assert.equal(flows.listByUpstreamPrd(f.prd.token).length, 1);
+  assert.equal(handoffs.get(f.handoffToken)?.status, 'consumed');
+});
+
+test('flow committed but handoff final write failed resumes the same persisted flow', async (t) => {
+  const f = await fixture(t);
+  const dir = temp(t);
+  const handoffPath = join(dir, 'handoffs.json');
+  const flowsPath = join(dir, 'flows.json');
+  writeFileSync(handoffPath, JSON.stringify([f.handoffs.get(f.handoffToken)]));
+  writeFileSync(flowsPath, JSON.stringify([f.prd]));
+  let handoffs = new ArchitectureHandoffStore(handoffPath);
+  let flows = new JsonProductSpecFlowStore(flowsPath);
+  const args = () => ({ flows, handoffs, workspaceDir: f.devWorkspace, scratchRoot: '.fx',
+    resolvePrdWorkspaceDir: () => f.prdWorkspace, identity: devIdentity,
+    request: archRequest, handoffToken: f.handoffToken });
+  handoffs.markFlowCreated = () => { throw new Error('injected finalize failure'); };
+  await assert.rejects(() => createBoundArchitectureFlow(args()), /injected finalize/);
+  const token = flows.listByUpstreamPrd(f.prd.token)[0]?.token;
+  assert.ok(token);
+  handoffs = new ArchitectureHandoffStore(handoffPath);
+  flows = new JsonProductSpecFlowStore(flowsPath);
+  assert.equal((await createBoundArchitectureFlow(args())).token, token);
+  assert.equal(flows.listByUpstreamPrd(f.prd.token).length, 1);
 });

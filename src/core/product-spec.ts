@@ -136,6 +136,7 @@ export type ContentSource =
  * 服务端预取台账核验，不采信模型自报。
  */
 export interface KnowledgeRef {
+  fact_kind?: 'source-current';
   system_id: string;
   /** 服务端裁剪作用域（如 bot 角色），来自可信身份映射。 */
   scope: string;
@@ -165,6 +166,7 @@ export const ContentSourceSchema = z.union([
 ]);
 
 export const KnowledgeRefSchema = z.object({
+  fact_kind: z.literal('source-current').optional(),
   system_id: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/),
   scope: z.string().min(1).max(64),
   snapshot_ref: z.string().min(1).max(200),
@@ -310,6 +312,34 @@ export class ProductSpecFlowStore {
     };
     this.flows.set(flow.token, flow);
     return flow;
+  }
+
+  /** Server-reserved token makes creation replayable after a cross-store crash. */
+  createWithToken(token: string, options: CreateProductSpecFlowOptions): ProductSpecFlow {
+    if (!/^[0-9a-f]{32}$/.test(token)) throw new Error('Invalid server reservation token');
+    const existing = this.flows.get(token);
+    if (existing) {
+      if (existing.taskId !== options.taskId || existing.botId !== options.botId
+        || existing.sessionId !== options.sessionId || existing.ownerOpenId !== options.ownerOpenId
+        || existing.ownerUnionId !== options.ownerUnionId || (existing.sessionVersion ?? 0) !== (options.sessionVersion ?? 0)
+        || (existing.ownerBotId ?? existing.collaboration?.fromBotId ?? existing.botId)
+          !== (options.ownerBotId ?? options.collaboration?.fromBotId ?? options.botId)
+        || JSON.stringify(existing.knowledge_refs) !== JSON.stringify(options.knowledge_refs ?? [])
+        || existing.knowledge_state !== (options.knowledge_state ?? null)
+        || existing.content_digest !== options.content_digest
+        || JSON.stringify(existing.request) !== JSON.stringify(options.request)
+        || JSON.stringify(existing.upstream) !== JSON.stringify(options.upstream)) {
+        const changed = ['taskId', 'botId', 'sessionId', 'ownerOpenId', 'ownerUnionId', 'ownerBotId', 'sessionVersion', 'content_digest', 'request', 'upstream', 'knowledge_refs', 'knowledge_state']
+          .filter(key => JSON.stringify((existing as unknown as Record<string, unknown>)[key]) !== JSON.stringify((options as unknown as Record<string, unknown>)[key]));
+        throw new Error(`Reservation replay does not match the recorded architecture flow (${changed.join(',')})`);
+      }
+      return structuredClone(existing);
+    }
+    const created = ProductSpecFlowStore.prototype.create.call(this, options);
+    this.flows.delete(created.token);
+    const reserved = { ...created, token };
+    this.flows.set(token, reserved);
+    return structuredClone(reserved);
   }
 
   get(token: string): ProductSpecFlow | undefined {

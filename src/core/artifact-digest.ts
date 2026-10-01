@@ -586,7 +586,7 @@ export async function verifyApprovableArtifact(options: {
   verifyKnowledgeCitations?: (input: {
     artifactTexts: readonly string[];
     declaredRefs: NonNullable<ProductSpecFlow['knowledge_refs']>;
-  }) => { ok: true } | { ok: false; reason: string };
+  }) => { ok: true } | { ok: false; reason: string } | Promise<{ ok: true } | { ok: false; reason: string }>;
   /** 测试注入：读取与稳定性复核之间触发「读取过程中变化」时序。 */
   artifactReadHook?: () => Promise<void>;
 }): Promise<{ ok: true } | ApprovalGateRejection> {
@@ -685,7 +685,7 @@ export async function verifyApprovableArtifact(options: {
         message: '方案包含知识引用（或声明了引用），但服务端引用核验不可用，确认被拒绝。',
       };
     }
-    const verified = options.verifyKnowledgeCitations({ artifactTexts: snapshot.texts, declaredRefs });
+    const verified = await options.verifyKnowledgeCitations({ artifactTexts: snapshot.texts, declaredRefs });
     if (!verified.ok) {
       return { ok: false, level: 'warning', message: `知识引用核验未通过：${verified.reason}` };
     }

@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import {
   assertArtifactStillMatchesApproval,
   readArchitectureArtifactSnapshot,
@@ -111,28 +113,28 @@ export async function createBoundArchitectureFlow(options: {
     knowledgeRefs: structuredClone(prd.knowledge_refs ?? []),
     knowledgeState: prd.knowledge_state ?? null,
   };
-  const flow = flows.create({
-    ...identity,
-    request,
-    artifact_kind: 'architecture',
-    content_digest: contentDigest,
-    digest_algorithm: 'canonical-sha256-v1',
-    content_sources: contentSources,
-    knowledge_refs: upstream.knowledgeRefs,
-    knowledge_state: upstream.knowledgeState,
-    upstream,
+  const creation = {
+    ...identity, request, artifact_kind: 'architecture' as const,
+    content_digest: contentDigest, digest_algorithm: 'canonical-sha256-v1' as const,
+    content_sources: contentSources, knowledge_refs: upstream.knowledgeRefs,
+    knowledge_state: upstream.knowledgeState, upstream,
+  };
+  const reservationDigest = createHash('sha256').update(JSON.stringify({
+    creation, workspace: realpathSync(workspaceDir),
+  })).digest('hex');
+  const currentPrd = flows.get(prd.token);
+  if (currentPrd?.status !== 'approved' || currentPrd.content_digest !== handoff.prdDigest) {
+    throw new Error('上游 PRD 在创建期间变化，请重新确认后交接。');
+  }
+  const reservation = handoffs.reserveCreation(options.handoffToken, {
+    taskId: identity.taskId, ownerOpenId: identity.ownerOpenId, digest: reservationDigest,
   });
-  // flow 创建成功后才消费交接（单次有效；失败路径不消耗 capability）。
-  const consumed = handoffs.consume(options.handoffToken, {
-    taskId: identity.taskId,
-    ownerOpenId: identity.ownerOpenId,
-  });
-  if (!consumed) {
-    // 并发窗口内交接已被他人消费/关闭：**作废**刚创建的 flow（置 invalidated，
-    // 不是事务回滚——它会在历史中留下一条作废记录）。两步之间进程崩溃可能
-    // 留下 open 交接码与已创建 flow 并存；持久化交接与原子消费属 W6 生产门禁。
-    flows.invalidate(flow.token, '架构交接在创建窗口内被并发使用或级联关闭，制品作废');
-    throw new Error('架构交接码在创建过程中失效（可能被并发使用或级联关闭），请重新发起交接。');
+  if (!reservation?.flowToken) throw new Error('架构交接码无效或由其他操作预留：拒绝创建。');
+  // If either persistence step fails, the durable reservation survives. Matching
+  // retries (including after restart) return the one recorded flow; no token burn.
+  const flow = flows.createWithToken(reservation.flowToken, creation);
+  if (!handoffs.markFlowCreated(options.handoffToken, flow.token)) {
+    throw new Error('架构交接提交未完成，请使用同一操作恢复。');
   }
   return flow;
 }

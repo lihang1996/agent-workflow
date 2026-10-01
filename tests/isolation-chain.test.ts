@@ -199,7 +199,7 @@ test('P0-1 调用链：无交接记录/绑定不符/消费后复用全部失败�
   // 同一授权的第二次使用（B 任务）失败：交接已消费。
   await assert.rejects(
     resolveCodingAuthorizationById({ ...base, binding: { ...binding, taskId: 'task-B' } }),
-    /已被消费/,
+    /已被预留\/消费/,
   );
   // 另一授权 ID 无交接记录 ⇒ 失败关闭（不从列表猜）。
   await assert.rejects(

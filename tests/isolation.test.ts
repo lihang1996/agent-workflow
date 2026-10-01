@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
@@ -17,9 +18,16 @@ import {
   loadProtectedRoots,
   prepareIsolation,
   preflightFixtureProbe,
+  resolveExecutableLiteralPath,
   type IsolationProtectedRoots,
 } from '../src/core/isolation.js';
-import { computeBinaryFingerprint, computeIsolationCapabilityIdentity } from '../src/core/isolation-capability.js';
+import {
+  computeBinaryContentSha256,
+  computeBinaryFingerprint,
+  computeIsolationCapabilityIdentity,
+  protectedRootsDigest,
+  type IsolationCapabilityReader,
+} from '../src/core/isolation-capability.js';
 import { spawnCli } from '../src/cli/spawn-cli.js';
 
 const DIAGNOSTIC_CHILD = fileURLToPath(new URL('./fixtures/isolation/diagnostic-child.mjs', import.meta.url));
@@ -414,38 +422,128 @@ test('capability identity binds engine/roots/purpose/write-policy and is scratch
   );
 });
 
-test('binary fingerprint binds realpath + --version output (A03)', () => {
-  const fingerprint = computeBinaryFingerprint({ binaryRealPath: '/usr/local/bin/codex', versionOutput: 'codex-cli 0.159.2\n' });
+test('binary fingerprint binds realpath + file content (A03 166 号返工)', async (t) => {
+  const root = temp(t);
+  const binaryPath = join(root, 'fake-cli');
+  writeFileSync(binaryPath, '#!/bin/sh\nVERSION-OUTPUT-SAME-EVERY-TIME\n', { mode: 0o755 });
+  const contentSha = await computeBinaryContentSha256(binaryPath);
+  const fingerprint = computeBinaryFingerprint({ binaryRealPath: binaryPath, contentSha256: contentSha });
   assert.match(fingerprint, /^[0-9a-f]{16}$/);
-  // 真实路径或版本输出任一变化 ⇒ 指纹变化。
-  assert.notEqual(fingerprint, computeBinaryFingerprint({ binaryRealPath: '/opt/bin/codex', versionOutput: 'codex-cli 0.159.2\n' }));
-  assert.notEqual(fingerprint, computeBinaryFingerprint({ binaryRealPath: '/usr/local/bin/codex', versionOutput: 'codex-cli 0.160.0\n' }));
+  // 同路径替换内容（`--version` 输出可以完全不变）⇒ 指纹必须变化。
+  writeFileSync(binaryPath, '#!/bin/sh\nEVIL-REPLACED-SAME-VERSION\n', { mode: 0o755 });
+  const replacedSha = await computeBinaryContentSha256(binaryPath);
+  assert.notEqual(contentSha, replacedSha, '内容摘要必须感知原地替换');
+  assert.notEqual(fingerprint, computeBinaryFingerprint({ binaryRealPath: binaryPath, contentSha256: replacedSha }));
+  // 路径变化（PATH 换绑）⇒ 指纹变化。
+  assert.notEqual(fingerprint, computeBinaryFingerprint({ binaryRealPath: join(root, 'other-cli'), contentSha256: replacedSha }));
   // 稳定可复现（canary 写入侧与 prepare 侧各自计算必须一致）。
-  assert.equal(fingerprint, computeBinaryFingerprint({ binaryRealPath: '/usr/local/bin/codex', versionOutput: 'codex-cli 0.159.2\n' }));
+  assert.equal(
+    computeBinaryFingerprint({ binaryRealPath: binaryPath, contentSha256: replacedSha }),
+    computeBinaryFingerprint({ binaryRealPath: binaryPath, contentSha256: await computeBinaryContentSha256(binaryPath) }),
+  );
 });
 
-test('prepareIsolation fails closed when only one of binaryRealPath/binaryVersion is provided (A03)', async (t) => {
+test('prepareIsolation fails closed when binaryRealPath is unreadable (A03)', async (t) => {
   const root = temp(t);
   const workspace = join(root, 'workspace');
   mkdirSync(workspace, { recursive: true });
-  for (const harness of [
-    { binaryRealPath: '/usr/local/bin/codex' },
-    { binaryVersion: 'codex-cli 0.159.2' },
-  ]) {
-    await assert.rejects(
-      prepareIsolation({
-        input: { taskId: 't-a03', purpose: 'probe', command: 'codex', cwd: workspace },
-        harness: {
-          capabilityStore: alwaysPassStore(),
-          probeFixture: async () => ({ ok: true }),
-          envBase: { PATH: process.env.PATH },
-          ...harness,
-        },
-        protectedRoots: { version: 'v-a03', roots: [join(root, 'protected')] },
-      }),
-      /binaryRealPath 与 binaryVersion 必须同时提供/,
-    );
-  }
+  await assert.rejects(
+    prepareIsolation({
+      input: { taskId: 't-a03', purpose: 'probe', command: 'codex', cwd: workspace },
+      harness: {
+        capabilityStore: alwaysPassStore(),
+        probeFixture: async () => ({ ok: true }),
+        envBase: { PATH: process.env.PATH },
+        binaryRealPath: join(root, 'does-not-exist'),
+      },
+      protectedRoots: { version: 'v-a03', roots: [join(root, 'protected')] },
+    }),
+    /ENOENT|binaryRealPath|隔离失败关闭/,
+  );
   // 工作区不留 scratch 痕迹（失败发生在 scratch 创建之前）。
   assert.deepEqual(readdirSync(workspace), []);
+});
+
+test('same-path binary replacement invalidates old capability identity (A03 166 号返工)', async (t) => {
+  const root = temp(t);
+  const workspace = join(root, 'workspace');
+  mkdirSync(workspace, { recursive: true });
+  const binaryPath = join(root, 'fake-cli');
+  writeFileSync(binaryPath, '#!/bin/sh\nv1-content\n', { mode: 0o755 });
+  const roots = { version: 'v-a03-replace', roots: [join(root, 'protected')] };
+
+  const keyStore = {
+    knownKey: computeIsolationCapabilityIdentity({
+      command: 'codex', purpose: 'probe', protectedRootsVersion: roots.version, protectedRootsDigest: protectedRootsDigest(roots.roots),
+      writePolicy: 'none', platform: process.platform,
+      binaryFingerprint: computeBinaryFingerprint({
+        binaryRealPath: binaryPath,
+        contentSha256: await computeBinaryContentSha256(binaryPath),
+      }),
+    }),
+  };
+  // 能力库只认「带指纹身份」：第一次（内容 v1）核验通过（走到注入的探针）。
+  const lookupKey = (): IsolationCapabilityReader => ({
+    lookup: (key: string) => (key === keyStore.knownKey ? {
+      read: 'passed' as const,
+      write: 'passed' as const,
+      evidenceRef: 'fixture://binary-replace',
+      expiresAt: '9999-12-31T23:59:59.000Z',
+    } : undefined),
+  });
+  const harnessBase = {
+    probeFixture: async () => ({ ok: true }),
+    envBase: { PATH: process.env.PATH },
+  };
+  const first = await prepareIsolation({
+    input: { taskId: 't-a03-r1', purpose: 'probe', command: 'codex', cwd: workspace },
+    harness: { ...harnessBase, capabilityStore: lookupKey(), binaryRealPath: binaryPath },
+    protectedRoots: roots,
+  });
+  first.dispose();
+
+  // 原地替换二进制内容（同路径）：旧身份查不到 ⇒ 必须在能力核验处失败关闭。
+  writeFileSync(binaryPath, '#!/bin/sh\nv2-replaced-content\n', { mode: 0o755 });
+  await assert.rejects(
+    prepareIsolation({
+      input: { taskId: 't-a03-r2', purpose: 'probe', command: 'codex', cwd: workspace },
+      harness: { ...harnessBase, capabilityStore: lookupKey(), binaryRealPath: binaryPath },
+      protectedRoots: roots,
+    }),
+    /引擎读写隔离未验证/,
+  );
+});
+
+
+test('launch uses pinned absolute binary and rejects replacement after preparation', async (t) => {
+  const root = realpathSync(temp(t));
+  const workspace = join(root, 'workspace');
+  mkdirSync(workspace);
+  const binary = join(root, 'fake-cli');
+  writeFileSync(binary, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  let launched: string[] | undefined;
+  const prepared = await prepareIsolation({
+    input: { taskId: 'pinned', purpose: 'probe', command: 'fake-cli', cwd: workspace },
+    harness: { capabilityStore: alwaysPassStore(), binaryRealPath: binary,
+      probeFixture: async () => ({ ok: true }),
+      spawn: (_command, args) => { launched = args; return spawn('/usr/bin/true'); } },
+    protectedRoots: { version: 'pin', roots: [] },
+  });
+  t.after(() => prepared.dispose());
+  const child = launchIsolated(prepared, ['--probe']);
+  await new Promise<void>((resolve) => child.once('close', () => resolve()));
+  assert.equal(launched?.[3], binary);
+  writeFileSync(binary, '#!/bin/sh\necho replaced\n', { mode: 0o755 });
+  launched = undefined;
+  assert.throws(() => launchIsolated(prepared, []), /可执行文件身份变化/);
+  assert.equal(launched, undefined);
+});
+
+test('relative PATH is resolved against the actual execution cwd, skips directories', (t) => {
+  const root = realpathSync(temp(t));
+  mkdirSync(join(root, 'bin'));
+  writeFileSync(join(root, 'bin', 'fake'), '#!/bin/sh\n', { mode: 0o755 });
+  assert.equal(resolveExecutableLiteralPath('fake', { PATH: 'bin' }, root), join(root, 'bin', 'fake'));
+  mkdirSync(join(root, 'bin', 'directory'));
+  assert.throws(() => resolveExecutableLiteralPath('directory', { PATH: 'bin' }, root), /无法在 PATH/);
 });

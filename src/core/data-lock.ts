@@ -1,39 +1,37 @@
-import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 
-/**
- * A08（Codex 深度审查批）：data 目录单实例锁。
- *
- * 多个 agent-os 进程同时跑会共写 data/ 下的台账（sessions、task-executions、
- * authorizations…），既有 store 都是「整文件读改写」，并发即互相覆盖。启动时
- * 用 `data/.lock`（O_EXCL 创建，写 pid+时间戳）保证单实例：
- * - 锁文件不存在 ⇒ 创建成功，持锁；
- * - 已存在 ⇒ 读出持有者 pid，`process.kill(pid, 0)` 纯探活：
- *   - ESRCH（进程已死）⇒ 抢占式接管（上次崩溃残留的陈旧锁，重写为本进程）；
- *   - 存活（含 EPERM——目标存在但无权发信号）⇒ 抛错「另一实例运行中」；
- * - 锁文件存在但读不出 pid（损坏/手写）⇒ 失败关闭（人工删除后可启动）。
- *
- * release：删除锁文件前核对内容仍是本进程 pid（被接管后不误删他人锁），
- * 幂等，供 exit/SIGINT/SIGTERM 处理器调用。
+/** Single-instance state writer. Stale or malformed locks fail closed.
+ * Cleanup requires a stopped service and an explicit operator action. A directory
+ * rename cannot compare the old owner atomically; automatic takeover has an ABA race.
  */
 
 export interface DataDirLock {
-  /** 释放锁（幂等）。仅在锁内容仍是本进程 pid 时删除文件。 */
+  /** 释放锁（幂等）。仅在锁内容仍属于本进程（token+pid）时删除目录。 */
   release: () => void;
-  /** 锁文件绝对路径（诊断用）。 */
+  /** 锁目录绝对路径（诊断用）。 */
   lockPath: string;
 }
 
-interface LockPayload {
+interface LockOwner {
   pid: number;
+  /** 所有权 token（每次 acquire 唯一）：release 与接管的竞争判定依据。 */
+  token: string;
   at: string;
 }
 
-function readLockPayload(lockPath: string): LockPayload | undefined {
+const LOCK_DIR_NAME = '.agent-os-lock.d';
+
+function readLockOwner(lockDir: string): LockOwner | undefined {
   try {
-    const parsed = JSON.parse(readFileSync(lockPath, 'utf8')) as Partial<LockPayload>;
-    if (typeof parsed.pid === 'number' && Number.isInteger(parsed.pid) && typeof parsed.at === 'string') {
-      return { pid: parsed.pid, at: parsed.at };
+    const parsed = JSON.parse(readFileSync(join(lockDir, 'owner.json'), 'utf8')) as Partial<LockOwner>;
+    if (
+      typeof parsed.pid === 'number' && Number.isInteger(parsed.pid) && parsed.pid > 0
+      && typeof parsed.token === 'string' && parsed.token.length > 0
+      && typeof parsed.at === 'string'
+    ) {
+      return { pid: parsed.pid, token: parsed.token, at: parsed.at };
     }
     return undefined;
   } catch {
@@ -52,48 +50,81 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
+/** 把目录原子改名到唯一坟场名并删除（release 与接管共用；rename 失败即未得手）。 */
+function moveDirToGraveyard(dir: string): boolean {
+  const grave = `${dir}.grave-${randomUUID()}`;
+  try {
+    renameSync(dir, grave);
+  } catch {
+    return false; // 已被他人接管/删除（ENOENT/ENOTEMPTY 等）。
+  }
+  rmSync(grave, { recursive: true, force: true });
+  return true;
+}
+
 export function acquireDataDirLock(dataDir: string, options: { now?: () => Date } = {}): DataDirLock {
   mkdirSync(dataDir, { recursive: true });
-  const lockPath = join(dataDir, '.lock');
-  const payload = (): string => `${JSON.stringify({
+  const lockDir = join(dataDir, LOCK_DIR_NAME);
+  const myToken = randomUUID();
+  const myOwner: LockOwner = {
     pid: process.pid,
+    token: myToken,
     at: (options.now ?? (() => new Date()))().toISOString(),
-  } satisfies LockPayload, null, 2)}\n`;
+  };
 
-  try {
-    // O_EXCL 语义（'wx'）：独占创建，已存在即 EEXIST。
-    writeFileSync(lockPath, payload(), { flag: 'wx', mode: 0o600 });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-    const holder = readLockPayload(lockPath);
-    if (!holder) {
-      throw new Error(
-        `data 目录锁文件存在但无法解析（${lockPath}）：无法判断是否另有实例运行，失败关闭。请人工确认后删除该文件再启动。`,
-      );
+  /**
+   * 建一个带完整 owner 的 staging 目录并原子 rename 成 lockDir（claim）。
+   * 返回 true = 持锁；false = lockDir 已被他人占据（竞争落败，可重试评估）。
+   * 任何其他错误（磁盘满/权限）抛错并清理自建 staging。
+   */
+  const claimWithStaging = (): boolean => {
+    const staging = `${lockDir}.staging-${randomUUID()}`;
+    try {
+      mkdirSync(staging, { recursive: false, mode: 0o700 });
+    } catch (error) {
+      throw error;
     }
+    try {
+      writeFileSync(join(staging, 'owner.json'), `${JSON.stringify(myOwner, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+      renameSync(staging, lockDir);
+      return true;
+    } catch (error) {
+      try { rmSync(staging, { recursive: true, force: true }); } catch { /* 尽力清理 */ }
+      const code = (error as NodeJS.ErrnoException).code;
+      // ENOTEMPTY/EEXIST/ENOTDIR：目标已被占据 = 竞争落败（正常路径）。
+      if (code === 'ENOTEMPTY' || code === 'EEXIST' || code === 'ENOTDIR') return false;
+      throw error;
+    }
+  };
+
+  // 预检：锁目录已存在但 owner 不可读 = 损坏（正常协议不会产生无 owner 的
+  // 锁目录；空目录会被 rename 静默替换，必须在此显式失败关闭）。
+  if (existsSync(lockDir) && readLockOwner(lockDir) === undefined) {
+    throw new Error(
+      `data 目录锁存在但无法解析持有者（${lockDir}/owner.json）：无法判断是否另有实例运行，失败关闭。请人工确认后删除该目录再启动。`,
+    );
+  }
+
+  if (!claimWithStaging()) {
+    const holder = readLockOwner(lockDir);
+    if (!holder) throw new Error(`data 目录锁损坏（${lockDir}），失败关闭。`);
     if (isProcessAlive(holder.pid)) {
-      throw new Error(
-        `另一实例运行中（pid=${holder.pid}，自 ${holder.at} 起持有 ${lockPath}）：data 目录同时只允许一个 agent-os 进程。`,
-      );
+      throw new Error(`另一实例运行中（pid=${holder.pid}，自 ${holder.at} 起持有 ${lockDir}）。`);
     }
-    // 持有者进程已死（上次崩溃残留）：抢占式接管，重写锁内容为本进程。
-    writeFileSync(lockPath, payload(), { mode: 0o600 });
+    throw new Error(`data 目录存在陈旧锁（pid=${holder.pid}，${lockDir}），失败关闭；停止全部实例并核对台账后再由操作者清理。`);
   }
 
   let released = false;
   return {
-    lockPath,
+    lockPath: lockDir,
     release: (): void => {
       if (released) return;
       released = true;
-      // 只删仍然属于本进程的锁（被接管后不误删他人锁）。
-      const current = readLockPayload(lockPath);
-      if (!current || current.pid !== process.pid) return;
-      try {
-        unlinkSync(lockPath);
-      } catch {
-        // 锁已被他人删除/接管：退出路径上忽略。
-      }
+      // 只释放仍然属于本进程的锁（token+pid 双核对；被接管后不误删他人锁）。
+      if (!existsSync(lockDir)) return;
+      const current = readLockOwner(lockDir);
+      if (!current || current.pid !== process.pid || current.token !== myToken) return;
+      moveDirToGraveyard(lockDir);
     },
   };
 }

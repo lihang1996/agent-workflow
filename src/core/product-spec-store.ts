@@ -2,8 +2,10 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
+  rmSync,
   writeFileSync,
 } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { dirname } from 'node:path';
 import { z } from 'zod';
 import { CollaborationOriginSchema } from './collaboration.js';
@@ -73,6 +75,12 @@ export class JsonProductSpecFlowStore extends ProductSpecFlowStore {
     return this.mutate(() => super.create(options));
   }
 
+  override createWithToken(token: string, options: CreateProductSpecFlowOptions): ProductSpecFlow {
+    // Call the base operation inside one persistence transaction. Its this.create
+    // uses this store's write guard; the outer snapshot still restores all state.
+    return this.mutate(() => super.createWithToken(token, options));
+  }
+
   override approve(token: string, messageId?: string): ProductSpecFlow | undefined {
     return this.mutate(() => super.approve(token, messageId));
   }
@@ -101,15 +109,24 @@ export class JsonProductSpecFlowStore extends ProductSpecFlowStore {
     }
   }
 
+  /**
+   * A08（166 号返工）：唯一临时文件名（固定 .tmp 在并发写下互相破坏）+
+   * 失败清理；snapshot 深拷贝保证 mutate 回滚的是完整旧状态。
+   */
   private persist(): void {
     mkdirSync(dirname(this.filePath), { recursive: true });
-    const temporaryPath = `${this.filePath}.tmp`;
-    writeFileSync(
-      temporaryPath,
-      `${JSON.stringify(this.snapshot(), null, 2)}\n`,
-      'utf8',
-    );
-    renameSync(temporaryPath, this.filePath);
+    const temporaryPath = `${this.filePath}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(
+        temporaryPath,
+        `${JSON.stringify(this.snapshot(), null, 2)}\n`,
+        'utf8',
+      );
+      renameSync(temporaryPath, this.filePath);
+    } catch (error) {
+      try { rmSync(temporaryPath, { force: true }); } catch { /* 尽力清理 */ }
+      throw error;
+    }
   }
 }
 

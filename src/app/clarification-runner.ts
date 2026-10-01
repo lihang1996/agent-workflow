@@ -1,4 +1,5 @@
 import { releaseTask, executeTask, executionStore } from './task-lifecycle.js';
+import { prefetchSourceContext, sourceSubmission, sourceBinding } from './source-context.js';
 import { createTaskCardUpdater, deliveryOutbox } from './result-delivery.js';
 import { flowMatchesSession } from './session-guard.js';
 import type { Bot } from '../im/lark.js';
@@ -96,12 +97,16 @@ async function executeClarification(options: Parameters<typeof continueClarifica
       assertRecreateWithoutHistoryDependency({ hadNativeSession: !!session.cliSessionId });
     }
     const resumeCliSessionId = applyModelDecision(modelPlan);
+    const sourceIdentity = sourceBinding(config, { ...flow, sessionVersion: session.version ?? 0 }, session.workspaceDir);
+    const requirement = formatClarificationAnswers(flow);
+    const prompt = buildBotPrompt(config, requirement, runtime.teamRegistry.contextFor(config.id), defaultDeliveryMode)
+      + await prefetchSourceContext(runtime, config, sourceIdentity, requirement);
     const result = await executeTask({ runtime, id: `clarification:${flow.token}`, sessionId: session.id, botId: config.id,
       modelSelection: modelPlan.modelSelection,
       freshNativeSession: resumeCliSessionId === undefined,
       execute: () => (options.execute ?? executeCli)(
         adapter,
-        buildBotPrompt(config, formatClarificationAnswers(flow), runtime.teamRegistry.contextFor(config.id), defaultDeliveryMode),
+        prompt,
         session.workspaceDir,
         resumeCliSessionId,
         run.signal,
@@ -164,7 +169,7 @@ async function executeClarification(options: Parameters<typeof continueClarifica
         store: runtime.productSpecFlows,
         workspaceDir: session.workspaceDir,
         ...(productSpecRequest.deliveryMode === 'local'
-          ? { scratchRoot: requireScratchRootForSubmission(runtime, session.id, flow.taskId) }
+          ? { scratchRoot: requireScratchRootForSubmission(runtime, session.id, flow.taskId, session.workspaceDir) }
           : {}),
         identity: {
           taskId: flow.taskId,
@@ -177,6 +182,7 @@ async function executeClarification(options: Parameters<typeof continueClarifica
           collaboration: flow.collaboration,
         },
         request: productSpecRequest,
+        ...sourceSubmission(runtime, sourceIdentity),
       });
       await cardUpdater.finish(buildProductSpecApprovalCard(productSpecFlow), { kind: 'product', token: productSpecFlow.token });
       runtime.clarificationFlows.delete(flow.token);
@@ -205,7 +211,7 @@ async function executeClarification(options: Parameters<typeof continueClarifica
           handoffs: runtime.architectureHandoffs,
           workspaceDir: session.workspaceDir,
           ...(normalizedRequest.deliveryMode === 'local'
-            ? { scratchRoot: requireScratchRootForSubmission(runtime, session.id, flow.taskId) }
+            ? { scratchRoot: requireScratchRootForSubmission(runtime, session.id, flow.taskId, session.workspaceDir) }
             : {}),
           resolvePrdWorkspaceDir: ({ prdSessionId }) => runtime.sessions.get(prdSessionId)?.workspaceDir,
           identity: {

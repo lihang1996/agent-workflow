@@ -12,6 +12,8 @@ import type { SessionManager } from '../core/session-manager.js';
 import type { TeamRegistry } from '../core/team-registry.js';
 import type { TaskExecutionStore } from '../core/task-execution.js';
 import type { DeliveryOutbox } from './delivery-outbox.js';
+import type { SourceContextGrantStore } from '../core/source-context-grant.js';
+import type { CodingIntentHandoffStore } from '../core/coding-handoff.js';
 
 export interface BotRuntime {
   config: BotConfig;
@@ -20,6 +22,10 @@ export interface BotRuntime {
 }
 
 export interface AppRuntime {
+  sourceContexts?: SourceContextGrantStore;
+  codingHandoffs?: CodingIntentHandoffStore;
+  authorizeCodingOperator?: (principalId: string, botId: string) => boolean;
+  validateCodingKnowledge?: (authorizationId: string) => Promise<void>;
   taskExecutions?: TaskExecutionStore;
   deliveries?: DeliveryOutbox;
   sessions: SessionManager;
@@ -33,19 +39,18 @@ export interface AppRuntime {
   clarificationFlows: ClarificationFlowStore;
   productSpecFlows: ProductSpecFlowStore;
   /**
-   * 服务端知识预取台账（T-016）。生产运行态多系统 KB 消费保持 blocked
-   * （见 kb-prefetch.ts 的 KNOWLEDGE_RUNTIME_GATE），生产不注入；仅当 flow
-   * 声明了 knowledge_refs 时 G1 才要求它在场做服务端引用核验。
+   * 旧部署事实预取台账（T-016）。正式部署证明未配置时不注入；
+   * source/dev 消费由 sourceContexts 提供，并在 G1 重新校验。
    */
   knowledgePrefetch?: KnowledgePrefetchLedger;
   /**
-   * 架构交接台账（T-020）：服务端签发的 PRD→架构 capability。内存态；
-   * 交接是单次使用的短生命周期引用，生产持久化策略随 W6 一并评审。
+   * 架构交接台账（T-020）：服务端签发的 PRD→架构 capability。
+   * 正式入口使用 JsonArchitectureHandoffStore，支持保留及重启恢复。
    */
   architectureHandoffs?: ArchitectureHandoffStore;
   /**
-   * 编码授权台账（T-021 首批）：本地数据模型与显式授权入口。active 授权
-   * 不接入任何真实开发派发（T-022 写隔离 canary 未通过前仅作为可校验状态）。
+   * 编码授权台账：开始开发卡片通过 codingHandoffs 可恢复地启动任务。
+   * active 授权仍须通过 G3、当前身份和对应 CLI 的隔离能力证明。
    */
   codingAuthorizations?: CodingAuthorizationStore;
   /**

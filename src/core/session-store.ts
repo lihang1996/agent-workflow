@@ -1,4 +1,5 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { z } from 'zod';
 import { CLI_IDS } from '../cli/types.js';
@@ -110,9 +111,16 @@ export class JsonSessionStore implements SessionStore {
     const snapshot = JSON.stringify(sessions, null, 2);
     const write = async () => {
       await mkdir(dirname(this.filePath), { recursive: true });
-      const tempPath = `${this.filePath}.tmp`;
-      await writeFile(tempPath, `${snapshot}\n`, 'utf8');
-      await rename(tempPath, this.filePath);
+      // A08（166 号返工）：唯一临时文件名（固定 .tmp 在并发写下互相破坏）+
+      // 失败清理自建临时文件。
+      const tempPath = `${this.filePath}.${randomUUID()}.tmp`;
+      try {
+        await writeFile(tempPath, `${snapshot}\n`, 'utf8');
+        await rename(tempPath, this.filePath);
+      } catch (error) {
+        try { await rm(tempPath, { force: true }); } catch { /* 尽力清理 */ }
+        throw error;
+      }
     };
 
     this.writeQueue = this.writeQueue.then(write, write);

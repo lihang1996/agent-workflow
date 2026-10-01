@@ -1,5 +1,7 @@
 import { promptInputForPlatform } from './types.js';
 import { createInterface } from 'node:readline';
+import type { ChildProcessByStdio } from 'node:child_process';
+import type { Readable, Writable } from 'node:stream';
 import type { CliAdapter, CliAttachment, CliEvent, CliRunResult } from './types.js';
 import type { ModelSelection } from '../core/model-selection.js';
 import { assertAppToolAllowed, validateAppToolCalls } from '../core/app-tool-policy.js';
@@ -16,6 +18,11 @@ import {
 const DEFAULT_TIMEOUT_MS = 50 * 60 * 1000;
 
 export interface RunCliOptions {
+  launchLifecycle?: {
+    beforeLaunch: () => Promise<void>;
+    onSpawn: (pid: number | undefined) => void;
+    onNotSpawned: (error: unknown) => void;
+  };
   adapter: CliAdapter;
   prompt: string;
   cwd: string;
@@ -69,6 +76,8 @@ async function executeRun(options: RunCliOptions): Promise<CliRunResult> {
   const prepared = await options.isolation({
     taskId: options.taskId ?? `task-${sessionId ?? 'adhoc'}-${Date.now().toString(36)}`,
     purpose: 'task',
+    cliMode: sessionId ? 'resume' : 'fresh',
+    modelSelection,
     command: adapter.command,
     cwd,
     ...(options.authorization ? {
@@ -110,7 +119,8 @@ async function executeRun(options: RunCliOptions): Promise<CliRunResult> {
     const args = sessionId
       ? adapter.buildResumeArgs(prompt, sessionId, promptInput, attachments, modelSelection)
       : adapter.buildArgs(prompt, promptInput, attachments, modelSelection);
-    result = await runIsolatedChild({ adapter, args, prepared, sessionId, useStdin, prompt, signal, timeoutMs, onEvent, onRawLine });
+    await options.launchLifecycle?.beforeLaunch();
+    result = await runIsolatedChild({ adapter, args, prepared, sessionId, useStdin, prompt, signal, timeoutMs, onEvent, onRawLine, launchLifecycle: options.launchLifecycle });
   } catch (error) {
     throw await postStateCheckForError(error as Error);
   }
@@ -130,19 +140,15 @@ function runIsolatedChild(options: {
   timeoutMs: number;
   onEvent?: (event: CliEvent) => void;
   onRawLine?: (line: string) => void;
+  launchLifecycle?: RunCliOptions['launchLifecycle'];
 }): Promise<CliRunResult> {
   const { adapter, args, prepared, sessionId, useStdin, prompt, signal, timeoutMs, onEvent, onRawLine } = options;
   return new Promise((resolve, reject) => {
     // 固定用 `['pipe','pipe','pipe']`，让 stdin 始终可写（spawnCli 返回类型按字面量收窄）。
     applyAdapterEnv(prepared.env, adapter.buildEnv?.());
-    const child = launchIsolated(prepared, args, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    // stdin 模式下把 prompt 写入子进程；否则 prompt 已在命令行参数里，stdin 直接收口。
-    if (child.stdin) {
-      if (useStdin) child.stdin.end(prompt, 'utf8');
-      else child.stdin.end();
-    }
+    let child: ChildProcessByStdio<Writable, Readable, Readable>;
+    try { child = launchIsolated(prepared, args, { stdio: ['pipe', 'pipe', 'pipe'] }); }
+    catch (error) { options.launchLifecycle?.onNotSpawned(error); reject(error); return; }
     // 取消/超时走进程组终止（119 号 P1-2 / 138 号 P1-3 / 149 号 P1-4）：
     // wrapper 退出 ≠ CLI/后端退出；AbortSignal 不进 spawn。终止结果由 close
     // 处理统一 await 核验后才 settle——abort 处理器只负责触发，且任务已
@@ -210,6 +216,8 @@ function runIsolatedChild(options: {
     };
 
     lines.on('line', (line) => {
+      if (settled) return;
+      try {
       onRawLine?.(line);
       for (const event of adapter.parseEvents(line)) {
         onEvent?.(event);
@@ -245,12 +253,17 @@ function runIsolatedChild(options: {
           };
         }
       }
+      } catch (error) { void fail(error as Error); }
     });
 
     child.stderr.on('data', (chunk: Buffer | string) => {
-      stderr += chunk.toString();
+      stderr = (stderr + chunk.toString()).slice(-262144);
     });
     child.once('error', (error) => {
+      if (!child.pid) {
+        try { options.launchLifecycle?.onNotSpawned(error); }
+        catch (persistenceError) { void fail(persistenceError as Error); return; }
+      }
       if (timedOut) {
         void fail(new Error(`${adapter.displayName} 执行超时`));
         return;
@@ -311,5 +324,14 @@ function runIsolatedChild(options: {
         resolve(finalResult);
       })();
     });
+    // Install all error/close listeners before fallible bookkeeping or stdin writes.
+    try {
+      if (child.pid) options.launchLifecycle?.onSpawn(child.pid);
+      if (signal?.aborted) abortHandler();
+      if (child.stdin) {
+        child.stdin.on('error', (error) => { if (!settled) void fail(error); });
+        if (useStdin) child.stdin.end(prompt, 'utf8'); else child.stdin.end();
+      }
+    } catch (error) { void fail(error as Error); }
   });
 }
