@@ -288,7 +288,10 @@ function validateCanonicalSelection(expected: unknown): CanonicalZcodeSelection 
 
 /**
  * 回读官方 settings snapshot（unknown）；不允许用 ?? 遮住冲突。
- * 核验 snapshot.session.id 非空有界与 settings 双档位，返回带 sessionId 的已验证结果；
+ * 官方 session/create 返回 snapshot.session.sessionId（canonical 字段）。
+ * 核验其非空有界与 settings 双档位，返回带 sessionId 的已验证结果；
+ * 不接受仅有旧 session.id 的伪官方 snapshot；若同时存在旧 id 且与 canonical
+ * sessionId 不一致则明确拒绝，同值额外 id 仅作为附加字段容忍。
  * 结果登记在私有 WeakSet，普通结构对象或 normalizer 返回值不能冒充已验证回读。
  */
 export function verifyZcodeSettingsSnapshot(
@@ -299,8 +302,15 @@ export function verifyZcodeSettingsSnapshot(
   if (!isPlainObject(snapshot) || !isPlainObject(snapshot.settings)) {
     fail('E_SNAPSHOT_INVALID', 'snapshot 缺少 settings，无法核验模型绑定');
   }
-  if (!isPlainObject(snapshot.session) || !isBoundedString(snapshot.session.id)) {
-    fail('E_SNAPSHOT_INVALID', 'snapshot 缺少非空有界的 session.id，无法核验会话');
+  if (!isPlainObject(snapshot.session)) {
+    fail('E_SNAPSHOT_INVALID', 'snapshot 缺少 session 对象，无法核验会话');
+  }
+  if (!isBoundedString(snapshot.session.sessionId)) {
+    fail('E_SNAPSHOT_INVALID', 'snapshot 缺少非空有界的 session.sessionId，无法核验会话');
+  }
+  const legacyId = readField(snapshot.session, 'id');
+  if (legacyId !== undefined && legacyId !== snapshot.session.sessionId) {
+    fail('E_SNAPSHOT_CONFLICT', 'session.id 与 canonical session.sessionId 不一致，拒绝歧义快照');
   }
   const settings = snapshot.settings;
   if (!isPlainObject(settings.model) || !isPlainObject(settings.model.current)) {
@@ -329,7 +339,7 @@ export function verifyZcodeSettingsSnapshot(
   }
   const verified: VerifiedZcodeSettings = deepFreeze({
     kind: 'snapshot-verified',
-    sessionId: snapshot.session.id,
+    sessionId: snapshot.session.sessionId,
     providerId: expected.providerId,
     modelId: expected.modelId,
     reasoningLevel: expected.options.reasoningLevel,

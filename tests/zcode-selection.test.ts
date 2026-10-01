@@ -62,7 +62,8 @@ const EXPECTED = norm('GLM-5.3', 'high');
 
 function snapshot(overrides: Record<string, unknown> = {}) {
   return {
-    session: { id: 'sess-1' },
+    // 官方 session/create 真实形态：canonical 字段为 session.sessionId。
+    session: { sessionId: 'sess-1' },
     settings: {
       model: { current: { providerId: ZCODE_PROVIDER_ID, modelId: 'GLM-5.3', options: { reasoningLevel: 'high' } } },
       thoughtLevel: { current: 'high' },
@@ -275,7 +276,7 @@ test('catalog: 字符串超长、重复、畸形均拒绝', () => {
 
 // ---------- snapshot / session ----------
 
-test('snapshot: session.id + 双档位匹配时通过，并容忍官方额外字段', () => {
+test('snapshot: session.sessionId + 双档位匹配时通过，并容忍官方额外字段', () => {
   const verified = verifyZcodeSettingsSnapshot(snapshot(), EXPECTED);
   assert.equal(verified.kind, 'snapshot-verified');
   assert.equal(verified.sessionId, 'sess-1');
@@ -284,13 +285,35 @@ test('snapshot: session.id + 双档位匹配时通过，并容忍官方额外字
   assert.equal(Object.isFrozen(verified), true);
 });
 
-test('snapshot: session.id 缺失、空或超长时拒绝', () => {
+test('snapshot: session.sessionId 缺失、空或超长时拒绝', () => {
   expectCode(() => verifyZcodeSettingsSnapshot({ settings: snapshot().settings }, EXPECTED), 'E_SNAPSHOT_INVALID');
-  expectCode(() => verifyZcodeSettingsSnapshot({ ...snapshot(), session: { id: '' } }, EXPECTED), 'E_SNAPSHOT_INVALID');
   expectCode(() => verifyZcodeSettingsSnapshot({
     ...snapshot(),
-    session: { id: 'x'.repeat(ZCODE_SELECTION_LIMITS.maxStringLength + 1) },
+    session: { sessionId: '' },
   }, EXPECTED), 'E_SNAPSHOT_INVALID');
+  expectCode(() => verifyZcodeSettingsSnapshot({
+    ...snapshot(),
+    session: { sessionId: 'x'.repeat(ZCODE_SELECTION_LIMITS.maxStringLength + 1) },
+  }, EXPECTED), 'E_SNAPSHOT_INVALID');
+});
+
+test('snapshot 回归: 仅有旧 session.id 的对象拒绝，不用 id ?? sessionId 兜底', () => {
+  expectCode(() => verifyZcodeSettingsSnapshot({
+    ...snapshot(),
+    session: { id: 'sess-1' },
+  }, EXPECTED), 'E_SNAPSHOT_INVALID');
+});
+
+test('snapshot 回归: sessionId 与额外旧 id 冲突时拒绝，同值额外 id 保持 canonical 结果', () => {
+  expectCode(() => verifyZcodeSettingsSnapshot({
+    ...snapshot(),
+    session: { sessionId: 'sess-1', id: 'sess-other' },
+  }, EXPECTED), 'E_SNAPSHOT_CONFLICT');
+  const verified = verifyZcodeSettingsSnapshot({
+    ...snapshot(),
+    session: { sessionId: 'sess-1', id: 'sess-1' },
+  }, EXPECTED);
+  assert.equal(verified.sessionId, 'sess-1');
 });
 
 test('snapshot: thoughtLevel 与 options.reasoningLevel 冲突时拒绝，不用 ?? 遮住', () => {
@@ -346,7 +369,7 @@ test('session-confirmed: 回调与回读 provider/model 不一致时拒绝', () 
   const callback = verifyZcodeAuthCallback({ providerId: ZCODE_PROVIDER_ID, modelId: 'GLM-5.3' }, EXPECTED);
   const flashExpected = norm('GLM-5.3-Flash', 'high');
   const otherReadback = verifyZcodeSettingsSnapshot({
-    session: { id: 'sess-2' },
+    session: { sessionId: 'sess-2' },
     settings: {
       model: { current: { providerId: ZCODE_PROVIDER_ID, modelId: 'GLM-5.3-Flash' } },
       thoughtLevel: { current: 'high' },
@@ -369,7 +392,7 @@ function shape(modelId: string, thought: string, optionLevel: string) {
 
 function snapshotWithoutOptions(thought: string) {
   return {
-    session: { id: 'sess-1' },
+    session: { sessionId: 'sess-1' },
     settings: {
       model: { current: { providerId: ZCODE_PROVIDER_ID, modelId: 'GLM-5.3' } },
       thoughtLevel: { current: thought },
