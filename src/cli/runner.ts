@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer';
 import { promptInputForPlatform } from './types.js';
 import { createInterface } from 'node:readline';
 import type { ChildProcessByStdio } from 'node:child_process';
@@ -16,6 +17,93 @@ import {
 } from '../core/isolation.js';
 
 const DEFAULT_TIMEOUT_MS = 50 * 60 * 1000;
+
+/** 212：started 候选——只有匹配的明确成功 tool_end 才能转正为业务调用。 */
+interface ToolCallCandidate {
+  toolUseId: string;
+  toolName: string;
+  input: unknown;
+  inputKey: string;
+}
+
+/**
+ * 216：重复 started 的一致性检测用无歧义稳定序列化——primitive（含字符串）
+ * 一律 JSON.stringify 编码（undefined 用裸 token，区别于 JSON string）、object
+ * 键排序、数组保序；禁止 tag+String 裸拼接（会碰撞）。超限抛固定错误（不携带
+ * 原始输入/秘密），由调用处失败关闭。
+ */
+export const TOOL_INPUT_KEY_MAX_DEPTH = 32;
+export const TOOL_INPUT_KEY_MAX_NODES = 10000;
+export const TOOL_INPUT_KEY_MAX_BYTES = 262144;
+
+function toolInputKey(value: unknown): string {
+  let nodes = 0;
+  let bytes = 0;
+  const parts: string[] = [];
+  // 增量预算：每个输出片段按 UTF-8 字节计入，超限即失败关闭（不回显输入）。
+  const push = (part: string): void => {
+    bytes += Buffer.byteLength(part, 'utf8');
+    if (bytes > TOOL_INPUT_KEY_MAX_BYTES) {
+      throw new Error('业务工具参数比较键超限（字节），失败关闭');
+    }
+    parts.push(part);
+  };
+  // 大字符串/大 key 先按字节预检再 JSON.stringify，避免无界构造。
+  const encodeString = (text: string): string => {
+    if (bytes + Buffer.byteLength(text, 'utf8') + 2 > TOOL_INPUT_KEY_MAX_BYTES) {
+      throw new Error('业务工具参数比较键超限（字节），失败关闭');
+    }
+    return JSON.stringify(text);
+  };
+  const walk = (node: unknown, depth: number): void => {
+    // 每次 visit 顶端计数并检查深度/节点数——object/array 同样算节点，
+    // 空 object/array 深度嵌套或超量都会在此失败关闭。
+    if (++nodes > TOOL_INPUT_KEY_MAX_NODES) {
+      throw new Error('业务工具参数比较键超限（节点数），失败关闭');
+    }
+    if (depth > TOOL_INPUT_KEY_MAX_DEPTH) {
+      throw new Error('业务工具参数比较键超限（深度），失败关闭');
+    }
+    // undefined 用裸 token（不是 JSON string），字符串一律带引号编码，互不碰撞。
+    if (node === undefined) { push('undefined'); return; }
+    if (node === null) { push(JSON.stringify(node)); return; }
+    if (typeof node === 'string') { push(encodeString(node)); return; }
+    if (typeof node === 'boolean') { push(JSON.stringify(node)); return; }
+    if (typeof node === 'number') {
+      // JSON 不支持非有限数值，直接固定错误，不做伪 string 转换。
+      if (!Number.isFinite(node)) {
+        throw new Error('业务工具参数包含不支持的比较类型（number），失败关闭');
+      }
+      push(JSON.stringify(node));
+      return;
+    }
+    // bigint/symbol/function 等 JSON 输入不支持的类型同样固定错误。
+    if (typeof node !== 'object') {
+      throw new Error('业务工具参数包含不支持的比较类型（' + typeof node + '），失败关闭');
+    }
+    if (Array.isArray(node)) {
+      push('[');
+      for (let index = 0; index < node.length; index += 1) {
+        if (index > 0) push(',');
+        walk(node[index], depth + 1);
+      }
+      push(']');
+      return;
+    }
+    const record = node as Record<string, unknown>;
+    const keys = Object.keys(record).sort();
+    push('{');
+    for (let index = 0; index < keys.length; index += 1) {
+      if (index > 0) push(',');
+      push(encodeString(keys[index]));
+      push(':');
+      walk(record[keys[index]], depth + 1);
+    }
+    push('}');
+  };
+  walk(value, 0);
+  return parts.join('');
+}
 
 export interface RunCliOptions {
   launchLifecycle?: {
@@ -165,10 +253,11 @@ function runIsolatedChild(options: {
     let observedSessionId = sessionId;
     let observedAnswer: string | undefined;
     let observedStats: CliRunResult['stats'];
-    const observedToolCalls = new Map<
-      string,
-      NonNullable<CliRunResult['toolCalls']>[number]
-    >();
+    // 212：tool_call 只存候选；必须收到对应明确 tool_end.failed===false 才收下。
+    const pendingToolCalls = new Map<string, ToolCallCandidate>();
+    const confirmedToolCalls = new Map<string, ToolCallCandidate>();
+    // 216：失败终止墓碑——本 run 内该 toolUseId 永久不能转正为业务调用。
+    const failedToolCallIds = new Set<string>();
     let finalResult: CliRunResult | undefined;
     let resultError: Error | undefined;
     let appToolError: Error | undefined;
@@ -235,11 +324,43 @@ function runIsolatedChild(options: {
             // Keep role violations even if the CLI later emits a failed tool result.
             appToolError = error as Error;
           }
-          observedToolCalls.set(event.toolUseId, event);
+          if (failedToolCallIds.has(event.toolUseId)) {
+            // 已失败终止的 id 不得重启转正；上方权限检查已完成并保留。
+            throw new Error('Agent OS 协议错误：toolUseId 已失败终止，不得重新 started（' + event.toolUseId + '）。');
+          }
+          const seen = pendingToolCalls.get(event.toolUseId)
+            ?? confirmedToolCalls.get(event.toolUseId);
+          if (seen) {
+            // 重复 started 至多一份；同 id 不同工具名/参数属协议违例，失败关闭。
+            if (seen.toolName !== event.toolName || seen.inputKey !== toolInputKey(event.input)) {
+              throw new Error('Agent OS 协议错误：同一 toolUseId 重复 started 且工具名或参数不一致（' + event.toolUseId + '）。');
+            }
+          } else {
+            pendingToolCalls.set(event.toolUseId, {
+              toolUseId: event.toolUseId,
+              toolName: event.toolName,
+              input: event.input,
+              inputKey: toolInputKey(event.input),
+            });
+          }
           continue;
         }
-        if (event.type === 'tool_end' && event.failed) {
-          observedToolCalls.delete(event.toolUseId);
+        if (event.type === 'tool_end') {
+          // 无候选的结束（native 工具或未匹配的早到结束）不生成业务调用，
+          // 也不替后续 started 预先签成功。
+          if (event.failed) {
+            // 216：失败优先——同时删候选与已确认调用，并记失败终止墓碑；
+            // 不能因「已经成功」忽略失败。
+            pendingToolCalls.delete(event.toolUseId);
+            confirmedToolCalls.delete(event.toolUseId);
+            failedToolCallIds.add(event.toolUseId);
+            continue;
+          }
+          const candidate = pendingToolCalls.get(event.toolUseId);
+          if (candidate) {
+            pendingToolCalls.delete(event.toolUseId);
+            confirmedToolCalls.set(event.toolUseId, candidate);
+          }
           continue;
         }
         if (event.type === 'result') {
@@ -307,8 +428,18 @@ function runIsolatedChild(options: {
         if (!finalResult) {
           return fail(new Error(`${adapter.displayName} 没有返回最终结果`));
         }
-        if (observedToolCalls.size > 0) {
-          finalResult.toolCalls = [...observedToolCalls.values()].map((call) => ({
+        if (pendingToolCalls.size > 0) {
+          // 212：未收到明确成功结束的候选不收下，也不返回审批/派发动作。
+          const pending = [...pendingToolCalls.values()]
+            .map((call) => call.toolName + '(' + call.toolUseId + ')')
+            .join('、');
+          return fail(new Error(
+            '业务工具未完成：' + pending + ' 缺成功结果（未收到明确的成功 tool_end），不收下 started 候选、不返回审批/派发动作',
+          ));
+        }
+        const confirmedCalls = [...confirmedToolCalls.values()];
+        if (confirmedCalls.length > 0) {
+          finalResult.toolCalls = confirmedCalls.map((call) => ({
             toolUseId: call.toolUseId,
             toolName: call.toolName,
             input: call.input,

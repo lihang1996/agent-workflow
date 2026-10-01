@@ -453,3 +453,59 @@ test('architecture review stays stage-gated and schema-checked', () => {
     [{ toolName: ARCHITECTURE_REVIEW, input: ARCHITECTURE_INPUT }],
   );
 });
+
+
+test('codex item.completed for business mcp_tool_call requires the official success shape', () => {
+  const codex = new CodexAdapter([...APP_TOOL_NAMES]);
+  const end = (item: Record<string, unknown>) => codex.parseEvents(JSON.stringify({ type: 'item.completed', item }))[0];
+  const base = { id: 'x-end', type: 'mcp_tool_call', server: 'agent_os', tool: ARCHITECTURE_REVIEW };
+  // 官方 0.150.1 成功形态：status completed + result.content 数组（meta/structured_content 并存）。
+  assert.deepEqual(end({
+    ...base,
+    status: 'completed',
+    result: { content: [{ type: 'text', text: 'ok' }], meta: {}, structured_content: { ok: true } },
+  }), { type: 'tool_end', toolUseId: 'x-end', failed: false });
+  // content 为空数组仍是合法数组（只返回 structured_content 的工具）。
+  assert.deepEqual(
+    end({ ...base, status: 'completed', result: { content: [], structured_content: { ok: true } } }),
+    { type: 'tool_end', toolUseId: 'x-end', failed: false },
+  );
+  // 「不是 failed」不等于成功：status 缺失/in_progress、result 缺失/null/非对象、
+  // error 存在、包装 isError/is_error===true 一律失败。
+  const failedShapes = [
+    { ...base },
+    { ...base, status: 'in_progress' },
+    { ...base, status: 'failed' },
+    { ...base, status: 'completed' },
+    { ...base, status: 'completed', result: null },
+    { ...base, status: 'completed', result: 'ok' },
+    { ...base, status: 'completed', result: { content: 'ok' } },
+    { ...base, status: 'completed', error: 'agent_os 调用失败', result: { content: [] } },
+    { ...base, status: 'completed', result: { content: [], isError: true } },
+    { ...base, status: 'completed', result: { content: [], is_error: true } },
+  ];
+  for (const item of failedShapes) {
+    assert.deepEqual(end(item), { type: 'tool_end', toolUseId: 'x-end', failed: true }, JSON.stringify(item));
+  }
+});
+
+test('codex keeps the native item.completed end contract for bash and file changes', () => {
+  const codex = new CodexAdapter([ARCHITECTURE_REVIEW]);
+  const end = (item: Record<string, unknown>) => codex.parseEvents(JSON.stringify({ type: 'item.completed', item }))[0];
+  assert.deepEqual(
+    end({ id: 'n-ok', type: 'command_execution', status: 'completed', exit_code: 0 }),
+    { type: 'tool_end', toolUseId: 'n-ok', failed: false },
+  );
+  assert.deepEqual(
+    end({ id: 'n-bad', type: 'command_execution', status: 'completed', exit_code: 127 }),
+    { type: 'tool_end', toolUseId: 'n-bad', failed: true },
+  );
+  assert.deepEqual(
+    end({ id: 'n-crash', type: 'command_execution', status: 'failed' }),
+    { type: 'tool_end', toolUseId: 'n-crash', failed: true },
+  );
+  assert.deepEqual(
+    end({ id: 'n-edit', type: 'file_change', status: 'completed', changes: [{ path: 'docs/a.md' }] }),
+    { type: 'tool_end', toolUseId: 'n-edit', failed: false },
+  );
+});

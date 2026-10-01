@@ -61,6 +61,21 @@ function toolInfo(item: Record<string, unknown>): {
   return undefined;
 }
 
+/**
+ * 212：官方 0.150.1 的 MCP item.completed 成功形态是 status==='completed'、
+ * result 为对象且 content 是数组、无 error（error 字段存在或包装
+ * isError/is_error===true 均视为失败）。status 缺失/in_progress、result
+ * 缺失或 null 一律不算成功；不要求官方没有的字段。
+ */
+function mcpToolCallCompletedSuccessfully(item: Record<string, unknown>): boolean {
+  if (item.status !== 'completed') return false;
+  if (item.error !== undefined && item.error !== null) return false;
+  const result = item.result;
+  if (!isRecord(result)) return false;
+  if (result.isError === true || result.is_error === true) return false;
+  return Array.isArray(result.content);
+}
+
 function parseStats(usage: unknown): CliRunStats | undefined {
   if (!isRecord(usage)) return undefined;
   const inputTokens = asNumber(usage.input_tokens);
@@ -234,6 +249,14 @@ export class CodexAdapter implements CliAdapter {
       return events;
     }
     if (event.type === 'item.completed') {
+      if (item.type === 'mcp_tool_call') {
+        // 212：业务 MCP 工具必须明确完成成功——「不是 failed」不算成功。
+        return [{
+          type: 'tool_end',
+          toolUseId: item.id,
+          failed: !mcpToolCallCompletedSuccessfully(item),
+        }];
+      }
       const exitCode = asNumber(item.exit_code);
       return [{
         type: 'tool_end',
