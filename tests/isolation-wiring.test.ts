@@ -1,10 +1,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { assertCapabilityAllowsLaunch, JsonIsolationCapabilityStore } from '../src/core/isolation-capability.js';
-import { adjudicateAttempt, createProductionIsolationPreparer } from '../src/core/isolation.js';
+import {
+  adjudicateAttempt,
+  createProductionIsolationPreparer,
+  type IsolationPrepareInput,
+  type IsolationSupplier,
+  type PreparedIsolation,
+} from '../src/core/isolation.js';
 
 const SOURCE_ROOT = new URL('../src/', import.meta.url);
 
@@ -27,6 +33,54 @@ const PASSED_ENTRY = {
   evidenceRef: '.agent-os/probe/canary-codex-2026-09-30.out.txt',
   expiresAt: '9999-12-31T23:59:59.000Z',
 };
+
+/**
+ * 209 号（纠正环境假设）：正例统一经本 helper 驱动生产 preparer——能力必须
+ * 命中；真实环境（AO_DIRECT_OS=1，无外层沙箱可嵌套）继续准备并成功；受限
+ * 环境（测试进程本身在宿主沙箱内）在 fixture 写预检阶段明确失败。
+ *
+ * 只捕获 preparer 本身抛出的异常（捕获范围不包住后续断言）：
+ * - AO_DIRECT_OS=1（真实 OS）：任何异常都原样重抛——预检必须成功，异常即真实回归；
+ * - 受限环境：只接受 `/^隔离预检失败（fixture 写探针）：/` 这一已确认预检
+ *   阶段的错误（它只会出现在能力核验通过之后，证明能力已命中）；能力拒绝/
+ *   ENOENT/其他任何异常不能当作成功，一律重抛。
+ *
+ * prepare 成功时不宽泛接受任何结果：核验 capabilityKey 与 fixture 写入的
+ * 准确键一致、binaryRealPath 为当前期望二进制 realpath、context.cwd 为输入
+ * cwd 的 realpath、purpose 为 probe；finally 中 finalize + dispose（未启动
+ * 任何 child ⇒ dispose 只清理本 prepare 自建的 ephemeral scratch，安全），
+ * 并断言 dispose 结果与 scratch 已清理。
+ */
+async function prepareProbeExpectingCapabilityHit(
+  supplier: IsolationSupplier,
+  input: IsolationPrepareInput,
+  expected: { capabilityKey: string; binaryRealPath: string },
+): Promise<void> {
+  assert.ok(expected.capabilityKey, '期望能力键必须来自 fixture 唯一条目（非空）');
+  let prepared: PreparedIsolation;
+  try {
+    prepared = await supplier(input);
+  } catch (error) {
+    if (process.env.AO_DIRECT_OS === '1') throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/^隔离预检失败（fixture 写探针）：/.test(message)) throw error;
+    return; // 受限环境：能力核验已通过，fixture 预检明确失败（已确认阶段）。
+  }
+  const scratch = prepared.pendingEphemeralScratch;
+  try {
+    assert.equal(prepared.capabilityKey, expected.capabilityKey, '能力键必须命中 fixture 写入的准确键');
+    assert.equal(prepared.harness.binaryRealPath, expected.binaryRealPath, '二进制必须解析到当前期望的 realpath');
+    assert.equal(prepared.context.cwd, realpathSync(input.cwd), 'context.cwd 必须为输入 cwd 的 realpath');
+    assert.equal(prepared.context.purpose, 'probe', '探测 purpose 必须为 probe');
+  } finally {
+    await prepared.finalize(); // probe purpose 为 no-op，仍按生命周期调用。
+    const disposed = prepared.dispose();
+    assert.equal(disposed.disposed, true, 'dispose 必须清理本 prepare 的 ephemeral scratch');
+    if (scratch !== undefined) {
+      assert.ok(!existsSync(scratch), 'dispose 后 scratch 目录必须已删除');
+    }
+  }
+}
 
 /**
  * 静态接线断言（100 号修订版 §2.2「逐入口接线并作静态断言」）：
@@ -97,7 +151,8 @@ test('capability store refreshes on content change even when mtime is preserved 
 
 test('production preparer binds binary content identity; replaced binary rejects at capability check (A03 166 号返工)', async (t) => {
   const { computeBinaryContentSha256, computeBinaryFingerprint, computeIsolationCapabilityIdentity, protectedRootsDigest } = await import('../src/core/isolation-capability.js');
-  const dir = mkdtempSync(join(tmpdir(), 'agent-os-prod-preparer-'));
+  // macOS：tmpdir() 可能返回 /var/folders/...（/private/var 的路径别名），此处规范化以与生产 preparer 的 realpath 同源。
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'agent-os-prod-preparer-')));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const binDir = join(dir, 'bin');
   mkdirSync(binDir);
@@ -118,10 +173,11 @@ test('production preparer binds binary content identity; replaced binary rejects
       contentSha256: await computeBinaryContentSha256(fakeBinary),
     }),
   });
-  const capabilityFileOf = async (): Promise<string> => {
+  const capabilityFileOf = async (): Promise<{ filePath: string; capabilityKey: string }> => {
+    const capabilityKey = await keyFor();
     const filePath = join(dir, `capability-${Date.now()}.json`);
-    writeFileSync(filePath, JSON.stringify({ _v: 2, entries: { [await keyFor()]: entry } }));
-    return filePath;
+    writeFileSync(filePath, JSON.stringify({ _v: 2, entries: { [capabilityKey]: entry } }));
+    return { filePath, capabilityKey };
   };
   const preparerOf = (capabilityFilePath: string) => createProductionIsolationPreparer({
     capabilityFilePath,
@@ -129,13 +185,14 @@ test('production preparer binds binary content identity; replaced binary rejects
     envBase: { PATH: binDir },
   });
 
-  // 指纹身份命中：能力核验通过（继续走到 fixture 预检；本环境嵌套沙箱被拒，
-  // 预检失败即证明能力核验已通过——错误类型是区分判据）。
-  const first = preparerOf(await capabilityFileOf());
-  await assert.rejects(
-    first({ taskId: 't1', purpose: 'probe', command: 'codex', cwd: dir }),
-    /隔离预检失败|fixture 写探针/,
-    '带指纹证据应通过能力核验并到达预检',
+  // 指纹身份命中：能力必须命中——真实环境继续准备成功，受限环境在 fixture
+  // 预检阶段明确失败（helper 只接受该已确认预检错误，其余异常一律判失败）。
+  const firstEvidence = await capabilityFileOf();
+  const first = preparerOf(firstEvidence.filePath);
+  await prepareProbeExpectingCapabilityHit(
+    first,
+    { taskId: 't1', purpose: 'probe', command: 'codex', cwd: dir },
+    { capabilityKey: firstEvidence.capabilityKey, binaryRealPath: realpathSync(fakeBinary) },
   );
 
   // 原地替换二进制内容（同路径、--version 可不变）：旧证据失效 ⇒ 能力核验拒绝。
@@ -147,16 +204,18 @@ test('production preparer binds binary content identity; replaced binary rejects
   );
 
   // 新内容重新登记证据后又能通过（canary 重跑后的正常路径）。
-  const second = preparerOf(await capabilityFileOf());
-  await assert.rejects(
-    second({ taskId: 't3', purpose: 'probe', command: 'codex', cwd: dir }),
-    /隔离预检失败|fixture 写探针/,
+  const secondEvidence = await capabilityFileOf();
+  const second = preparerOf(secondEvidence.filePath);
+  await prepareProbeExpectingCapabilityHit(
+    second,
+    { taskId: 't3', purpose: 'probe', command: 'codex', cwd: dir },
+    { capabilityKey: secondEvidence.capabilityKey, binaryRealPath: realpathSync(fakeBinary) },
   );
 });
 
 test('production preparer reloads protected roots on every call (A03 166 号返工)', async (t) => {
   const { computeBinaryContentSha256, computeBinaryFingerprint, computeIsolationCapabilityIdentity, protectedRootsDigest } = await import('../src/core/isolation-capability.js');
-  const dir = mkdtempSync(join(tmpdir(), 'agent-os-prod-roots-'));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'agent-os-prod-roots-')));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const binDir = join(dir, 'bin');
   mkdirSync(binDir);
@@ -166,17 +225,18 @@ test('production preparer reloads protected roots on every call (A03 166 号返�
   mkdirSync(protectedRoot);
   const rootsFile = join(dir, 'roots.json');
   writeFileSync(rootsFile, JSON.stringify({ version: 'roots-test-v1', roots: [protectedRoot] }));
+  const capabilityKey = computeIsolationCapabilityIdentity({
+    command: 'codex', purpose: 'probe', protectedRootsVersion: 'roots-test-v1',
+    writePolicy: 'none', platform: process.platform,
+    protectedRootsDigest: protectedRootsDigest([protectedRoot]),
+    binaryFingerprint: computeBinaryFingerprint({
+      binaryRealPath: fakeBinary,
+      contentSha256: await computeBinaryContentSha256(fakeBinary),
+    }),
+  });
   const capabilityFilePath = join(dir, 'capability.json');
   writeFileSync(capabilityFilePath, JSON.stringify({ _v: 2, entries: {
-    [computeIsolationCapabilityIdentity({
-      command: 'codex', purpose: 'probe', protectedRootsVersion: 'roots-test-v1',
-      writePolicy: 'none', platform: process.platform,
-    protectedRootsDigest: protectedRootsDigest([protectedRoot]),
-      binaryFingerprint: computeBinaryFingerprint({
-        binaryRealPath: fakeBinary,
-        contentSha256: await computeBinaryContentSha256(fakeBinary),
-      }),
-    })]: { ...PASSED_ENTRY, evidenceRef: 'fixture://prod-roots' },
+    [capabilityKey]: { ...PASSED_ENTRY, evidenceRef: 'fixture://prod-roots' },
   } }));
   const preparer = createProductionIsolationPreparer({
     capabilityFilePath,
@@ -184,10 +244,12 @@ test('production preparer reloads protected roots on every call (A03 166 号返�
     envBase: { PATH: binDir },
   });
 
-  // 初次：能力命中（到达预检）。
-  await assert.rejects(
-    preparer({ taskId: 'r1', purpose: 'probe', command: 'codex', cwd: dir }),
-    /隔离预检失败|fixture 写探针/,
+  // 初次：能力必须命中——真实环境继续准备成功，受限环境在 fixture 预检
+  // 阶段明确失败（两种结局都证明能力核验已通过，由 helper 精确区分）。
+  await prepareProbeExpectingCapabilityHit(
+    preparer,
+    { taskId: 'r1', purpose: 'probe', command: 'codex', cwd: dir },
+    { capabilityKey, binaryRealPath: realpathSync(fakeBinary) },
   );
 
   // 运行期变更根清单（同一 supplier，版本不变，指向不存在的根）：下一次启动
@@ -215,7 +277,7 @@ test('production preparer reloads protected roots on every call (A03 166 号返�
 
 test('production preparer resolves binary via PATH; rebinding PATH invalidates old evidence (A03 166 号返工)', async (t) => {
   const { computeBinaryContentSha256, computeBinaryFingerprint, computeIsolationCapabilityIdentity, protectedRootsDigest } = await import('../src/core/isolation-capability.js');
-  const dir = mkdtempSync(join(tmpdir(), 'agent-os-prod-path-'));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'agent-os-prod-path-')));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const binA = join(dir, 'bin-a');
   const binB = join(dir, 'bin-b');
@@ -227,26 +289,29 @@ test('production preparer resolves binary via PATH; rebinding PATH invalidates o
   mkdirSync(protectedRoot);
   const rootsFile = join(dir, 'roots.json');
   writeFileSync(rootsFile, JSON.stringify({ version: 'path-test-v1', roots: [protectedRoot] }));
+  const keyViaA = computeIsolationCapabilityIdentity({
+    command: 'codex', purpose: 'probe', protectedRootsVersion: 'path-test-v1',
+    writePolicy: 'none', platform: process.platform,
+    protectedRootsDigest: protectedRootsDigest([protectedRoot]),
+    binaryFingerprint: computeBinaryFingerprint({
+      binaryRealPath: join(binA, 'codex'),
+      contentSha256: await computeBinaryContentSha256(join(binA, 'codex')),
+    }),
+  });
   const capabilityFilePath = join(dir, 'capability.json');
   writeFileSync(capabilityFilePath, JSON.stringify({ _v: 2, entries: {
-    [computeIsolationCapabilityIdentity({
-      command: 'codex', purpose: 'probe', protectedRootsVersion: 'path-test-v1',
-      writePolicy: 'none', platform: process.platform,
-    protectedRootsDigest: protectedRootsDigest([protectedRoot]),
-      binaryFingerprint: computeBinaryFingerprint({
-        binaryRealPath: join(binA, 'codex'),
-        contentSha256: await computeBinaryContentSha256(join(binA, 'codex')),
-      }),
-    })]: { ...PASSED_ENTRY, evidenceRef: 'fixture://prod-path' },
+    [keyViaA]: { ...PASSED_ENTRY, evidenceRef: 'fixture://prod-path' },
   } }));
 
-  // PATH 指向 binA：指纹身份命中（到达预检）。
+  // PATH 指向 binA：指纹身份命中——能力必须命中；真实环境继续准备成功，
+  // 受限环境在 fixture 预检阶段明确失败（helper 精确区分两种结局）。
   const viaA = createProductionIsolationPreparer({
     capabilityFilePath, protectedRootsFilePath: rootsFile, envBase: { PATH: binA },
   });
-  await assert.rejects(
-    viaA({ taskId: 'p1', purpose: 'probe', command: 'codex', cwd: dir }),
-    /隔离预检失败|fixture 写探针/,
+  await prepareProbeExpectingCapabilityHit(
+    viaA,
+    { taskId: 'p1', purpose: 'probe', command: 'codex', cwd: dir },
+    { capabilityKey: keyViaA, binaryRealPath: realpathSync(join(binA, 'codex')) },
   );
   // PATH 换绑到 binB（不同二进制）：旧证据失效 ⇒ 能力核验拒绝。
   const viaB = createProductionIsolationPreparer({
@@ -266,6 +331,70 @@ test('production preparer resolves binary via PATH; rebinding PATH invalidates o
     viaNone({ taskId: 'p3', purpose: 'probe', command: 'codex', cwd: dir }),
     /无法在 PATH 上解析引擎命令/,
   );
+});
+
+// ---- 209：prepare helper 自身的负例单测 ---------------------------------------------
+
+test('prepare helper rethrows non-precheck errors instead of accepting them (209)', async () => {
+  // 能力拒绝不是预检错误：不能借「受限环境」宽泛当作成功，必须原样拒绝。
+  const noEvidence: IsolationSupplier = async () => {
+    throw new Error('引擎读写隔离未验证（blocked）：无该环境键下的 canary 证据（G-W6b-CANARY 未执行）');
+  };
+  await assert.rejects(
+    prepareProbeExpectingCapabilityHit(
+      noEvidence,
+      { taskId: 'h1', purpose: 'probe', command: 'codex', cwd: '.' },
+      { capabilityKey: 'expected-key', binaryRealPath: '/nonexistent/codex' },
+    ),
+    /引擎读写隔离未验证/,
+  );
+  // ENOENT 等其他错误同样不能当作成功：helper 只接受行首锚定的预检前缀。
+  const missingRoot: IsolationSupplier = async () => {
+    throw new Error("ENOENT: no such file or directory, realpath '/missing/root'");
+  };
+  await assert.rejects(
+    prepareProbeExpectingCapabilityHit(
+      missingRoot,
+      { taskId: 'h1b', purpose: 'probe', command: 'codex', cwd: '.' },
+      { capabilityKey: 'expected-key', binaryRealPath: '/nonexistent/codex' },
+    ),
+    /ENOENT/,
+  );
+});
+
+test('prepare helper rejects a wrong capabilityKey and still disposes the prepare scratch (209)', async (t) => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'agent-os-helper-stub-')));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  let disposeCalls = 0;
+  const stub: PreparedIsolation = {
+    harness: {
+      capabilityStore: { lookup: () => undefined },
+      binaryRealPath: join(dir, 'codex'),
+    },
+    context: {
+      taskId: 'h2', purpose: 'probe', command: 'codex', cwd: dir,
+      scratchDir: join(dir, 'scratch'), allowedPaths: [],
+      protectedRoots: { version: 'helper-stub-v1', roots: [dir] },
+    },
+    profile: '(version 1)',
+    env: { PATH: dir },
+    capabilityKey: 'wrong-key-from-stub',
+    finalize: async () => undefined,
+    dispose: () => {
+      disposeCalls += 1;
+      return { disposed: true };
+    },
+    pendingEphemeralScratch: join(dir, 'scratch'),
+  };
+  await assert.rejects(
+    prepareProbeExpectingCapabilityHit(
+      async () => stub,
+      { taskId: 'h2', purpose: 'probe', command: 'codex', cwd: dir },
+      { capabilityKey: 'expected-key', binaryRealPath: join(dir, 'codex') },
+    ),
+    /能力键/,
+  );
+  assert.equal(disposeCalls, 1, '断言失败路径也必须 finalize + dispose 本 prepare 的 scratch');
 });
 
 // ---- A03：过期拒绝 + 文件刷新 ------------------------------------------------------
