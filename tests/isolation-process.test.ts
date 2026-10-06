@@ -7,9 +7,13 @@ import { join } from 'node:path';
 import {
   assertGroupFullyExited,
   isProcessGroupAlive,
+  isZombieState,
   launchIsolated,
+  listProcessGroup,
+  parseProcessGroupListing,
   prepareIsolation,
   requireSessionScratchBinding,
+  settleGroupAfterExit,
   terminateIsolatedChild,
   type IsolationProtectedRoots,
 } from '../src/core/isolation.js';
@@ -99,6 +103,59 @@ test('assertGroupFullyExited fails closed when group members survive', async (t)
   await new Promise((resolve) => child.once('close', resolve));
   assert.throws(() => assertGroupFullyExited(child.pid!), /仍有存活后代/);
   await terminateIsolatedChild(child, { termGraceMs: 1_000, killGraceMs: 1_000 });
+});
+
+// ---- 正常退出后的组收尾：宽限 / 升级终止 / 僵尸排除（2026-10-07 误杀回归） --------
+
+test('settleGroupAfterExit: 辅助进程滞后有序退出 ⇒ 宽限窗口内判 settled，不丢弃已完成结果', { timeout: 15_000 }, async (t) => {
+  // 复现线上竞态：组长（wrapper/CLI 主进程）立即退出，孙进程 0.6s 后自行退出。
+  // 曾经的一次瞬时核验会把这个窗口当「有存活后代」判失败。
+  const child = spawn('sh', ['-c', 'sleep 0.6 & exit 0'], { detached: true, stdio: 'ignore' });
+  t.after(() => { try { process.kill(-child.pid!, 'SIGKILL'); } catch { /* 已退 */ } });
+  await new Promise((resolve) => child.once('close', resolve));
+  const outcome = await settleGroupAfterExit(child.pid, { graceMs: 3_000, termGraceMs: 1_000, killGraceMs: 1_000 });
+  assert.equal(outcome.outcome, 'settled');
+  assert.doesNotThrow(() => assertGroupFullyExited(child.pid!));
+});
+
+test('settleGroupAfterExit: 宽限耗尽仍有存活 ⇒ 升级整组终止后 settled', { timeout: 15_000 }, async (t) => {
+  // 孙进程 sleep 30s 不会自己退：宽限耗尽后必须整组终止并核验干净，而不是判失败。
+  const child = spawn('sh', ['-c', 'sleep 30 & exit 0'], { detached: true, stdio: 'ignore' });
+  t.after(() => { try { process.kill(-child.pid!, 'SIGKILL'); } catch { /* 已退 */ } });
+  await new Promise((resolve) => child.once('close', resolve));
+  const outcome = await settleGroupAfterExit(child.pid, { graceMs: 300, termGraceMs: 1_000, killGraceMs: 1_000 });
+  assert.equal(outcome.outcome, 'settled');
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.deepEqual(isProcessGroupAlive(child.pid!), { ok: true, alive: false });
+});
+
+test('parseProcessGroupListing: state/command 解析与僵尸识别（command 含空格）', () => {
+  const stdout = [
+    '  123 123 S node /usr/local/bin/foo --bar baz',
+    '  124 123 Z (helper)',
+    '  999 777 R other-group proc',
+    '',
+  ].join('\n');
+  assert.deepEqual(parseProcessGroupListing(stdout, 123), [
+    { pid: 123, state: 'S', command: 'node /usr/local/bin/foo --bar baz' },
+    { pid: 124, state: 'Z', command: '(helper)' },
+  ]);
+  assert.equal(isZombieState('Z'), true);
+  assert.equal(isZombieState('Z+'), true);
+  assert.equal(isZombieState('S'), false);
+  assert.equal(isZombieState('R'), false);
+});
+
+test('listProcessGroup: 存活成员枚举出 state 与命令行（诊断详情可用）', async (t) => {
+  const child = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { detached: true, stdio: 'ignore' });
+  t.after(() => { try { process.kill(-child.pid!, 'SIGKILL'); } catch { /* 已退 */ } });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  const snapshot = listProcessGroup(child.pid!);
+  assert.equal(snapshot.ok, true);
+  const leader = snapshot.members.find((member) => member.pid === child.pid);
+  assert.ok(leader, '组长必须出现在枚举结果中');
+  assert.ok(!isZombieState(leader.state));
+  assert.ok(leader.command.length > 0);
 });
 
 // ---- 能力先于 scratch + 失败清理（119 号 P1-1） ------------------------------------

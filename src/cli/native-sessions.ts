@@ -1,10 +1,10 @@
-import { assertGroupFullyExited, terminateIsolatedChild } from '../core/isolation.js';
+import { terminateIsolatedChild } from '../core/isolation.js';
 import { createReadStream } from 'node:fs';
 import { readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { CliAdapter, CliSessionSummary } from './types.js';
-import { launchIsolated, type IsolationSupplier } from '../core/isolation.js';
+import { launchIsolated, settleGroupAfterExit, type IsolationSupplier } from '../core/isolation.js';
 
 const SESSION_LIMIT = 8;
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -271,11 +271,17 @@ async function listCodexSessions(
     child.once('close', (code) => {
       if (settled || settling) return;
       void (async () => {
-        // close 后核验：wrapper 退出 ≠ 后端退出；幸存者/无法核验 ⇒ 失败关闭。
-        try {
-          assertGroupFullyExited(child.pid);
-        } catch (groupError) {
-          await fail(groupError as Error);
+        // close 后核验：wrapper 退出 ≠ 后端退出。辅助进程可能滞后有序退出，
+        // 给有界宽限再升级终止；幸存者/无法核验 ⇒ 失败关闭。
+        const groupOutcome = await settleGroupAfterExit(child.pid).catch(
+          (error: Error): { outcome: 'unverifiable'; reason: string } => ({ outcome: 'unverifiable', reason: error.message }),
+        );
+        if (groupOutcome.outcome === 'unverifiable') {
+          await fail(new Error(`无法核验隔离进程组（${groupOutcome.reason}），失败关闭。`));
+          return;
+        }
+        if (groupOutcome.outcome === 'survivors') {
+          await fail(new Error(`隔离进程组仍有存活后代（${groupOutcome.detail}），wrapper 退出不代表 CLI/后端退出，任务判失败。`));
           return;
         }
         await fail(new Error(

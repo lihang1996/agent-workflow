@@ -540,9 +540,18 @@ export function launchIsolated(
 
 // ---- 隔离进程组收尾（119 号 P1-2） ------------------------------------------------
 
+export interface ProcessGroupMember {
+  pid: number;
+  /** ps state 首字母（Z=僵尸、U=不可中断等待、S/R=正常运行等）。 */
+  state: string;
+  /** 完整命令行（诊断用）。 */
+  command: string;
+}
+
 export interface ProcessGroupSnapshot {
   ok: boolean;
   pids: number[];
+  members: ProcessGroupMember[];
   error?: string;
 }
 
@@ -570,31 +579,70 @@ export function isProcessGroupAlive(pgid: number): ProcessGroupLiveness {
   }
 }
 
+/** ps state 首字母为 Z ⇒ 僵尸（已死未收尸）：kill(-pgid,0) 会命中，但后端已不在跑。 */
+export function isZombieState(state: string): boolean {
+  return state.startsWith('Z');
+}
+
 /**
- * 枚举进程组成员（`ps -eo pid=,pgid=`，仅诊断补充）。ps 不可用 ⇒ {ok:false}。
+ * 解析 `ps -eo pid=,pgid=,state=,command=` 输出中属于指定进程组的成员。
+ * command 含空格 ⇒ 按前三个定长字段切分后剩余部分整体为命令行。
+ */
+export function parseProcessGroupListing(stdout: string, pgid: number): ProcessGroupMember[] {
+  const members: ProcessGroupMember[] = [];
+  for (const line of stdout.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const [pidText, pgidText, state, ...commandParts] = trimmed.split(/\s+/);
+    if (Number(pgidText) !== pgid || !Number.isFinite(Number(pidText))) continue;
+    if (!state) continue;
+    members.push({ pid: Number(pidText), state, command: commandParts.join(' ') });
+  }
+  return members;
+}
+
+/**
+ * 枚举进程组成员（`ps -eo pid=,pgid=,state=,command=`，诊断与僵尸排除用）。
+ * ps 不可用 ⇒ {ok:false}；调用方不得据此判定「已清」（见 groupHasNoLiveMembers）。
  */
 export function listProcessGroup(pgid: number): ProcessGroupSnapshot {
   if (!pgid || process.platform === 'win32') {
-    return { ok: false, pids: [], error: `无法核验进程组（pgid=${pgid}）` };
+    return { ok: false, pids: [], members: [], error: `无法核验进程组（pgid=${pgid}）` };
   }
   try {
-    const result = spawnSync('ps', ['-eo', 'pid=,pgid='], { encoding: 'utf8', timeout: 10_000 });
+    const result = spawnSync('ps', ['-eo', 'pid=,pgid=,state=,command='], { encoding: 'utf8', timeout: 10_000 });
     if (result.error || result.status !== 0) {
-      return { ok: false, pids: [], error: `ps 枚举失败: ${result.error?.message ?? `status=${result.status}`}` };
+      return { ok: false, pids: [], members: [], error: `ps 枚举失败: ${result.error?.message ?? `status=${result.status}`}` };
     }
-    const pids: number[] = [];
-    for (const line of (result.stdout ?? '').split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      const [pidText, pgidText] = trimmed.split(/\s+/);
-      if (Number(pgidText) === pgid && Number.isFinite(Number(pidText))) {
-        pids.push(Number(pidText));
-      }
-    }
-    return { ok: true, pids };
+    const members = parseProcessGroupListing(result.stdout ?? '', pgid);
+    return { ok: true, pids: members.map((member) => member.pid), members };
   } catch (error) {
-    return { ok: false, pids: [], error: (error as Error).message };
+    return { ok: false, pids: [], members: [], error: (error as Error).message };
   }
+}
+
+/**
+ * 组内是否已无存活成员：syscall ESRCH ⇒ 已清（快速路径，不依赖 ps）；syscall
+ * 仍报存活时用 ps 枚举排除僵尸（Z 已死未收尸，不代表 CLI/后端还在跑）。
+ * ps 枚举不可用 ⇒ 维持 syscall 的判活结论（不据此放宽），失败关闭不降级。
+ * 返回 string ⇒ 无法核验（syscall 层失败），调用方失败关闭。
+ */
+function groupHasNoLiveMembers(pgid: number): boolean | string {
+  const liveness = isProcessGroupAlive(pgid);
+  if (!liveness.ok) return liveness.error;
+  if (!liveness.alive) return true;
+  const snapshot = listProcessGroup(pgid);
+  if (!snapshot.ok) return false;
+  return snapshot.members.every((member) => isZombieState(member.state));
+}
+
+/** 幸存者诊断：pid + state + 命令行（只列非僵尸成员），枚举失败时降级提示。 */
+function describeGroupSurvivors(pgid: number): string {
+  const snapshot = listProcessGroup(pgid);
+  if (!snapshot.ok) return '组内仍有存活进程（无法枚举 pid）';
+  const live = snapshot.members.filter((member) => !isZombieState(member.state));
+  if (live.length === 0) return '组内仍有存活进程（无法枚举 pid）';
+  return live.map((member) => `pid=${member.pid} state=${member.state} ${member.command}`.trimEnd()).join('；');
 }
 
 async function waitFor(ms: number): Promise<void> {
@@ -621,11 +669,8 @@ export async function terminateIsolatedChild(
   }
   const termGraceMs = options.termGraceMs ?? 2_000;
   const killGraceMs = options.killGraceMs ?? 1_500;
-  const groupGone = (): boolean | string => {
-    const liveness = isProcessGroupAlive(pgid);
-    if (!liveness.ok) return liveness.error;
-    return !liveness.alive;
-  };
+  // 僵尸感知：SIGKILL 杀不死已退出未收尸的成员，纯 syscall 会把它误报为存活。
+  const groupGone = (): boolean | string => groupHasNoLiveMembers(pgid);
   try {
     process.kill(-pgid, 'SIGTERM');
   } catch { /* ESRCH：组已不存在 */ }
@@ -653,21 +698,63 @@ export async function terminateIsolatedChild(
 
 /**
  * 子进程已退出后的核验：进程组内不得再有存活成员（后端/CLI 不得比 wrapper
- * 活得长）。无法核验或存在幸存者 ⇒ 抛错（失败关闭），尽力附幸存 pid 供诊断。
+ * 活得长；僵尸已死未收尸，不算存活）。无法核验或存在幸存者 ⇒ 抛错（失败
+ * 关闭），附幸存 pid/state/命令行供诊断。仍是瞬时检查、无宽限——正常完成
+ * 路径请用 settleGroupAfterExit（竞态见其注释）。
  */
 export function assertGroupFullyExited(pgid: number | undefined): void {
   if (!pgid) throw new Error('隔离子进程无 pid，无法核验进程组，失败关闭。');
-  const liveness = isProcessGroupAlive(pgid);
-  if (!liveness.ok) {
-    throw new Error(`无法核验隔离进程组（${liveness.error}），失败关闭。`);
+  const settled = groupHasNoLiveMembers(pgid);
+  if (typeof settled === 'string') {
+    throw new Error(`无法核验隔离进程组（${settled}），失败关闭。`);
   }
-  if (liveness.alive) {
-    const snapshot = listProcessGroup(pgid);
-    const detail = snapshot.ok && snapshot.pids.length > 0
-      ? `pids=${snapshot.pids.join(',')}`
-      : '组内仍有存活进程（无法枚举 pid）';
-    throw new Error(`隔离进程组仍有存活后代（${detail}），wrapper 退出不代表 CLI/后端退出，任务判失败。`);
+  if (!settled) {
+    throw new Error(`隔离进程组仍有存活后代（${describeGroupSurvivors(pgid)}），wrapper 退出不代表 CLI/后端退出，任务判失败。`);
   }
+}
+
+export type SettleGroupAfterExitOutcome =
+  | { outcome: 'settled' }
+  | { outcome: 'survivors'; detail: string }
+  | { outcome: 'unverifiable'; reason: string };
+
+/**
+ * 任务已正常完成后（wrapper/CLI 主进程已退出）的组收尾。背景：CLI 运行期间
+ * 派生的辅助进程（MCP server、shell 等）与主进程同组，主进程退出后它们还需
+ * 一小段时间有序退出；曾经的一次瞬时 assertGroupFullyExited 会把这个窗口当
+ * 「有存活后代」判失败，把已拿到结果的任务整个丢弃（2026-10-07 实发）。
+ * 收尾顺序：有界宽限轮询（僵尸不算存活）→ 仍不干净则升级整组终止（结果已
+ * 拿到，清理的是本任务自己的残兵）→ 终验。幸存者/无法核验仍返回失败结局，
+ * 失败关闭原则不变——修的只是不给有序退出留时间的误杀。
+ */
+export async function settleGroupAfterExit(
+  pgid: number | undefined,
+  options: { graceMs?: number; termGraceMs?: number; killGraceMs?: number } = {},
+): Promise<SettleGroupAfterExitOutcome> {
+  if (!pgid) return { outcome: 'unverifiable', reason: '隔离子进程无 pid，无法核验进程组，失败关闭。' };
+  if (process.platform === 'win32') {
+    return { outcome: 'unverifiable', reason: 'Windows 无进程组核验（本就 blocked）' };
+  }
+  const graceMs = options.graceMs ?? 2_000;
+  const deadline = Date.now() + graceMs;
+  for (;;) {
+    const settled = groupHasNoLiveMembers(pgid);
+    if (typeof settled === 'string') return { outcome: 'unverifiable', reason: settled };
+    if (settled) return { outcome: 'settled' };
+    if (Date.now() >= deadline) break;
+    await waitFor(100);
+  }
+  const terminated = await terminateIsolatedChild({ pid: pgid }, {
+    ...(options.termGraceMs !== undefined ? { termGraceMs: options.termGraceMs } : {}),
+    ...(options.killGraceMs !== undefined ? { killGraceMs: options.killGraceMs } : {}),
+  });
+  if (terminated.outcome === 'unverifiable') {
+    return { outcome: 'unverifiable', reason: terminated.reason };
+  }
+  if (terminated.groupAliveAfter) {
+    return { outcome: 'survivors', detail: describeGroupSurvivors(pgid) };
+  }
+  return { outcome: 'settled' };
 }
 
 // ---- prepare（组装 IsolationContext；顺序按修订版 §6） -----------------------------

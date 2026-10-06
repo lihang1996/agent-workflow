@@ -1,4 +1,4 @@
-import { assertGroupFullyExited, terminateIsolatedChild } from '../core/isolation.js';
+import { settleGroupAfterExit, terminateIsolatedChild } from '../core/isolation.js';
 import { createInterface } from 'node:readline';
 import type { CliAdapter, CliCompactPlan } from './types.js';
 import {
@@ -157,10 +157,17 @@ function runClaudeCompact(
           void fail(new Error(`${options.adapter.displayName} 上下文整理已取消`));
           return;
         }
-        try {
-          assertGroupFullyExited(child.pid);
-        } catch (groupError) {
-          void fail(groupError as Error);
+        // 正常退出路径：辅助进程可能滞后有序退出，给有界宽限再升级终止
+        // （见 settleGroupAfterExit 注释）；幸存者/无法核验仍失败关闭。
+        const groupOutcome = await settleGroupAfterExit(child.pid).catch(
+          (error: Error): { outcome: 'unverifiable'; reason: string } => ({ outcome: 'unverifiable', reason: error.message }),
+        );
+        if (groupOutcome.outcome === 'unverifiable') {
+          void fail(new Error(`无法核验隔离进程组（${groupOutcome.reason}），失败关闭。`));
+          return;
+        }
+        if (groupOutcome.outcome === 'survivors') {
+          void fail(new Error(`隔离进程组仍有存活后代（${groupOutcome.detail}），wrapper 退出不代表 CLI/后端退出，任务判失败。`));
           return;
         }
         if (code !== 0) {
@@ -322,10 +329,17 @@ function runCodexCompact(
           void fail(new Error(`${options.adapter.displayName} 上下文整理已取消`));
           return;
         }
-        try {
-          assertGroupFullyExited(child.pid);
-        } catch (groupError) {
-          void fail(groupError as Error);
+        // 正常退出路径：辅助进程可能滞后有序退出，给有界宽限再升级终止
+        // （见 settleGroupAfterExit 注释）；幸存者/无法核验仍失败关闭。
+        const groupOutcome = await settleGroupAfterExit(child.pid).catch(
+          (error: Error): { outcome: 'unverifiable'; reason: string } => ({ outcome: 'unverifiable', reason: error.message }),
+        );
+        if (groupOutcome.outcome === 'unverifiable') {
+          void fail(new Error(`无法核验隔离进程组（${groupOutcome.reason}），失败关闭。`));
+          return;
+        }
+        if (groupOutcome.outcome === 'survivors') {
+          void fail(new Error(`隔离进程组仍有存活后代（${groupOutcome.detail}），wrapper 退出不代表 CLI/后端退出，任务判失败。`));
           return;
         }
         fail(new Error(

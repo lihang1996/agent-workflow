@@ -8,9 +8,9 @@ import type { ModelSelection } from '../core/model-selection.js';
 import { assertAppToolAllowed, validateAppToolCalls } from '../core/app-tool-policy.js';
 import {
   applyAdapterEnv,
-  assertGroupFullyExited,
   assertTaskDiffClean,
   launchIsolated,
+  settleGroupAfterExit,
   terminateIsolatedChild,
   type IsolationSupplier,
   type PreparedIsolation,
@@ -413,10 +413,17 @@ function runIsolatedChild(options: {
           if (timedOut) return fail(new Error(`${adapter.displayName} 执行超时`));
           return fail(new Error(`${adapter.displayName} 执行已取消`));
         }
-        try {
-          assertGroupFullyExited(child.pid);
-        } catch (groupError) {
-          return fail(new Error(`${(groupError as Error).message}`));
+        // 正常退出路径：辅助进程（MCP server 等）可能滞后于主进程有序退出，
+        // 给有界宽限再升级终止（见 settleGroupAfterExit 注释），避免把已拿到
+        // 结果的任务误判失败；幸存者/无法核验仍失败关闭。
+        const groupOutcome = await settleGroupAfterExit(child.pid).catch(
+          (error: Error): { outcome: 'unverifiable'; reason: string } => ({ outcome: 'unverifiable', reason: error.message }),
+        );
+        if (groupOutcome.outcome === 'unverifiable') {
+          return fail(new Error(`无法核验隔离进程组（${groupOutcome.reason}），失败关闭。`));
+        }
+        if (groupOutcome.outcome === 'survivors') {
+          return fail(new Error(`隔离进程组仍有存活后代（${groupOutcome.detail}），wrapper 退出不代表 CLI/后端退出，任务判失败。`));
         }
         if (resultError) return fail(resultError);
         if (appToolError) return fail(appToolError);
