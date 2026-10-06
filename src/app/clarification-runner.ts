@@ -244,7 +244,7 @@ async function executeClarification(options: Parameters<typeof continueClarifica
     await cardUpdater.finish(buildTaskCard({
       title: adapter.displayName,
       status: 'success',
-      detail: '已根据你的选择完成',
+      detail: '已根据你的选择回复',
       progress: progress.snapshot(),
       answer: result.answer,
       stats: result.stats,
@@ -263,7 +263,7 @@ async function executeClarification(options: Parameters<typeof continueClarifica
       bot,
       replyToMessageId: flow.originalMessageId,
       target: { openId: flow.ownerOpenId, name: '' },
-      text: '任务已完成，请查看上方结果。',
+      text: '已回复，请查看上方结果。',
       replyInThread: flow.replyInThread,
     });
   } catch (error) {

@@ -3,6 +3,8 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { BotConfig } from './bot-registry.js';
 import { appToolsForBot, type AppToolName } from './app-tool-policy.js';
+import { assertModelSelectionSupported } from './engine-capabilities.js';
+import { normalizeModelSelection } from './model-selection.js';
 
 export interface MissingSkill {
   botId: string;
@@ -54,6 +56,10 @@ export class TeamRegistry {
     return [
       '你所在的 Agent 团队：',
       ...roster,
+      '团队角色默认执行配置（来自 Agent OS 服务端配置）：',
+      ...this.members.map(describeMemberModel),
+      '以上是角色默认配置，不代表某个话题当前的执行引擎，也不证明引擎实际使用的模型。实际值未核验时必须如实说明；话题会话的引擎与上次执行计划选择可通过 @ 对应成员 /status 查看。',
+      '用户询问团队成员的默认引擎、模型或推理强度时，直接依据以上配置回答，并说明声明受阻断或实际值未核验的情况。这些配置由 Agent OS 注入，成员工作目录中没有配置文件不代表未配置；无需让用户提供配置截图或派发任务来查询。',
       `你当前以 ${current.id} 的身份工作。只处理交给你的职责；需要其他成员参与时，清楚说明希望交给谁以及期望结果。`,
       '团队名单中的成员都是真实的飞书 bot。CLI 内部子 Agent 适合处理临时分工，不能冒充这些长期团队成员。',
       '需要把任务交给其他成员时，使用 dispatch_task 工具，由 Agent OS 发送协作卡片并真正 @ 对方。只有 CEO 助理可以在运行时调用该工具；targetBotId 必须来自上面的团队名单，不能填写自己。',
@@ -88,6 +94,21 @@ export class TeamRegistry {
     }
     return missing;
   }
+}
+
+function describeMemberModel(member: BotConfig): string {
+  const selection = normalizeModelSelection(member.modelOverrides?.[member.defaultCliId]);
+  const model = selection.model ?? '未声明（引擎原生默认或运行环境决定，实际值未核验）';
+  const effort = selection.reasoningEffort ?? '未声明';
+  let status = selection.model !== null || selection.reasoningEffort !== null
+    ? '声明可作为执行参数；仍需执行前运行时核验，实际使用值未核验。'
+    : '未声明模型与推理强度；实际使用值未核验。';
+  try {
+    assertModelSelectionSupported(member.defaultCliId, selection);
+  } catch (error) {
+    status = `声明受阻断：${(error as Error).message} 实际使用值未核验。`;
+  }
+  return `- ${member.id}：默认引擎=${member.defaultCliId}；model=${model}；effort=${effort}\n  状态：${status}`;
 }
 
 async function somePathExists(paths: string[]): Promise<boolean> {

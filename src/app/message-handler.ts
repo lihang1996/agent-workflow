@@ -601,7 +601,7 @@ export function createMessageHandler(options: {
               target: { openId: msg.senderOpenId, name: '' },
               text: isCompacting
                 ? '上下文整理已完成，请查看上方结果。'
-                : '任务已完成，请查看上方结果。',
+                : '已回复，请查看上方结果。',
               replyInThread: hasThread,
             });
           }

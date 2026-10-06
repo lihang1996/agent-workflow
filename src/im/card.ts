@@ -67,7 +67,7 @@ export interface ClarificationCardOptions {
 
 const STATUS_STYLE = {
   running: { template: 'blue', label: '执行中' },
-  success: { template: 'green', label: '已完成' },
+  success: { template: 'green', label: '执行结束' },
   failed: { template: 'red', label: '执行失败' },
   cancelled: { template: 'grey', label: '已取消' },
 } as const;
